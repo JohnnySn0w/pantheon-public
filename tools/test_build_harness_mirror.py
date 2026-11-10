@@ -572,7 +572,7 @@ class TestClaudeManifest(unittest.TestCase):
         entries = bhm.parse_entries(self.acc["published_entries"])
         self.assertEqual(len(entries), 24)
         self.assertEqual(bhm.tree_sha(entries), self.acc["published_tree"])
-        self.assertEqual(self.acc["published_tree"], "fb497e8d0351e9084e8e34c9142c5af8f15a1979")
+        self.assertEqual(self.acc["published_tree"], "9f04a88bd13b27e97a41c75577bc0ae71f705532")
 
     def test_payload_is_exactly_the_published_paths(self):
         published = sorted(p for _m, _o, p in bhm.parse_entries(self.acc["published_entries"]))
@@ -604,19 +604,16 @@ class TestClaudeManifest(unittest.TestCase):
         self.assertEqual(code, bhm.EXIT_OK, "\n".join(report))
         self.assertEqual(len(report), 2, report)
         self.assertTrue(report[0].startswith("LEAKGATE PASS mirror=claude "), report[0])
-        self.assertEqual(report[-1], "OK tree fb497e8d0351e9084e8e34c9142c5af8f15a1979")
+        self.assertEqual(report[-1], "OK tree 9f04a88bd13b27e97a41c75577bc0ae71f705532")
         self.assertEqual(self.acc["allowlist"], [])
 
 
 class TestCodexManifest(unittest.TestCase):
     """The real codex mirror manifest, frozen-input acceptance (ruling B3, T-4768 PR3)."""
 
-    # Zero STALE at acceptance.source_sha: recovery re-pinned the #811 drift as reviewed-not-
-    # ported (2026-10-09). A reviewed-not-ported re-pin moves only source_blob. PORTING a
-    # source change changes the shadow's bytes, so it also needs a new acceptance block
-    # (source_sha, published_tree, entries) and the tree sha / file count asserted here.
-    STALE_MSG = ("STALE shadow at the frozen source_sha: re-pin source_blob if reviewed-"
-                 "not-ported; if ported, also refresh the acceptance block and this test")
+    # The frozen input is content AND mirror config at acceptance.source_sha (SOP step 10,
+    # T-6131), so a shadow port or re-pin awaiting its publish leaves this test green; the
+    # acceptance block moves only with record-published, after the publish.
 
     @classmethod
     def setUpClass(cls):
@@ -632,7 +629,7 @@ class TestCodexManifest(unittest.TestCase):
         entries = bhm.parse_entries(self.acc["published_entries"])
         self.assertEqual(len(entries), 43)
         self.assertEqual(bhm.tree_sha(entries), self.acc["published_tree"])
-        self.assertEqual(self.acc["published_tree"], "4e7c6a420dad8bc0ed2039273d417a38625dc5bc")
+        self.assertEqual(self.acc["published_tree"], "316f7ce094867aa26f9f5226bea8ca6709179bf5")
 
     def test_payload_is_exactly_the_published_paths(self):
         published = sorted(p for _m, _o, p in bhm.parse_entries(self.acc["published_entries"]))
@@ -661,17 +658,24 @@ class TestCodexManifest(unittest.TestCase):
         self.assertNotIn(b"State stickers", (CODEX_MANIFEST.parent / f["shadow"]).read_bytes())
 
     def test_acceptance_frozen_input_reproduces_published_tree(self):
-        src, cfg, m = bhm.open_mirror(REPO, self.acc["source_sha"], "codex",
-                                      manifest_path=CODEX_MANIFEST)
+        # content AND mirror config (manifest, shadows, overlay) from the frozen sha, as the
+        # claude twin does (T-5594), so a shadow re-pin awaiting its publish does not break
+        # the frozen input (T-6131); leak-gate sources from HEAD. Checked against the
+        # acceptance block on disk, which names the live publish.
+        src, cfg, m = bhm.open_mirror(REPO, self.acc["source_sha"], "codex")
         res = bhm.build(src, cfg, m, gate_src=bhm.GitSource(REPO, "HEAD"))
         self.assertEqual(res.errors, [])
-        self.assertEqual(res.stale, [], self.STALE_MSG)
-        code, report = bhm.check(res, m)
+        # STALE at the frozen sha is pin drift, not a reproduction failure: #1199 re-pinned
+        # poller/keepgoing in a commit after 6932d9e1e, with the tree unchanged. STALE is
+        # the weekly drift sweep's signal at HEAD (exit 13, SOP step 2b), not this test's.
+        self.assertTrue(all(x.startswith("STALE ") for x in res.stale), res.stale)
+        res.stale = []
+        code, report = bhm.check(res, self.manifest)   # the on-disk acceptance names the live publish
         self.assertEqual(code, bhm.EXIT_OK, "\n".join(report))
         self.assertEqual(len(report), 2, report)
         self.assertTrue(report[0].startswith("LEAKGATE PASS mirror=codex "), report[0])
         self.assertIn(" files=43 leaks=0 allowlisted=30 ", report[0])
-        self.assertEqual(report[-1], "OK tree 4e7c6a420dad8bc0ed2039273d417a38625dc5bc")
+        self.assertEqual(report[-1], "OK tree 316f7ce094867aa26f9f5226bea8ca6709179bf5")
         self.assertEqual(self.acc["allowlist"], [])
 
     def test_t6_payload_holds_no_contiguous_byte_sequence(self):

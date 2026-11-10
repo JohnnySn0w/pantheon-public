@@ -11,10 +11,10 @@ sop/remediation/agent-oauth-relogin.md:
   git_sha: 0a1bf7e77f7ca3627ca8bea96f8ad75d48735d7f
   sha256: 9f9c61d9a450958bc060a028aa3bcb5023f9efacb5698a78bc1eaa64eccdecf3
 sop/remediation/persona-daemon-liveness-recovery.md:
-  byte_length: 15322
-  git_blob: 0215f83257df48f2ef7a7d709a5b967767495060
-  git_sha: ef00cfa3f85c74b2128c6a3630e49deb44f0082d
-  sha256: bcaf87c1201a7cebe4418ad95ea1125a101265fdc34f0ed1e0a0c798bb10cf39
+  byte_length: 14377
+  git_blob: d0ec22eff2d3992f0d7872b412e0102eefa681ea
+  git_sha: 7f9d358ba6df7e744c639c5b70e3ca6f0ea0f179
+  sha256: 9359f81b3d7acf6b294a555ea30e4280f90b5608f0a20ac25f015dc19a0acfac
 sop/standard/a2a-research-request-handling.md:
   byte_length: 10347
   git_blob: 62edd31bd517dd0762a24b25964051db0b7993f2
@@ -36,10 +36,10 @@ sop/standard/agent-self-restart-with-kick.md:
   git_sha: 650829da832a61d1d7f212d5fabfbb4e2c654baa
   sha256: c45b9d933eabeb384c58b36954a23c15c3ab3e3ab9e3cad952be29de37805d09
 sop/standard/appending-a-ledger-entry.md:
-  byte_length: 6647
-  git_blob: 2bd90c0385321d01679955289b572499159cfa26
-  git_sha: 40170d7e7bce9196860de02455e9530247fc7d56
-  sha256: e5c9c6b718b44933d4a66874e7f47492f747b4c9cff73db6aa9bdbf470f46b1a
+  byte_length: 7492
+  git_blob: 6453d2e0a89436f398c000578c9e506584bab59c
+  git_sha: 7cbbd37cb8578e26c83dfe325cd10387a991f08c
+  sha256: 5236e76933deea6b7e4745e348a97375993e2b176c935799ba5bdce750af46a6
 sop/standard/applying-the-threat-model.md:
   byte_length: 6634
   git_blob: 404c906e97acf1317126b6d145aae4d37f348436
@@ -51,10 +51,10 @@ sop/standard/auto-commit-cron-default-safe-contract.md:
   git_sha: 4e82cf83d6dd16e237be2ea79698445ac5bc76b8
   sha256: abe742e834b9cb4f0f919e80509740cce9a1002bdc8a9dac1e2e29b928608a59
 sop/standard/auto-file-side-observations.md:
-  byte_length: 13945
-  git_blob: 5f458ed271f2b1355c2d81a63678241b2bc12332
-  git_sha: a3dc970ee6d2db3bcc6c7a40f1d608555f3a0ee0
-  sha256: feb547242457868f27d40248b833c7f0ff55c4f3242b9846fb85431c501306a9
+  byte_length: 13957
+  git_blob: 89545a29c9f7272cc336eb877e88cf3ced593eef
+  git_sha: ddeb11f6a6561e2b7e999611510aeb2de866f1aa
+  sha256: a3b99e2a46bab95854071e7bd8a95c8879c6ed54c507ff461b5677167ecae8f0
 sop/standard/cadence-fired-remediation-design.md:
   byte_length: 5571
   git_blob: f7bcc007f2848e1a6d4334df9cfe7006643d920e
@@ -71,10 +71,10 @@ sop/standard/confirm-health-after-touching-a-live-session.md:
   git_sha: 0a1bf7e77f7ca3627ca8bea96f8ad75d48735d7f
   sha256: 34f877e1538228eb5b25ef123560f20e56dc72a9fb55aec0e1b4fb3b431ebd80
 sop/standard/cross-agent-dispatch-discipline.md:
-  byte_length: 5670
-  git_blob: 3b3996d3716ceacaf0545284546280b878747956
-  git_sha: cb7112cb98e37ef23ea746814fd85845ed70d2c6
-  sha256: f35993c19351bb9011887d4070a22257afc74937186d406cb2f948e0248f1c4f
+  byte_length: 6064
+  git_blob: 57fddacda326b89dba95660a5d993b3985cbd7f3
+  git_sha: 9a0db1e08ff650b311b694dfb15dc61c1d8a1780
+  sha256: 82e437ee6b7d25ff511d82edf7d680eed4124ad19e6038df599c33307b713ac4
 sop/standard/cve-response.md:
   byte_length: 5166
   git_blob: 23ffd7703451bdebb12a58b639b301c8337dde61
@@ -90,16 +90,21 @@ sop/standard/dispatch-and-wait-liveness.md:
   git_blob: cb6e769d159a1432d02400ebb6abf02a423513e7
   git_sha: 9c3dce69cc76f7285e8816cefa57d99f0aca6972
   sha256: 24149a9d1b7e6d44ded4afa7f5b6c7a826b3c41eb444d1eae4560889e71e7715
+sop/standard/external-interaction-etiquette.md:
+  byte_length: 4451
+  git_blob: 066214ba8632bbda66b7af006289f623b12fc3e1
+  git_sha: 3b06aa0e8db23959ba3c2c40b9fbe8e49a1ce5b8
+  sha256: a31ad637a31c2ebb24cd50aa377a1cf0cdf1b2c9e3201436c0c7bbd66eda5894
 sop/standard/freeze-at-ratification-surface.md:
   byte_length: 4083
   git_blob: 20210dfdb7ac706d0ca3cf7fd658340913a4bdfb
   git_sha: 634f9fee1c0e900895842865ce9de32c07250ef3
   sha256: 69998faaf344004b86ef211f679577627474137e78110c79106b1f8639dc9722
 sop/standard/hand-moving-an-established-seat-onto-the-control-plane.md:
-  byte_length: 62813
-  git_blob: 9c5567420086e1b44de79636dfa960d4c72b6a70
-  git_sha: a7813e41de40160eb7a5435a3abb7ada0140f9ed
-  sha256: a201b14c9f0d5e3eb4f02a891ff3a97ab04a35da87080225201cde7cbc49605e
+  byte_length: 62715
+  git_blob: 2bb7d3de0ac3321d8e05e8d9175b16f0f4ce69ef
+  git_sha: 4dd1ccad45189096c621d149a17db0ea3396c5bc
+  sha256: a67163d47620139b5a2e3a4c8a63f95bac27b8696d89bab75b7a8636ad19482b
 sop/standard/handling-low-level-errors.md:
   byte_length: 7036
   git_blob: b5b70667f175494718822f8419aad61b7d476f80
@@ -116,10 +121,10 @@ sop/standard/merging-an-agent-branch-pr.md:
   git_sha: a1a2b268aa0258933a5f950b16001d21546b8c1d
   sha256: 5ba5dbe87411aa8de38e3f9076b77453d8564ea7d31d59226cd453fb10f26322
 sop/standard/pantheon-bringup.md:
-  byte_length: 122967
-  git_blob: 436a2eb8b4d17d8c1ebdf3b5ccfe6dd6dab141cb
-  git_sha: d919d9ce0cafba778b82b3cdf724491ae1b1ef93
-  sha256: ceb798ed4de5c2ba62696b9eea7e8e8c07389df6d04e4b9e8bcfd5f46718111b
+  byte_length: 122974
+  git_blob: ea671d5bbae8bc3e69555c876b4ac6031abfe253
+  git_sha: ddeb11f6a6561e2b7e999611510aeb2de866f1aa
+  sha256: 2678ec058e40343d33912d6c25cc2fa186f680a1be9d55b5f58d25764e8bd41c
 sop/standard/ratifiable-adr-shape.md:
   byte_length: 5862
   git_blob: 8168a434952ff903df046a51bb33f0909419daf8
@@ -131,25 +136,25 @@ sop/standard/redeploy-pantheon-pwa.md:
   git_sha: a3dc970ee6d2db3bcc6c7a40f1d608555f3a0ee0
   sha256: 158b86f11b0af131b7cd3d4149d740afd41627c83a909f6b57b11edfe1e0f653
 sop/standard/refreshing-an-org-039-release-mirror.md:
-  byte_length: 52326
-  git_blob: 0846aaff26b11052212c775e6e0faeac286fdb82
-  git_sha: 7aa71562682933ae0d6403135f3004ad83371d3d
-  sha256: 95b651f3f479913208398c83fa15a6a4bbd91e80a1c6415ed5d7537e90272f6b
+  byte_length: 53254
+  git_blob: 2e76d5d088f94d8fe29afcb89494c73687acbe88
+  git_sha: ddeb11f6a6561e2b7e999611510aeb2de866f1aa
+  sha256: 40f53e33efab1b21badcf0c37c3b839f791d007bc0e69e9f25f3468efce33d07
 sop/standard/sending-a-state-sticker.md:
   byte_length: 3740
   git_blob: 9d2261a474ff1607a1d9c16e190972f95b4d2be2
   git_sha: f9dda1c16ee5cfb22f68b983b983e992a91458c6
   sha256: 46dbf6b9a9f0879f133387bfa9b1df49b205c0d7bd7afeaaa8a27d0545d39801
 sop/standard/staging-a-worker-dispatch.md:
-  byte_length: 9305
-  git_blob: fa847b0db91e2a3eb0c91b04ba2174080cefe9a5
-  git_sha: 9c3dce69cc76f7285e8816cefa57d99f0aca6972
-  sha256: cd1fcc4a49b294e4b3f88c8a469bccd01ffa0019225204d4ab6e8a9e1aa6d9c2
+  byte_length: 10364
+  git_blob: 9be6fdc87b95b30573467f35b5895b2817fd417c
+  git_sha: 9f0fdbd5466408cbe31d6c17448208c7ac5605d3
+  sha256: f4edd0b765f29d695af39eff96fd56998ff9a3b0020d1580ca36bbfede6013fb
 sop/standard/testing-depth-and-scope.md:
-  byte_length: 34054
-  git_blob: 8ddbb29b10ccd854c0842e1e12fc5a2c1ffd270d
-  git_sha: 585bc0af43d46de5832dddcc170a31c204ba2009
-  sha256: 1790f2790af046c1c6b865ef07bffffc0ccc9924b33bae64c7ef67c07dd11a48
+  byte_length: 34053
+  git_blob: 69d02010b7437aeab0c27d03884113232a2a508c
+  git_sha: ddeb11f6a6561e2b7e999611510aeb2de866f1aa
+  sha256: ab9362135308571437bfb499a4ff84d1ed50cac2da8fd9dabeadeb9e9f9f0240
 sop/standard/ticket-flow.md:
   byte_length: 16917
   git_blob: bdba2d230b0c53ddf17f1c10ce0202be17a0a0da

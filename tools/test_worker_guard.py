@@ -716,11 +716,9 @@ class TestT5140StructuralBound(unittest.TestCase):
             self.assertIsNone(worker_guard.decide(_bash(cmd)))
 
     def test_deep_nesting_cpu_smoke_is_secondary_to_the_structural_cap(self):
-        cmd = "bash -c '" + "$(" * 25_000 + "'"
+        fam = _rep("$(", 25_000, "bash -c '", "'").map(lambda c: _bash(c, "implementer"))
         worker_guard._scan.cache_clear()
-        result = _cpu_bounded(self, worker_guard.decide,
-                              _bash(cmd, "implementer"),
-                              label="T-5140 deep nesting", bound=0.25)
+        result = _cpu_fam(self, worker_guard.decide, fam, label="T-5140 deep nesting", bound=0.25)
         self.assertIsNotNone(result)
 
 
@@ -793,30 +791,30 @@ class TestT5140R2OverflowFailsClosed(unittest.TestCase):
         self.assertGreater(overflowed, 3)
 
     def test_double_quoted_child_shell_nesting_is_denied_fast(self):
-        for label, cmd in (
-            ("dq open", 'bash -c "' + "$(" * 25_000 + '"'),
-            ("dq balanced", 'bash -c "' + "$(" * 16_000 + ")" * 16_000 + '"'),
-            ("dq parens", 'bash -c "$(' + "(" * 24_000 + ')"'),
-            ("dq in dq", "bash -c \"bash -c '" + "$(" * 25_000 + "'\""),
+        for label, fam in (
+            ("dq open", _rep("$(", 25_000, 'bash -c "', '"')),
+            ("dq balanced", _Fam(lambda m: 'bash -c "' + "$(" * m + ")" * m + '"', 16_000)),
+            ("dq parens", _rep("(", 24_000, 'bash -c "$(', ')"')),
+            ("dq in dq", _rep("$(", 25_000, "bash -c \"bash -c '", "'\"")),
         ):
             with self.subTest(label=label):
                 worker_guard._scan_cached.cache_clear()
-                out = _cpu_bounded(self, worker_guard.decide, _bash(cmd, "implementer"),
-                                   label=f"T-5140 r2 {label}", bound=0.25)
+                out = _cpu_fam(self, worker_guard.decide, fam.map(lambda c: _bash(c, "implementer")),
+                               label=f"T-5140 r2 {label}", bound=0.25)
                 self.assertIsNotNone(out)
                 self.assertIn("T-5140", out["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_shell_read_heredoc_body_nesting_is_denied_fast(self):
-        deep = "$(" * 25_000
-        for cmd in (
-            f"bash <<'EOF'\n{deep}\nEOF",
-            f"sh <<'EOF'\n{deep}\nEOF",
-            f"source /dev/stdin <<'EOF'\n{deep}\nEOF",  # strict-lexer bail: _scan fallback
+        for head in (
+            "bash <<'EOF'\n",
+            "sh <<'EOF'\n",
+            "source /dev/stdin <<'EOF'\n",  # strict-lexer bail: _scan fallback
         ):
-            with self.subTest(cmd=cmd[:30]):
+            fam = _rep("$(", 25_000, head, "\nEOF")
+            with self.subTest(cmd=fam.text[:30]):
                 worker_guard._scan_cached.cache_clear()
-                out = _cpu_bounded(self, worker_guard.decide, _bash(cmd, "implementer"),
-                                   label="T-5140 r2 heredoc", bound=0.25)
+                out = _cpu_fam(self, worker_guard.decide, fam.map(lambda c: _bash(c, "implementer")),
+                               label="T-5140 r2 heredoc", bound=0.25)
                 self.assertIsNotNone(out)
                 self.assertIn("T-5140", out["hookSpecificOutput"]["permissionDecisionReason"])
 
@@ -918,16 +916,17 @@ class TestT5140R3WholeOperandWalk(unittest.TestCase):
                 self.assertNestingDeny(cmd)
 
     def test_review_shapes_are_denied_fast(self):
-        for label, cmd in (
-            ("A split push, 4 sq levels", self._wrap("$(" * 4000 + 'git "pu""sh" origin' + ")" * 4000, 4)),
-            ("C ticket payload, 3 sq levels", self._wrap("$(" * 25_000, 3)),
-            ("D operand concat", "bash -c ':;''" + "$(" * 25_000 + "'"),
-            ("E escaped operand", "bash -c " + "\\$\\(" * 15_000),
+        for label, fam in (
+            ("A split push, 4 sq levels",
+             _Fam(lambda m: self._wrap("$(" * m + 'git "pu""sh" origin' + ")" * m, 4), 4000)),
+            ("C ticket payload, 3 sq levels", _Fam(lambda m: self._wrap("$(" * m, 3), 25_000)),
+            ("D operand concat", _rep("$(", 25_000, "bash -c ':;''", "'")),
+            ("E escaped operand", _rep("\\$\\(", 15_000, "bash -c ")),
         ):
             with self.subTest(label=label):
                 _clear_guard_caches()
-                out = _cpu_bounded(self, worker_guard.decide, _bash(cmd, "implementer"),
-                                   label=f"T-5140 r3 {label}", bound=0.25)
+                out = _cpu_fam(self, worker_guard.decide, fam.map(lambda c: _bash(c, "implementer")),
+                               label=f"T-5140 r3 {label}", bound=0.25)
                 self.assertIsNotNone(out)
                 self.assertIn("T-5140", out["hookSpecificOutput"]["permissionDecisionReason"])
 
@@ -2066,35 +2065,36 @@ class TestGitIdentityRuleLinearTime(unittest.TestCase):
     BUDGET_S = 0.5
     N = 3000
 
-    def _timed(self, command, cwd):
-        # CPU time, not wall clock (T-4443): a loaded host steals wall time.
-        return _cpu_bounded(self, worker_guard._git_identity_match, command, cwd,
-                            label=command, bound=self.BUDGET_S)
+    def _timed(self, fam, cwd):
+        # CPU time, not wall clock (T-4443): a loaded host steals wall time. T-5838: judged by
+        # growth over the `_Fam` sizes when a loaded host pushes it past the budget.
+        return _cpu_fam(self, worker_guard._git_identity_match, fam, cwd,
+                        label=fam.text, bound=self.BUDGET_S)
 
     def _repros(self):
         n = self.N
-        # (command, cwd, blocked?) — expected decisions are what the old rule gives
+        # (command family, cwd, blocked?) — expected decisions are what the old rule gives
         # on the same shapes (see TestGitIdentityRuleParity.test_repro_shapes_short).
         return [
-            ("git -C " * n, _TMP_CWD, False),
-            ("git -C " * n, _SHARED_CWD, False),
-            ("git -C git -C " * n, _TMP_CWD, False),
-            ("git -C git -C " * n, _SHARED_CWD, False),
-            ("git config " * n, _SHARED_CWD, False),
-            ("git config -C " * n, _SHARED_CWD, False),
-            ("git config user.nam " * n, _SHARED_CWD, False),
-            ("git -C " * n + "config --global core.editor vim", _TMP_CWD, True),
-            ("git config " * n + "user.name x", _SHARED_CWD, True),
-            ("git config " * n + "user.name x", _TMP_CWD, False),
-            ("git config user.name x " + "git -C /home/claude/ " * n, _TMP_CWD, False),
-            ("git config user.name x " + "git -C /home/claude/r " * n, _TMP_CWD, True),
-            ("git -C " * n + "; config --global x", _SHARED_CWD, False),
+            (_rep("git -C ", n), _TMP_CWD, False),
+            (_rep("git -C ", n), _SHARED_CWD, False),
+            (_rep("git -C git -C ", n), _TMP_CWD, False),
+            (_rep("git -C git -C ", n), _SHARED_CWD, False),
+            (_rep("git config ", n), _SHARED_CWD, False),
+            (_rep("git config -C ", n), _SHARED_CWD, False),
+            (_rep("git config user.nam ", n), _SHARED_CWD, False),
+            (_rep("git -C ", n, tail="config --global core.editor vim"), _TMP_CWD, True),
+            (_rep("git config ", n, tail="user.name x"), _SHARED_CWD, True),
+            (_rep("git config ", n, tail="user.name x"), _TMP_CWD, False),
+            (_rep("git -C /home/claude/ ", n, "git config user.name x "), _TMP_CWD, False),
+            (_rep("git -C /home/claude/r ", n, "git config user.name x "), _TMP_CWD, True),
+            (_rep("git -C ", n, tail="; config --global x"), _SHARED_CWD, False),
         ]
 
     def test_repros_decide_within_budget(self):
-        for command, cwd, blocked in self._repros():
-            with self.subTest(command=command[:30], cwd=cwd):
-                reason = self._timed(command, cwd)
+        for fam, cwd, blocked in self._repros():
+            with self.subTest(command=fam.text[:30], cwd=cwd):
+                reason = self._timed(fam, cwd)
                 self.assertEqual(reason is not None, blocked)
 
     def test_blocked_repros_keep_the_exact_reason(self):
@@ -2102,9 +2102,9 @@ class TestGitIdentityRuleLinearTime(unittest.TestCase):
         self.assertIn("--global/--system", global_reason)
         self.assertIn("persistent git user identity", identity_reason)
         n = self.N
-        self.assertEqual(self._timed("git -C " * n + "config --global core.editor vim", _TMP_CWD),
-                         global_reason)
-        self.assertEqual(self._timed("git config " * n + "user.name x", _SHARED_CWD),
+        self.assertEqual(self._timed(_rep("git -C ", n, tail="config --global core.editor vim"),
+                                     _TMP_CWD), global_reason)
+        self.assertEqual(self._timed(_rep("git config ", n, tail="user.name x"), _SHARED_CWD),
                          identity_reason)
 
 
@@ -2684,8 +2684,8 @@ class TestHoRecordsFallbackDequotesEverySegment(unittest.TestCase):
         for unit in ("$(", "\"$(", "a'' ", "$'\\x41' ", "(", "case a in a) ", "`", "; git add s''op/x ", "# '\n"):
             with self.subTest(unit=unit):
                 # A quote and a `sop/` word, so the lexer and the worktree check both run.
-                cmd = "true; a'' sop/x; " + unit * (60_000 // len(unit))
-                _cpu_bounded(self, worker_guard._ho_records_fallback, cmd, "/tmp", label=unit)
+                fam = _rep(unit, 60_000 // len(unit), "true; a'' sop/x; ")
+                _cpu_fam(self, worker_guard._ho_records_fallback, fam, "/tmp", label=unit)
 
 
 class TestHoRecordsGitDirOptionsAndBashSpellings(unittest.TestCase):
@@ -2920,10 +2920,10 @@ class TestHoRecordsGitDirOptionsAndBashSpellings(unittest.TestCase):
         for unit in ("git -C ~/pantheon-config add tools/x ", "-C a ", "--work-tree=a ",
                      "le\\\ndger ", "$'\\x6c' ", "add sop/x adr/y ", "cat 'adr'/x | "):
             with self.subTest(unit=unit):
-                cmd = "git -C ~/pantheon-config " + unit * (60_000 // len(unit))
-                _cpu_bounded(self, worker_guard._ho_records_fallback, cmd, "/tmp", label=unit)
-                _cpu_bounded(self, worker_guard._ho_records_segmented, cmd, "/tmp", label=unit)
-                _cpu_bounded(self, worker_guard._ho_git_dir_hit, cmd.split(), "/tmp", label=unit)
+                fam = _rep(unit, 60_000 // len(unit), "git -C ~/pantheon-config ")
+                _cpu_fam(self, worker_guard._ho_records_fallback, fam, "/tmp", label=unit)
+                _cpu_fam(self, worker_guard._ho_records_segmented, fam, "/tmp", label=unit)
+                _cpu_fam(self, worker_guard._ho_git_dir_hit, fam.map(str.split), "/tmp", label=unit)
 
 
 # --- T-4545: the ORG-094 / T-3472 move left the guard's protected-dir anchors on dead paths ---
@@ -4497,8 +4497,8 @@ class TestNonLiteralCommandWordRefused(unittest.TestCase):
                      "env 'A=x y' 'B=p q' ", "env 'A=x y' ", 'env "A=1 \'x\' '):
             with self.subTest(unit=unit):
                 worker_guard._scan.cache_clear()
-                _cpu_bounded(self, _blocked, (unit * (60000 // len(unit)))[:60000] + "ls",
-                             "implementer", label="r4 " + unit[:12])
+                _cpu_fam(self, _blocked, _rep(unit, 60000 // len(unit), tail="ls"),
+                         "implementer", label="r4 " + unit[:12])
 
     # T-4506: `_RawLevel` classifies the command words of a level `_scan` cannot
     # read, so a quoted or backslashed command word there is refused like
@@ -4594,9 +4594,9 @@ class TestNonLiteralCommandWordRefused(unittest.TestCase):
 
     def test_t5115_unclosed_nesting_stays_linear(self):
         for unit in self.T5115_UNCLOSED:
-            cmd = unit * (60000 // len(unit))
+            fam = _rep(unit, 60000 // len(unit))
             with self.subTest(unit=unit):
-                _cpu_bounded(self, self._t5115_raw, cmd, label="T-5115 raw " + unit, bound=0.25)
+                _cpu_fam(self, self._t5115_raw, fam, label="T-5115 raw " + unit, bound=0.25)
                 worker_guard._scan.cache_clear()
                 # Past the cap: allowed as on main, unless the level holds a quote
                 # (`"$(`: allowed on main, now refused, fail-closed).
@@ -4609,26 +4609,25 @@ class TestNonLiteralCommandWordRefused(unittest.TestCase):
                     # T-5140 r2: a `$(` chain past `_SCAN_NEST_MAX` frames is a
                     # scan overflow, refused (fail-closed); bare `<(`/`>(` push
                     # no `_scan` frame and stay allowed as on main.
-                    self.assertEqual(_cpu_bounded(self, _blocked, cmd, "implementer",
-                                                  label="T-5115 " + unit), "$(" in unit)
-        cmd = "`" + "<(" * 30000  # an unclosed backtick body: a level of its own
-        _cpu_bounded(self, self._t5115_raw, cmd, label="T-5115 raw backtick", bound=0.25)
+                    self.assertEqual(_cpu_fam(self, _blocked, fam, "implementer",
+                                              label="T-5115 " + unit), "$(" in unit)
+        fam = _rep("<(", 30000, "`")  # an unclosed backtick body: a level of its own
+        _cpu_fam(self, self._t5115_raw, fam, label="T-5115 raw backtick", bound=0.25)
         worker_guard._scan.cache_clear()
-        self.assertFalse(_cpu_bounded(self, _blocked, cmd, "implementer", label="T-5115 backtick"))
+        self.assertFalse(_cpu_fam(self, _blocked, fam, "implementer", label="T-5115 backtick"))
 
     def test_t5115_open_at_heredoc_body_end_stays_linear(self):
         for unit in ("$(", "env $(", "ls\\\n$("):
-            cmd = "cat <<E\n" + unit * (32000 // len(unit)) + "\nE\necho done"
+            fam = _rep(unit, 32000 // len(unit), "cat <<E\n", "\nE\necho done")
             with self.subTest(unit=unit):
-                _cpu_bounded(self, self._t5115_raw, cmd, label="T-5115 hbody " + unit, bound=0.25)
+                _cpu_fam(self, self._t5115_raw, fam, label="T-5115 hbody " + unit, bound=0.25)
 
     def test_t5115_closed_deep_nesting_stays_linear(self):
         # Closed nesting on a level `_scan` cannot read (an open quote after
         # it). Past the cap this fails closed: allowed on main (in 2-4s),
         # denied now with the parse reason, as the level holds a quote.
         for o in ("$(", "<(", "env $("):
-            k = 62000 // (len(o) + 1)
-            cmd = o * k + "ls" + ")" * k + '\necho "y'
+            fam = _Fam(lambda m, o=o: o * m + "ls" + ")" * m + '\necho "y', 62000 // (len(o) + 1))
             with self.subTest(o=o):
                 # T-5140 r3: at this depth `_scan` overflows before it reaches
                 # the open quote; the open-quote `None` is pinned below the cap.
@@ -4636,10 +4635,10 @@ class TestNonLiteralCommandWordRefused(unittest.TestCase):
                 malformed = [False]
                 self.assertIsNone(worker_guard._scan(below, malformed))
                 self.assertFalse(malformed[0])
-                _cpu_bounded(self, self._t5115_raw, cmd, label="T-5115 closed raw " + o, bound=0.25)
+                _cpu_fam(self, self._t5115_raw, fam, label="T-5115 closed raw " + o, bound=0.25)
                 worker_guard._scan.cache_clear()
-                r = _cpu_bounded(self, worker_guard.decide, _bash(cmd, "implementer"),
-                                 label="T-5115 closed " + o)
+                r = _cpu_fam(self, worker_guard.decide, fam.map(lambda c: _bash(c, "implementer")),
+                             label="T-5115 closed " + o)
                 self.assertIsNotNone(r)
                 # T-5140 r2: a `$(` chain past `_SCAN_NEST_MAX` is refused
                 # earlier, as a scan overflow; `<(` pushes no `_scan` frame.
@@ -4684,17 +4683,17 @@ class TestNonLiteralCommandWordRefused(unittest.TestCase):
         self.assertIsNone(worker_guard.decide(_bash('"ls" -l', None)))
 
     def test_stays_linear(self):
-        _cpu_bounded(self, _blocked, ('ls "a" | ' * 6000)[:60000] + "ls", label="many words")
+        _cpu_fam(self, _blocked, _rep('ls "a" | ', 6000, tail="ls"), label="many words")
 
     def test_heredoc_scan_stays_linear(self):
         # r3 item 3: r2 rescanned to the end for every unmatched delimiter
         # (5.7 s at 8000 units) and tested each position against every body.
         worker_guard._scan.cache_clear()
-        _cpu_bounded(self, _blocked, "x <<A'\n" * 8000, "implementer",
-                     label="unmatched heredoc operators")
+        _cpu_fam(self, _blocked, _rep("x <<A'\n", 8000), "implementer",
+                 label="unmatched heredoc operators")
         worker_guard._scan.cache_clear()
-        self.assertFalse(_cpu_bounded(self, _blocked, "cat <<A\n'x' y\nA\n" * 3500,
-                                      "implementer", label="many heredoc bodies"))
+        self.assertFalse(_cpu_fam(self, _blocked, _rep("cat <<A\n'x' y\nA\n", 3500),
+                                  "implementer", label="many heredoc bodies"))
 
 
 class TestCodeStringOptionAbbreviations(unittest.TestCase):
@@ -5045,50 +5044,180 @@ def _cpu_bounded(test: unittest.TestCase, fn, *args, label: str = "",
 # (cache and SMT sharing) by more than the calibration loop measures: orchestrator's soak saw 3.0-4.0s
 # against x1.2-1.5 slowdowns on rows that take ~1.3-2.7s on a calmer host. `_cpu_scaling` keeps
 # `_cpu_bounded`'s absolute bound as the fast path and, only on a miss, judges the GROWTH: the
-# best-of-3 CPU at a small and at the full size, measured interleaved so a host slowdown hits
-# both alike. From n/k to n a linear walk grows ~k (fixed costs make it less), a quadratic one
-# toward k^2. Measured on the real rows at k=8 (artisan, 2026-11-01): linear 4.6x-10.6x, and a
-# quadratic re-read mutation adding ~2.4s at full size 17x, too close; hence k=16 and a limit of
-# k^1.25 (32x): linear rows sit near 16x, that mutation near 40x. A capped reading (T-5505) passes
-# its own `max_ratio`. What it gives up, deliberately: a constant-factor slowdown that stays linear
-# now passes under load (the guard's own T-4389 clock fails CLOSED on that, so it is a latency
-# cost, not a fail-open); the super-linear regressions these tests exist for still fail.
+# best-of-3 CPU at n/16, n/2 and n, measured interleaved so a host slowdown hits every size alike.
+# A capped reading (T-5505) passes its own `max_ratio` from `small_n` instead.
+#
+# T-5838: the T-5817 judgement looked only from n/16 to n against k^1.25 (32x), which needs a
+# quadratic term Q at full size of more than ~1.15x the linear cost L to fail: a review mutation
+# of Q ~0.8-1.0 L passed at 21.9-32.2x. Three checks now, each load-invariant or generous:
+#   1. four octaves, t(n)/t(n/16) <= 16^1.25 (32x): an exponential or strong quadratic;
+#   2. the TOP octave, t(n)/t(n/2) <= 2^1.25 (2.38x): the local log-log slope where a quadratic
+#      term is largest. Noiseless and on a row that is itself ~2x per octave, with fixed cost c,
+#      Q fails it when Q > ~0.47 L + 3.4 c (the real floor, per shape, is below);
+#   3. a ceiling, best-of-3 t(n) <= 4 x `bound`: a constant-factor blowup that stays linear.
+# Load bursts are the noise to beat: a whole-file run read the linear T-5662 'many arrays' row
+# at 2.64x once (8 repeats under 2 burners: 1.96-2.18x), and T-5386 'renamed uses' at 2.46x and
+# 2.66x in a row with mutation workers hammering memory too (3 repeats: 1.97-2.08x). So each
+# growth is read the lower of two ways (`_growth`: best over best, and the median of each
+# round's back-to-back pair), and a judgement that fails is measured once more from scratch
+# (SCALING_CONFIRMS); the test fails only if both judgements fail. Measured (artisan, 2026-11-02,
+# load avg ~8-17): linear rows' top octave 1.80-2.18x; with a quadratic adding ~0.4 L at full
+# size, 2.30-2.70x (r16 17-26x, which 1. passes). Before any of this, a miss of the fast path is
+# retried once cold at full size (T-5838 r1): most load misses then cost ~2 runs, as they did.
+# DETECTION FLOOR, stated per row shape (T-5838 r1 review): a regression is caught only once it
+# pushes the full-size CPU past `bound` (as `_cpu_bounded` was), even on a cold retry. Past that,
+# with Q the quadratic term and L the linear cost at full size:
+#   - rows whose own top octave is ~2x (heredoc + cd): Q > ~0.6 L is caught (0.6 L 1/2, 0.75 L 2/2);
+#   - rows whose own cost levels off at the top (the eval chain, ~1.6-1.7x per top octave) need
+#     Q >~ 1.5 L: 0.8 L passed 3/3 and 1.15 L passed 2/2;
+#   - under load noise Q ~0.6-1 L is hit-or-miss: a Monte Carlo of this judgement (sigma 0.08, 1.4x
+#     bursts) passed 0.6 L 84-86% of the time, 1.0 L 35-71%, 2.0 L 1-25%;
+#   - strong regressions (a quadratic that dominates, the row well past the bound) always fail:
+#     41 of 41 sampled tests did under an injected ~3s O(n^2) pass, as does a >4x linear slowdown.
+# Smaller quadratic terms and linear slowdowns under 4x pass; the guard's own T-4389 clock fails
+# CLOSED on those, so they cost latency, not a fail-open.
 SCALING_K = 16
 SCALING_BEST_OF = 3
-SCALING_LINEAR_MAX = SCALING_K ** 1.25
+SCALING_LINEAR_EXP = 1.25
+SCALING_LINEAR_MAX = SCALING_K ** SCALING_LINEAR_EXP
+SCALING_OCTAVE_MAX = 2 ** SCALING_LINEAR_EXP
+SCALING_CEILING_X = 4.0
+SCALING_CONFIRMS = 1
+
+
+def _scaling_rounds(fn, sized: list, label: str) -> tuple[object, list[list[float]]]:
+    """(result of the last args tuple, [CPU per args tuple] per round), SCALING_BEST_OF rounds
+    with the sizes interleaved in each."""
+    rounds = []
+    result = None
+    for _ in range(SCALING_BEST_OF):
+        times = []
+        for args in sized:
+            _clear_guard_caches()
+            result, t = _cpu_timed(fn, args, label)
+            times.append(t)
+        rounds.append(times)
+    return result, rounds
+
+
+def _scaling_times(fn, sized: list, label: str) -> tuple[object, list[float]]:
+    """(result of the last args tuple, best CPU per args tuple), the runs interleaved."""
+    result, rounds = _scaling_rounds(fn, sized, label)
+    return result, [min(col) for col in zip(*rounds)]
+
+
+def _growth(rounds: list, i: int, j: int) -> float:
+    """Growth from size i to size j, read the lower of two ways: best CPU over best CPU, and the
+    median of each round's own pair (measured back to back, so a load burst that spans one round
+    hits both). A real super-linear term inflates both; a burst that lands on the best runs of
+    one size but not the other inflates only the first (T-5838)."""
+    import statistics
+    best = min(r[j] for r in rounds) / max(min(r[i] for r in rounds), 1e-3)
+    paired = statistics.median(r[j] / max(r[i], 1e-3) for r in rounds)
+    return min(best, paired)
 
 
 def _scaling_ratio(fn, small: tuple, big: tuple, label: str) -> tuple[object, float, float]:
     """(result at big, best CPU at small, best CPU at big), the runs interleaved."""
-    best_s = best_b = float("inf")
-    result = None
-    for _ in range(SCALING_BEST_OF):
-        _clear_guard_caches()
-        _, t_s = _cpu_timed(fn, small, label)
-        _clear_guard_caches()
-        result, t_b = _cpu_timed(fn, big, label)
-        best_s, best_b = min(best_s, t_s), min(best_b, t_b)
+    result, (best_s, best_b) = _scaling_times(fn, [small, big], label)
     return result, best_s, best_b
 
 
 def _cpu_scaling(test: unittest.TestCase, fn, build, n: int, *args, label: str = "",
                  bound: float = LINEAR_BOUND_S, small_n: int | None = None,
                  max_ratio: float = SCALING_LINEAR_MAX):
-    """fn(build(n), *args), asserting its CPU stays under `bound`, or else that its CPU grows by
-    at most `max_ratio` from size `small_n` (default n // SCALING_K) to n. Returns fn's result."""
+    """fn(build(n), *args), asserting its CPU stays under `bound`, or else that it grows at most
+    `max_ratio` from n // SCALING_K and at most SCALING_OCTAVE_MAX over the top octave, and
+    stays under SCALING_CEILING_X * bound (block comment above). With `small_n`, a capped
+    reading: only the growth from `small_n` to n is judged. Returns fn's result at n."""
     big = (build(n), *args)
     _clear_guard_caches()
     result, elapsed = _cpu_timed(fn, big, label)
     if elapsed < bound:
         return result
-    m = small_n if small_n is not None else max(1, n // SCALING_K)
-    result, t_s, t_b = _scaling_ratio(fn, (build(m), *args), big, label)
-    ratio = t_b / max(t_s, 1e-3)
-    if ratio <= max_ratio:
+    # T-5838 r1: most misses are a load burst over that one run, so retry the full size once cold
+    # (a regression past the bound stays past it) before the 3-round growth judgement.
+    _clear_guard_caches()
+    result, retry = _cpu_timed(fn, big, label)
+    if retry < bound:
         return result
-    test.fail(f"{label[:60]!r}: {elapsed:.3f}s CPU (bound {bound}s), and it grows {ratio:.1f}x from "
-              f"n={m} ({t_s:.3f}s) to n={n} ({t_b:.3f}s), past {max_ratio:.1f}x "
-              f"(best of {SCALING_BEST_OF}, interleaved)")
+    elapsed = min(elapsed, retry)
+    if small_n is not None:
+        result, t_s, t_b = _scaling_ratio(fn, (build(small_n), *args), big, label)
+        ratio = t_b / max(t_s, 1e-3)
+        if ratio <= max_ratio:
+            return result
+        test.fail(f"{label[:60]!r}: {elapsed:.3f}s CPU (bound {bound}s), and it grows {ratio:.1f}x "
+                  f"from n={small_n} ({t_s:.3f}s) to n={n} ({t_b:.3f}s), past {max_ratio:.1f}x "
+                  f"(best of {SCALING_BEST_OF}, interleaved)")
+    m, h = max(1, n // SCALING_K), max(1, n // 2)
+    sized = [(build(m), *args), (build(h), *args), big]
+    ceiling = SCALING_CEILING_X * bound
+    seen = []
+    for _ in range(1 + SCALING_CONFIRMS):
+        result, rounds = _scaling_rounds(fn, sized, label)
+        t_m, t_h, t_b = (min(col) for col in zip(*rounds))
+        ratio, octave = _growth(rounds, 0, 2), _growth(rounds, 1, 2)
+        if ratio <= max_ratio and octave <= SCALING_OCTAVE_MAX and t_b <= ceiling:
+            return result
+        seen.append(f"n={m} {t_m:.3f}s, n={h} {t_h:.3f}s, n={n} {t_b:.3f}s: grows {ratio:.1f}x "
+                    f"over n/{SCALING_K}, {octave:.2f}x over the top octave")
+    test.fail(f"{label[:60]!r}: {elapsed:.3f}s CPU (bound {bound}s); best of {SCALING_BEST_OF}, "
+              f"interleaved, each fresh: {'; '.join(seen)} (limits {max_ratio:.1f}x, "
+              f"{SCALING_OCTAVE_MAX:.2f}x, ceiling {ceiling:.1f}s)")
+
+
+class _Fam:
+    """T-5838: a family of inputs indexed by size, `build(m)`, with `n` the size a test runs
+    at; `_fill` makes the common head + unit * m + tail one, sized to a character budget."""
+
+    def __init__(self, build, n: int):
+        self.build, self.n = build, n
+
+    def __call__(self, m: int):
+        return self.build(m)
+
+    @property
+    def text(self):
+        return self.build(self.n)
+
+    def map(self, wrap) -> "_Fam":
+        """The same family with `wrap` applied to each member (e.g. `_bash(..., agent)`)."""
+        return _Fam(lambda m: wrap(self.build(m)), self.n)
+
+
+def _rep(unit: str, n: int, head: str = "", tail: str = "") -> _Fam:
+    """head + unit * m + tail, run at m = n."""
+    return _Fam(lambda m: head + unit * m + tail, n)
+
+
+def _fill(unit: str, head: str = "", tail: str = "", size: int = 60_000) -> _Fam:
+    """head + unit * m + tail with as many whole units as fit in `size` characters."""
+    return _rep(unit, (size - len(head) - len(tail)) // len(unit), head, tail)
+
+
+def _cpu_fam(test: unittest.TestCase, fn, fam: _Fam, *args, **kw):
+    """`_cpu_scaling` over a `_Fam`: fn(fam.text, *args), judged by its growth on a miss."""
+    return _cpu_scaling(test, fn, fam, fam.n, *args, **kw)
+
+
+def _cpu_best_of(test: unittest.TestCase, fn, *args, label: str = "",
+                 bound: float = LINEAR_BOUND_S):
+    """T-5838: for a FIXED input that is no size family (a nesting depth whose quoting grows
+    the text exponentially by design, one script file on disk): fn(*args) under `bound`, or
+    else the best of SCALING_BEST_OF cold runs under SCALING_CEILING_X * bound. Load inflates
+    every run, so the best one is the honest cost; a super-linear blowup at these inputs is
+    seconds to hours (and `_cpu_timed`'s hard stops end it). Returns fn's result."""
+    _clear_guard_caches()
+    result, elapsed = _cpu_timed(fn, args, label)
+    if elapsed < bound:
+        return result
+    result, (best,) = _scaling_times(fn, [args], label)
+    ceiling = SCALING_CEILING_X * bound
+    if best <= ceiling:
+        return result
+    test.fail(f"{label[:60]!r}: {elapsed:.3f}s CPU (bound {bound}s), best of {SCALING_BEST_OF} "
+              f"cold runs {best:.3f}s, past the {ceiling:.1f}s ceiling")
 
 
 class TestCpuScaling(unittest.TestCase):
@@ -5133,6 +5262,81 @@ class TestCpuScaling(unittest.TestCase):
         # The shape of the mutation proof: ~1.4s linear plus ~2.4s quadratic at full size.
         with self.assertRaises(AssertionError):
             self._run(lambda m: 1.4 * m / 64000 + 2.4 * (m / 64000) ** 2)
+
+    # T-5838: the T-5817 review mutation, ~1.3s linear plus ~1.0s quadratic at full size, grew
+    # ~27x over n/16 (under the 32x limit); the top octave sees it, loaded or not.
+    def test_review_mild_quadratic_fails_on_the_top_octave(self):
+        for slowdown in (1.0, 2.5):
+            with self.subTest(slowdown=slowdown), self.assertRaises(AssertionError) as cm:
+                self._run(lambda m: 1.3 * m / 64000 + 1.0 * (m / 64000) ** 2, slowdown=slowdown)
+            self.assertIn("top octave", str(cm.exception))
+
+    def test_quadratic_below_the_stated_floor_passes(self):
+        # Below every shape's floor in the block comment (~0.6 L at best): a 0.3 L quadratic term
+        # passes (documented, not wanted).
+        self.assertEqual(self._run(lambda m: 2.0 * m / 64000 + 0.6 * (m / 64000) ** 2), "ok")
+
+    def test_linear_with_fixed_cost_under_load_passes(self):
+        self.assertEqual(self._run(lambda m: 0.5 + 1.5 * m / 64000, slowdown=2.0), "ok")
+
+    def test_linear_blowup_past_the_ceiling_fails(self):
+        with self.assertRaises(AssertionError) as cm:
+            self._run(lambda m: (SCALING_CEILING_X * LINEAR_BOUND_S + 1.0) * m / 64000)
+        self.assertIn("ceiling", str(cm.exception))
+
+    def _noisy(self, cost, noisy):
+        """Like `_run`, but runs whose 1-based call index is in `noisy` take 1.4x as long."""
+        state = {"t": 0.0, "calls": 0}
+
+        def fn(text):
+            state["calls"] += 1
+            state["t"] += cost(len(text)) * (1.4 if state["calls"] in noisy else 1.0)
+            return "ok"
+        with unittest.mock.patch("time.thread_time", lambda: state["t"]):
+            return _cpu_scaling(self, fn, lambda m: "x" * m, 64000, label="probe")
+
+    def test_a_noisy_judgement_is_measured_again_fresh(self):
+        # Call 1 is the fast path, call 2 the cold retry; calls 3-11 the first judgement (n/16,
+        # n/2, n x 3): every full-size run there was slowed by a load burst, the second is clean.
+        linear = lambda m: 2.5 * m / 64000  # noqa: E731
+        self.assertEqual(self._noisy(linear, {5, 8, 11}), "ok")
+        with self.assertRaises(AssertionError):  # slowed in both judgements: a real failure
+            self._noisy(linear, {5, 8, 11, 14, 17, 20})
+
+    def test_a_one_off_miss_passes_on_the_cold_retry(self):
+        # r1: a burst over the first full-size run alone costs one retry, no growth judgement
+        calls = []
+        with unittest.mock.patch(f"{__name__}._scaling_rounds", side_effect=AssertionError("judged")):
+            self.assertEqual(self._noisy(lambda m: (calls.append(m), 1.6 * m / 64000)[1], {1}), "ok")
+        self.assertEqual(len(calls), 2)
+
+    def test_growth_reads_the_lower_of_best_and_paired(self):
+        # one quiet half-size run makes best/best 2.5x; each round's own pair says ~2.05x
+        rounds = [[1.0, 2.0], [0.8, 2.1], [1.0, 2.05]]
+        self.assertAlmostEqual(_growth(rounds, 0, 1), 2.05)
+        # a real super-linear term moves both readings
+        self.assertGreater(_growth([[1.0, 2.6], [0.95, 2.55], [1.0, 2.7]], 0, 1), SCALING_OCTAVE_MAX)
+
+    # T-5838: `_cpu_best_of`, for a fixed input: the best cold run against the ceiling.
+    def _best_of(self, runs):
+        import itertools
+        seq = itertools.chain(runs, itertools.repeat(runs[-1]))
+        state = {"t": 0.0}
+
+        def fn():
+            state["t"] += next(seq)
+            return "ok"
+        with unittest.mock.patch("time.thread_time", lambda: state["t"]):
+            return _cpu_best_of(self, fn, label="probe")
+
+    def test_best_of_passes_a_loaded_fixed_input(self):
+        hi = SCALING_CEILING_X * LINEAR_BOUND_S
+        self.assertEqual(self._best_of([LINEAR_BOUND_S * 2.5, hi + 1, hi * 0.9, hi + 1]), "ok")
+
+    def test_best_of_fails_when_every_cold_run_is_past_the_ceiling(self):
+        with self.assertRaises(AssertionError) as cm:
+            self._best_of([SCALING_CEILING_X * LINEAR_BOUND_S + 0.5])
+        self.assertIn("ceiling", str(cm.exception))
 
 
 class TestCpuBoundedCalibration(unittest.TestCase):
@@ -5498,54 +5702,56 @@ class TestGhAndPushRulesStayLinear(unittest.TestCase):
     """T-4145 review round 2: a hook timeout is non-blocking, so a slow guard
     fails OPEN. Option/value runs that used to backtrack exponentially (tens of
     seconds at 30 tokens, minutes at 26 `--repo=` flags) must decide fast and
-    still deny. Measured well under 0.2s each; the bound (`_cpu_bounded`) is
+    still deny. Measured well under 0.2s each; the bound (`_cpu_scaling`) is
     loose for a loaded box, and an exponential or quadratic blowup at this size
     is seconds to hours."""
 
     N = 3000
 
-    def _fast_deny(self, cmd):
+    def _fast_deny(self, fam):
         worker_guard._scan.cache_clear()
-        self.assertTrue(_cpu_bounded(self, _gh_blocked, cmd, label=cmd), cmd[:80])
+        self.assertTrue(_cpu_fam(self, _gh_blocked, fam, label=fam.text), fam.text[:80])
 
     def test_git_global_option_runs(self):
-        for cmd in ("git " + "-C " * 30 + "x; git push",
-                    "git " + "-C " * self.N + "x; git push",
-                    "git " + "-c " * self.N + "x; git push",
-                    "git " + "-c k=v " * self.N + "push",
+        n = self.N
+        for fam in (_rep("-C ", 30, "git ", "x; git push"),
+                    _rep("-C ", n, "git ", "x; git push"),
+                    _rep("-c ", n, "git ", "x; git push"),
+                    _rep("-c k=v ", n, "git ", "push"),
                     # T-5425: redirection runs before the subcommand
-                    "git " + "2>&1 " * self.N + "push",
-                    "git " + ">a " * self.N + "push",
-                    "git " + "2" * self.N + "x; git 2>/dev/null push"):
-            with self.subTest(cmd=cmd[:40]):
-                self._fast_deny(cmd)
+                    _rep("2>&1 ", n, "git ", "push"),
+                    _rep(">a ", n, "git ", "push"),
+                    _rep("2", n, "git ", "x; git 2>/dev/null push")):
+            with self.subTest(cmd=fam.text[:40]):
+                self._fast_deny(fam)
 
     def test_named_fd_redirect_runs(self):
         # T-5425 r2: `{fd}>a ` repeated over 8 KiB and 64 KiB (the input cap)
         for size in (8192, 65536):
-            k = (size - len("git push")) // len("{fd}>a ")
-            cmd = "git " + "{fd}>a " * k + "push"
-            self.assertLessEqual(len(cmd), size)
+            fam = _fill("{fd}>a ", "git ", "push", size)
+            self.assertLessEqual(len(fam.text), size)
             with self.subTest(size=size):
-                self._fast_deny(cmd)
+                self._fast_deny(fam)
 
     def test_gh_leading_flag_runs(self):
-        for cmd in ("gh " + "--repo=o/r " * 26 + "release create v1",
-                    "gh " + "--repo=o/r " * self.N + "release create v1",
-                    "gh " + "--repo o/r " * self.N + "pr merge 5",
-                    "gh " + "-Ro/r " * self.N + "pr merge 5",
-                    "gh " + "--hostname=h " * self.N + "api -X DELETE repos/o/r",
-                    "echo x; gh " + "--repo=o/r " * self.N + "secret set X",
-                    "cd /tmp && watch 'gh' " + "--repo=o/r " * self.N + "pr merge 5"):
-            with self.subTest(cmd=cmd[:40]):
-                self._fast_deny(cmd)
+        n = self.N
+        for fam in (_rep("--repo=o/r ", 26, "gh ", "release create v1"),
+                    _rep("--repo=o/r ", n, "gh ", "release create v1"),
+                    _rep("--repo o/r ", n, "gh ", "pr merge 5"),
+                    _rep("-Ro/r ", n, "gh ", "pr merge 5"),
+                    _rep("--hostname=h ", n, "gh ", "api -X DELETE repos/o/r"),
+                    _rep("--repo=o/r ", n, "echo x; gh ", "secret set X"),
+                    _rep("--repo=o/r ", n, "cd /tmp && watch 'gh' ", "pr merge 5")):
+            with self.subTest(cmd=fam.text[:40]):
+                self._fast_deny(fam)
 
     def test_assignment_and_quote_anchor_runs(self):
-        for cmd in ("A=b " * self.N + "gh pr merge 5",
-                    "A=a\\ b " * self.N + "gh pr merge 5",
-                    'bash -c "' + "'env " * self.N + ' gh pr merge 5"'):
-            with self.subTest(cmd=cmd[:40]):
-                self._fast_deny(cmd)
+        n = self.N
+        for fam in (_rep("A=b ", n, tail="gh pr merge 5"),
+                    _rep("A=a\\ b ", n, tail="gh pr merge 5"),
+                    _rep("'env ", n, 'bash -c "', ' gh pr merge 5"')):
+            with self.subTest(cmd=fam.text[:40]):
+                self._fast_deny(fam)
 
     def test_t5430_named_fd_shell_formed_runs(self):
         # T-5430: `{fd}>a "x" ` and `{a}` repeated over 8 KiB and 64 KiB (the input cap),
@@ -5553,22 +5759,21 @@ class TestGhAndPushRulesStayLinear(unittest.TestCase):
         tail = '; git {fd}>f "push"'
 
         def fill(unit, size):
-            k = (size - len("git ") - len(tail) - len('>f "push"')) // len(unit)
-            cmd = "git " + unit * k + '>f "push"' + tail
-            self.assertLessEqual(len(cmd), size)
-            return cmd
+            fam = _fill(unit, "git ", '>f "push"' + tail, size)
+            self.assertLessEqual(len(fam.text), size)
+            return fam
         for unit in ('{fd}>a "x" ', "{a}"):
             for size in (8192, 65536):
-                cmd = fill(unit, size)
+                fam = fill(unit, size)
                 with self.subTest(unit=unit, size=size, reader="shell-formed"):
-                    self.assertTrue(_cpu_bounded(self, worker_guard._shell_formed_push_match,
-                                                 cmd, label=cmd))
+                    self.assertTrue(_cpu_fam(self, worker_guard._shell_formed_push_match,
+                                             fam, label=fam.text))
                 # a whole `{a}{a}...>f` view at 64 KiB is slow before this reader runs, on
                 # main too (`_HO_DYN_WRITE_CODE_GATE`, filed apart from T-5430)
                 if unit == "{a}" and size > 8192:
                     continue
                 with self.subTest(unit=unit, size=size, reader="decide"):
-                    self._fast_deny(cmd)
+                    self._fast_deny(fam)
 
 
 class TestEscalationSpellingsClosed(unittest.TestCase):
@@ -5731,9 +5936,9 @@ class TestEscalationSpellingsClosed(unittest.TestCase):
                                        ("grep sudo f", depth >= 8)):
                     cmd = nest(inner, depth, double)
                     with self.subTest(double=double, depth=depth, inner=inner):
-                        worker_guard._scan.cache_clear()
+                        # T-5838: a fixed depth (the quoting grows the text by design)
                         self.assertEqual(
-                            _cpu_bounded(self, _blocked, cmd, "implementer", label=cmd), blocked)
+                            _cpu_best_of(self, _blocked, cmd, "implementer", label=cmd), blocked)
 
     def test_known_overblock_under_wrapper_kept(self):
         """The T-4135 wrapper rule is kept as it was: an unquoted escalator word
@@ -5792,30 +5997,31 @@ class TestEscalationRuleStaysLinear(unittest.TestCase):
 
     N = 6000
 
-    def _timed(self, fn, cmd):
+    def _timed(self, fn, fam):
         worker_guard._scan.cache_clear()
-        return _cpu_bounded(self, fn, cmd, label=cmd)
+        return _cpu_fam(self, fn, fam, label=fam.text)
 
     def test_wrapper_anchor_runs_decide_fast(self):
         for run in ("{env ", "(env ", "!env "):
             with self.subTest(run=run):
-                self.assertFalse(self._timed(_gh_blocked, run * self.N))
-                self.assertFalse(self._timed(_gh_blocked, run * self.N + "x"))
-                self.assertTrue(self._timed(_gh_blocked, run * self.N + "sudo"))
+                self.assertFalse(self._timed(_gh_blocked, _rep(run, self.N)))
+                self.assertFalse(self._timed(_gh_blocked, _rep(run, self.N, tail="x")))
+                self.assertTrue(self._timed(_gh_blocked, _rep(run, self.N, tail="sudo")))
 
     def test_walk_runs_decide_fast(self):
-        for cmd, blocked in (("env " + "A=b " * self.N + '"sudo" x', True),
-                             ("timeout 5 " * self.N + "x", False),
-                             ("nice " + "-n 5 " * self.N + '"sudo" x', True),
-                             ("env " + '-S "-i" ' * self.N + "x", False),
-                             ("eval " * self.N + "x", False),
-                             ('bash -c "' + "'env " * self.N + ' sudo"', True)):
-            with self.subTest(cmd=cmd[:30]):
-                self.assertEqual(self._timed(_gh_blocked, cmd), blocked)
+        n = self.N
+        for fam, blocked in ((_rep("A=b ", n, "env ", '"sudo" x'), True),
+                             (_rep("timeout 5 ", n, tail="x"), False),
+                             (_rep("-n 5 ", n, "nice ", '"sudo" x'), True),
+                             (_rep('-S "-i" ', n, "env ", "x"), False),
+                             (_rep("eval ", n, tail="x"), False),
+                             (_rep("'env ", n, 'bash -c "', ' sudo"'), True)):
+            with self.subTest(cmd=fam.text[:30]):
+                self.assertEqual(self._timed(_gh_blocked, fam), blocked)
 
     def test_assignment_anchor_run_escalation_fast(self):
-        self.assertFalse(self._timed(worker_guard._escalation, "A={ " * self.N + "x"))
-        self.assertTrue(self._timed(worker_guard._escalation, "A={ " * self.N + "sudo"))
+        self.assertFalse(self._timed(worker_guard._escalation, _rep("A={ ", self.N, tail="x")))
+        self.assertTrue(self._timed(worker_guard._escalation, _rep("A={ ", self.N, tail="sudo")))
 
 
 class TestResidualEscalatorsAndWrappersClosed(unittest.TestCase):
@@ -6495,61 +6701,61 @@ class TestResidualWalkStaysLinear(unittest.TestCase):
 
     N = 6000
 
-    def _timed(self, cmd):
+    def _timed(self, fam):
         worker_guard._scan.cache_clear()
-        return _cpu_bounded(self, _blocked, cmd, "implementer", label=cmd)
+        return _cpu_fam(self, _blocked, fam, "implementer", label=fam.text)
 
     def test_runs_decide_fast(self):
         n = self.N
         for cmd, blocked in (
-                ("taskset 3 " * n + "sudo x", True),
-                ("chrt -i 0 " * n + "x", False),
-                ("flock -w 5 f " * n + "x", False),
-                ("strace -e x " * n + "sudo x", True),
-                ("script " + "-c x f " * n, False),
-                ("script " + "-c 'ls' " * n + "-c 'sudo x'", True),
-                ("parallel ::: " + "'ls' " * n, False),
-                ("parallel " + "-j 4 " * n + "sudo x", True),
-                ("ssh " + "-oProxyCommand=x " * n + "host", False),
-                ("ssh " + "-o ProxyCommand=x " * n + "-o ProxyCommand='sudo x' host", True),
-                ("systemd-run --user " * n + "sudo x", True),
-                ("coproc " * n + "sudo x", True),
-                ("echo x | " * n + "bash", False),
-                ("echo sudo | " * n + "bash", True),
-                ("x || " * n + "bash; echo sudo", False),
+                (_Fam(lambda m: "taskset 3 " * m + "sudo x", n), True),
+                (_Fam(lambda m: "chrt -i 0 " * m + "x", n), False),
+                (_Fam(lambda m: "flock -w 5 f " * m + "x", n), False),
+                (_Fam(lambda m: "strace -e x " * m + "sudo x", n), True),
+                (_Fam(lambda m: "script " + "-c x f " * m, n), False),
+                (_Fam(lambda m: "script " + "-c 'ls' " * m + "-c 'sudo x'", n), True),
+                (_Fam(lambda m: "parallel ::: " + "'ls' " * m, n), False),
+                (_Fam(lambda m: "parallel " + "-j 4 " * m + "sudo x", n), True),
+                (_Fam(lambda m: "ssh " + "-oProxyCommand=x " * m + "host", n), False),
+                (_Fam(lambda m: "ssh " + "-o ProxyCommand=x " * m + "-o ProxyCommand='sudo x' host", n), True),
+                (_Fam(lambda m: "systemd-run --user " * m + "sudo x", n), True),
+                (_Fam(lambda m: "coproc " * m + "sudo x", n), True),
+                (_Fam(lambda m: "echo x | " * m + "bash", n), False),
+                (_Fam(lambda m: "echo sudo | " * m + "bash", n), True),
+                (_Fam(lambda m: "x || " * m + "bash; echo sudo", n), False),
                 # T-4360: a code string fed the pipe, walked once.
-                ("echo sudo | ssh h '" + "ls; " * n + "bash'", True),
-                ("echo sudo | ssh h '" + "ls; " * n + "cat'", False),
-                ("echo sudo | bash -c '" + "x | " * n + "xargs bash -n'", False),
-                ("command -v run0; " * n + "x", False),
-                ("machinectl -q " * n + "x", False),
-                ("env A=b " * n + "flock f -c 'sudo x'", True),
+                (_Fam(lambda m: "echo sudo | ssh h '" + "ls; " * m + "bash'", n), True),
+                (_Fam(lambda m: "echo sudo | ssh h '" + "ls; " * m + "cat'", n), False),
+                (_Fam(lambda m: "echo sudo | bash -c '" + "x | " * m + "xargs bash -n'", n), False),
+                (_Fam(lambda m: "command -v run0; " * m + "x", n), False),
+                (_Fam(lambda m: "machinectl -q " * m + "x", n), False),
+                (_Fam(lambda m: "env A=b " * m + "flock f -c 'sudo x'", n), True),
                 # Each code string is its own nested check (~0.2 ms, the same
                 # as T-4154's `bash -c 'ls'`), so these rows use n/2.
-                ("flock f -c 'ls'; " * (n // 2) + "flock f -c 'sudo x'", True),
-                ("ssh " + "-o 'ProxyCommand x' " * (n // 2) + "host", False),
+                (_Fam(lambda m: "flock f -c 'ls'; " * m + "flock f -c 'sudo x'", n // 2), True),
+                (_Fam(lambda m: "ssh " + "-o 'ProxyCommand x' " * m + "host", n // 2), False),
                 # T-4363: nested groups and compound commands, and closers
                 # that match no open group, are one stack push/pop each.
-                ("echo sudo | " + "{ cd x; " * n + "bash" + "; }" * n, True),
-                ("{ cd x; " * n + "bash" + "; }" * n + " # sudo", False),
-                ("echo sudo | " + "while x; do " * n + "cat" + "; done" * n, False),
-                ("echo sudo | " + "( cd x; " * n + "bash" + " )" * n, True),
-                ("echo sudo | ( " + "case y in a) x;; esac; " * (n // 2) + "bash )", True),
-                ("done; } fi esac; " * n + "echo sudo | bash", True),
+                (_Fam(lambda m: "echo sudo | " + "{ cd x; " * m + "bash" + "; }" * m, n), True),
+                (_Fam(lambda m: "{ cd x; " * m + "bash" + "; }" * m + " # sudo", n), False),
+                (_Fam(lambda m: "echo sudo | " + "while x; do " * m + "cat" + "; done" * m, n), False),
+                (_Fam(lambda m: "echo sudo | " + "( cd x; " * m + "bash" + " )" * m, n), True),
+                (_Fam(lambda m: "echo sudo | ( " + "case y in a) x;; esac; " * m + "bash )", n // 2), True),
+                (_Fam(lambda m: "done; } fi esac; " * m + "echo sudo | bash", n), True),
                 # T-4375: comment lines after a pipe, and openers glued to a
                 # continuation, are one step each.
-                ("echo sudo | " + "# c ; x\n" * n + "bash", True),
-                ("echo sudo | " + "# c\n" * n + "cat\nbash", False),
-                ("# c | x\n" * n + "echo sudo", False),
-                ("echo sudo | " + "while\\\n x; do " * n + "bash" + "; done" * n, True),
-                ("echo sudo | " + "if\\\n x; then " * n + "cat" + "; fi" * n, False),
+                (_Fam(lambda m: "echo sudo | " + "# c ; x\n" * m + "bash", n), True),
+                (_Fam(lambda m: "echo sudo | " + "# c\n" * m + "cat\nbash", n), False),
+                (_Fam(lambda m: "# c | x\n" * m + "echo sudo", n), False),
+                (_Fam(lambda m: "echo sudo | " + "while\\\n x; do " * m + "bash" + "; done" * m, n), True),
+                (_Fam(lambda m: "echo sudo | " + "if\\\n x; then " * m + "cat" + "; fi" * m, n), False),
                 # T-4375 round 2: comments ending in `\`, shell words in a
                 # pipe-holding comment, and a long comment after a shell.
-                ("echo sudo | " + "# c \\\n" * n + "bash", True),
-                ("echo sudo | # c " + "bash f " * n, False),
-                ("echo sudo | bash " + "# c " * n, True),
-                ("ssh h " + "a'b c' " * n, False)):
-            with self.subTest(cmd=cmd[:40]):
+                (_Fam(lambda m: "echo sudo | " + "# c \\\n" * m + "bash", n), True),
+                (_Fam(lambda m: "echo sudo | # c " + "bash f " * m, n), False),
+                (_Fam(lambda m: "echo sudo | bash " + "# c " * m, n), True),
+                (_Fam(lambda m: "ssh h " + "a'b c' " * m, n), False)):
+            with self.subTest(cmd=cmd.text[:40]):
                 self.assertEqual(self._timed(cmd), blocked)
 
     def test_continued_comment_lines_stay_linear(self):
@@ -6557,24 +6763,24 @@ class TestResidualWalkStaysLinear(unittest.TestCase):
         # by one forward-only cursor.
         # (~0.9s CPU for the first row; the base walk alone is ~0.65s.)
         n = 20000
-        for cmd, blocked in (("# c \\\n" * n + "sudo id", True),
-                             ("#\\\n" * n + "echo ok", False),
-                             ("# c " + "x " * n + "\\\n" + "sudo id", True)):
-            with self.subTest(cmd=cmd[:40]):
+        for cmd, blocked in ((_Fam(lambda m: "# c \\\n" * m + "sudo id", n), True),
+                             (_Fam(lambda m: "#\\\n" * m + "echo ok", n), False),
+                             (_Fam(lambda m: "# c " + "x " * m + "\\\n" + "sudo id", n), True)):
+            with self.subTest(cmd=cmd.text[:40]):
                 self.assertEqual(self._timed(cmd), blocked)
 
     def test_quotes_in_comments_stay_linear(self):
         # T-4393 follow-up: comment and `$'...'` state is one flag each.
         n = self.N
-        for cmd, blocked in (("true # it's\n" * n + "sudo id # '", True),
-                             ("echo $'\\'' ; " * n + "sudo id # '", True),
-                             ("x=${a// #/'b'} ; " * (n // 2) + "echo ok", False),
+        for cmd, blocked in ((_Fam(lambda m: "true # it's\n" * m + "sudo id # '", n), True),
+                             (_Fam(lambda m: "echo $'\\'' ; " * m + "sudo id # '", n), True),
+                             (_Fam(lambda m: "x=${a// #/'b'} ; " * m + "echo ok", n // 2), False),
                              # Round 2: a backtick closes every frame opened
                              # inside it once; paren kinds are one push/pop.
                              # (n/2: ~0.5-0.8s CPU each, like the base.)
-                             ("echo `echo 'a $(b` ; " * (n // 2) + "sudo id", True),
-                             ("echo $(echo a)#x <(b)#y ; " * (n // 2) + "echo ok", False)):
-            with self.subTest(cmd=cmd[:40]):
+                             (_Fam(lambda m: "echo `echo 'a $(b` ; " * m + "sudo id", n // 2), True),
+                             (_Fam(lambda m: "echo $(echo a)#x <(b)#y ; " * m + "echo ok", n // 2), False)):
+            with self.subTest(cmd=cmd.text[:40]):
                 self.assertEqual(self._timed(cmd), blocked)
 
     def test_deep_shlex_quote_nesting_stays_linear(self):
@@ -6597,7 +6803,9 @@ class TestResidualWalkStaysLinear(unittest.TestCase):
                 cmd = "sh -c " + shlex.quote(cmd)
             cmd = ("echo sudo | " if pipe else "") + cmd
             with self.subTest(inner=inner, levels=lv, chars=len(cmd)):
-                self.assertEqual(self._timed(cmd), blocked)
+                # T-5838: a fixed level count (each level triples the text), no size family
+                worker_guard._scan.cache_clear()
+                self.assertEqual(_cpu_best_of(self, _blocked, cmd, "implementer", label=cmd), blocked)
 
 
 def _t4145_gh_regexes():
@@ -6646,22 +6854,22 @@ class TestGhPrefixStaysLinear(unittest.TestCase):
 
     N = 6000
 
-    def _timed_gh(self, cmd):
+    def _timed_gh(self, fam):
         worker_guard._scan.cache_clear()
-        return _cpu_bounded(self, worker_guard._gh_cli_violation, cmd, "/tmp", label=cmd)
+        return _cpu_fam(self, worker_guard._gh_cli_violation, fam, "/tmp", label=fam.text)
 
     def test_assignment_anchor_run(self):
-        self.assertIsNone(self._timed_gh("A={ " * self.N + "gh pr view 5"))
+        self.assertIsNone(self._timed_gh(_rep("A={ ", self.N, tail="gh pr view 5")))
         self.assertFalse(_gh_blocked("A={ " * self.N + "gh pr view 5"))
-        self.assertIsNotNone(self._timed_gh("A={ " * self.N + "gh pr merge 5"))
+        self.assertIsNotNone(self._timed_gh(_rep("A={ ", self.N, tail="gh pr merge 5")))
         self.assertTrue(_gh_blocked("A={ " * self.N + "gh pr merge 5"))
-        self.assertIsNone(self._timed_gh("A={ " * self.N + "x"))
+        self.assertIsNone(self._timed_gh(_rep("A={ ", self.N, tail="x")))
 
     def test_nested_gh_spans(self):
-        for cmd in ("(gh " * self.N, "(gh pr view 5 " * self.N, "{ gh pr view 5 " * self.N):
-            with self.subTest(cmd=cmd[:30]):
-                self.assertIsNotNone(self._timed_gh(cmd))
-                self.assertTrue(_gh_blocked(cmd))
+        for unit in ("(gh ", "(gh pr view 5 ", "{ gh pr view 5 "):
+            with self.subTest(cmd=(unit * self.N)[:30]):
+                self.assertIsNotNone(self._timed_gh(_rep(unit, self.N)))
+                self.assertTrue(_gh_blocked(unit * self.N))
 
 
 # T-4389 part B: the pre-fix code, copied verbatim from d2a07924d as test oracles.
@@ -6749,24 +6957,23 @@ class TestKeywordAndWhitespaceRunsStayLinear(unittest.TestCase):
 
     def _rows(self):
         for unit in self.UNITS:
-            body = unit * (self.SIZE // len(unit))
-            yield unit, body + "x", False
-            yield unit, body + "sudo x", True
+            yield unit, _rep(unit, self.SIZE // len(unit), tail="x"), False
+            yield unit, _rep(unit, self.SIZE // len(unit), tail="sudo x"), True
 
     def test_helpers_fast(self):
-        for unit, cmd, _ in self._rows():
-            with self.subTest(unit=unit, tail=cmd[-6:]):
+        for unit, fam, _ in self._rows():
+            with self.subTest(unit=unit, tail=fam.text[-6:]):
                 for anchors in (worker_guard._CMD_ANCHOR_CHARS, worker_guard._CMD_ANCHOR_CHARS_RAW):
-                    _cpu_bounded(self, worker_guard._cmd_positions, cmd, anchors, label=unit)
-                _cpu_bounded(self, worker_guard._gh_cmd_matches, cmd, label=unit)
-                _cpu_bounded(self, worker_guard._gh_dynamic_cmd, cmd, label=unit)
+                    _cpu_fam(self, worker_guard._cmd_positions, fam, anchors, label=unit)
+                _cpu_fam(self, worker_guard._gh_cmd_matches, fam, label=unit)
+                _cpu_fam(self, worker_guard._gh_dynamic_cmd, fam, label=unit)
 
     def test_decide_fast(self):
-        for unit, cmd, blocked in self._rows():
-            with self.subTest(unit=unit, tail=cmd[-6:]):
+        for unit, fam, blocked in self._rows():
+            with self.subTest(unit=unit, tail=fam.text[-6:]):
                 worker_guard._scan.cache_clear()
                 self.assertEqual(
-                    _cpu_bounded(self, _blocked, cmd, "implementer", label=unit), blocked)
+                    _cpu_fam(self, _blocked, fam, "implementer", label=unit), blocked)
 
 
 class TestHeredocBodiesInScan(unittest.TestCase):
@@ -7004,19 +7211,20 @@ class TestHeredocBodiesStayLinear(unittest.TestCase):
     Z = 60_000
 
     def _fill(self, unit, head="", tail=""):
-        return head + unit * ((self.Z - len(head) - len(tail)) // len(unit)) + tail
+        return _fill(unit, head, tail, self.Z)
 
     def _rows(self):
         f = self._fill
         yield "long body", f("it's a line\n", "cat <<E\n", "E\nls"), False
         yield "many heredocs", f("cat <<E\nx'\nE\n", "", "ls"), False
-        yield "many ops on one line", "cat " + "<<E " * 6600 + "\n" + "x'\nE\n" * 6600 + "ls", False
+        yield "many ops on one line", _Fam(lambda m: "cat " + "<<E " * m + "\n" + "x'\nE\n" * m + "ls",
+                                           6600), False
         yield "hand-off chain", f("sed 's/^/sudo /' <<E |\nls\nE\n", "", "sh"), True
         yield "substitutions in a body", f("$(ls) '\n", "cat <<E\n", "E\nls"), False
         yield "arithmetic shifts", f("(( 1<<2 ))\n", "", "ls"), False
         yield "expansion shifts", f("echo $((1<<2))\n", "", "ls"), False
-        yield "bare << run", "<<" * 30000, False
-        yield "one long delimiter", "cat <<" + "E" * 59990 + "\nx\n", False
+        yield "bare << run", _rep("<<", 30000), False
+        yield "one long delimiter", _rep("E", 59990, "cat <<", "\nx\n"), False
         yield "subscript shifts", f("a[1<<2]=x\n", "", "ls"), False
         yield "joined body lines", f("a\\\n", "cat <<E\n", "E\nls"), False
         yield "<<- bodies", f("cat <<-E\n\tx'\n\tE\n", "", "ls"), False
@@ -7026,8 +7234,8 @@ class TestHeredocBodiesStayLinear(unittest.TestCase):
             with self.subTest(row=label):
                 worker_guard._scan.cache_clear()
                 self.assertEqual(
-                    _cpu_bounded(self, _blocked, cmd, "implementer", label=label,
-                                 bound=self.BOUND), blocked)
+                    _cpu_fam(self, _blocked, cmd, "implementer", label=label,
+                             bound=self.BOUND), blocked)
 
     def test_two_reading_rows_fast(self):
         # Shell-fed and piped bodies, allowed by both passes: measured
@@ -7040,8 +7248,8 @@ class TestHeredocBodiesStayLinear(unittest.TestCase):
                            ("shell-fed ls lines", f("ls\n", "sh -s <<'E'\n", "E"))):
             with self.subTest(row=label):
                 worker_guard._scan.cache_clear()
-                self.assertFalse(_cpu_bounded(self, _blocked, cmd, "implementer", label=label,
-                                              bound=self.BOUND))
+                self.assertFalse(_cpu_fam(self, _blocked, cmd, "implementer", label=label,
+                                          bound=self.BOUND))
 
 
 # T-4389: this class measures the PARSERS' linearity at sizes above the 64 KiB Bash cap, which
@@ -7237,21 +7445,21 @@ class TestDataHeredoc(unittest.TestCase):
 
     def test_long_heredocs_stay_linear(self):
         n = 6000
-        for cmd, blocked in (
-            ("cat > /tmp/r.md <<'EOF'\n" + "run `sudo x` and gh pr merge 5\n" * n + "EOF", False),
-            ("bash <<'EOF'\n" + "sudo x\n" * n + "EOF", True),
-            ("cat > /tmp/r.md <<'EOF'\n" + "sudo x\n" * n, True),
-            ("cat > /tmp/r.md <<'EOF'\n" + "EOFX\n EOF\n" * n + "EOF", False),
+        for fam, blocked in (
+            (_rep("run `sudo x` and gh pr merge 5\n", n, "cat > /tmp/r.md <<'EOF'\n", "EOF"), False),
+            (_rep("sudo x\n", n, "bash <<'EOF'\n", "EOF"), True),
+            (_rep("sudo x\n", n, "cat > /tmp/r.md <<'EOF'\n"), True),
+            (_rep("EOFX\n EOF\n", n, "cat > /tmp/r.md <<'EOF'\n", "EOF"), False),
         ):
-            with self.subTest(cmd=cmd[:30]):
+            with self.subTest(cmd=fam.text[:30]):
                 worker_guard._scan.cache_clear()
-                self.assertEqual(_cpu_bounded(self, _blocked, cmd, "implementer", label=cmd), blocked)
-        for cmd in ("cat > /tmp/r.md <<'EOF'\nsudo x\nEOF\n" * n,
-                    "cat > f " + "> g " * n + "<<'EOF'\nsudo x\nEOF",
-                    "(" * n + "cat > f <<'EOF'\nsudo x\nEOF\n" + ")" * n,
-                    "cat > f <<'EOF'\n" * n):
-            with self.subTest(cmd=cmd[:30]):
-                _cpu_bounded(self, worker_guard._data_heredoc_text, cmd, label=cmd)
+                self.assertEqual(_cpu_fam(self, _blocked, fam, "implementer", label=fam.text), blocked)
+        for fam in (_rep("cat > /tmp/r.md <<'EOF'\nsudo x\nEOF\n", n),
+                    _rep("> g ", n, "cat > f ", "<<'EOF'\nsudo x\nEOF"),
+                    _Fam(lambda m: "(" * m + "cat > f <<'EOF'\nsudo x\nEOF\n" + ")" * m, n),
+                    _rep("cat > f <<'EOF'\n", n)):
+            with self.subTest(cmd=fam.text[:30]):
+                _cpu_fam(self, worker_guard._data_heredoc_text, fam, label=fam.text)
 
 
 class TestFailClosedBounds(unittest.TestCase):
@@ -7517,33 +7725,33 @@ class TestArrayAssignmentPrefixStaysLinear(unittest.TestCase):
 
     N = 6000
 
-    def _timed(self, cmd):
+    def _timed(self, fam):
         worker_guard._scan.cache_clear()
-        return _cpu_bounded(self, _blocked, cmd, "implementer", label=cmd)
+        return _cpu_fam(self, _blocked, fam, "implementer", label=fam.text)
 
     def test_runs_decide_fast(self):
         n = self.N
-        for cmd, blocked in (("x=(" * n + "sudo id", True),
-                             ("x=(a)" * n + " sudo id", True),
-                             ("x=(a) " * n + "sudo id", True),
-                             ("x=(a)#x " * n + "sudo id", True),
-                             ("a[" * n + " sudo id", True),
-                             ("a[{" * n + " sudo id", True),
-                             ("(a[1" * n + " x", False),
-                             ("]=" * n + " sudo id", True),
-                             ("x=('(" * n + " x", False),
-                             ("x=(a) echo " * n + "x", False),
-                             ("a[1]=x " * n + "gh auth status -t", True),
-                             ("arr=(a); cp $(pwd)x " * n + "x", False),
+        for cmd, blocked in ((_Fam(lambda m: "x=(" * m + "sudo id", n), True),
+                             (_Fam(lambda m: "x=(a)" * m + " sudo id", n), True),
+                             (_Fam(lambda m: "x=(a) " * m + "sudo id", n), True),
+                             (_Fam(lambda m: "x=(a)#x " * m + "sudo id", n), True),
+                             (_Fam(lambda m: "a[" * m + " sudo id", n), True),
+                             (_Fam(lambda m: "a[{" * m + " sudo id", n), True),
+                             (_Fam(lambda m: "(a[1" * m + " x", n), False),
+                             (_Fam(lambda m: "]=" * m + " sudo id", n), True),
+                             (_Fam(lambda m: "x=('(" * m + " x", n), False),
+                             (_Fam(lambda m: "x=(a) echo " * m + "x", n), False),
+                             (_Fam(lambda m: "a[1]=x " * m + "gh auth status -t", n), True),
+                             (_Fam(lambda m: "arr=(a); cp $(pwd)x " * m + "x", n), False),
                              # round 2
-                             ("a[x " * n + "sudo id", True),
-                             ("a[x y " * n + "z]=v sudo id", True),
-                             ("x=${a " * n + "} sudo id", True),
-                             ('x=${"' * n + " x", False),
-                             ("x=${'" * n + " x", False),
-                             ("x=${$(" * n + " x", True),  # T-5140 r2: scan overflow
-                             ("x=${y:-a b} " * n + "sudo id", True)):
-            with self.subTest(cmd=cmd[:40]):
+                             (_Fam(lambda m: "a[x " * m + "sudo id", n), True),
+                             (_Fam(lambda m: "a[x y " * m + "z]=v sudo id", n), True),
+                             (_Fam(lambda m: "x=${a " * m + "} sudo id", n), True),
+                             (_Fam(lambda m: 'x=${"' * m + " x", n), False),
+                             (_Fam(lambda m: "x=${'" * m + " x", n), False),
+                             (_Fam(lambda m: "x=${$(" * m + " x", n), True),  # T-5140 r2: scan overflow
+                             (_Fam(lambda m: "x=${y:-a b} " * m + "sudo id", n), True)):
+            with self.subTest(cmd=cmd.text[:40]):
                 self.assertEqual(self._timed(cmd), blocked)
 
     def test_quoted_subscript_decide_fast(self):
@@ -7552,21 +7760,21 @@ class TestArrayAssignmentPrefixStaysLinear(unittest.TestCase):
         # the text (30.9 s at 64K); `_AssignRuns.head_end` is linear. At
         # 2 * N units (36K characters) round 1 took about 10 s each.
         n = 2 * self.N
-        for cmd in ('a["' * n, '"a[' * n, "a['" * n, 'a[$"' * n):
-            with self.subTest(cmd=cmd[:40]):
-                self.assertTrue(self._timed(cmd + " sudo id"))
+        for unit in ('a["', '"a[', "a['", 'a[$"'):
+            with self.subTest(cmd=(unit * n)[:40]):
+                self.assertTrue(self._timed(_rep(unit, n, tail=" sudo id")))
 
     def test_quote_heavy_decide_fast(self):
         # `_in_command_word` runs at every quote, on a 120-char window.
         n = self.N
-        for cmd, blocked in (('x=(a)#x "q"; ' * n + 'x=(a)#x "sudo" id', True),
+        for cmd, blocked in ((_Fam(lambda m: 'x=(a)#x "q"; ' * m + 'x=(a)#x "sudo" id', n), True),
                              # T-4426 r2: `'q'` after `a[1]=x ` is a quoted command word
-                             ("a[1]=x 'q' " * n + "echo ok", True),
+                             (_Fam(lambda m: "a[1]=x 'q' " * m + "echo ok", n), True),
                              # T-4426 r3: so is `"q"` after the array assignment
                              # `x=(a) ` (bash runs it as the command); this row
                              # was an ALLOW row before.
-                             ('x=(a) "q" ' * n + "echo ok", True)):
-            with self.subTest(cmd=cmd[:40]):
+                             (_Fam(lambda m: 'x=(a) "q" ' * m + "echo ok", n), True)):
+            with self.subTest(cmd=cmd.text[:40]):
                 self.assertEqual(self._timed(cmd), blocked)
 
 
@@ -8257,14 +8465,15 @@ class TestPythonStartupHookWrites(unittest.TestCase):
         self.assertIn("spell the command out literally", r["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_r5_code_strings_stay_linear(self):
+        # T-5838: rows past 65000 characters fill it with whole units (was a `[:65000]` cut)
         n = 10000
-        for cmd in ("timeout 1 bash -c 'cd /tmp && ls'; " * n,
-                    "timeout 1 bash -c \"timeout 1 bash -c 'timeout 1 bash -c ls'\"; " * (n // 4),
-                    "bash " * n + "-c 'ls'",
-                    "bash -c " * n + "ls",
-                    "eval 'bash -c ls'; " * n):
-            with self.subTest(cmd=cmd[:30]):
-                _cpu_bounded(self, worker_guard._py_startup_write_match, cmd[:65000], "/tmp", label=cmd[:40])
+        for fam in (_fill("timeout 1 bash -c 'cd /tmp && ls'; ", size=65000),
+                    _fill("timeout 1 bash -c \"timeout 1 bash -c 'timeout 1 bash -c ls'\"; ", size=65000),
+                    _rep("bash ", n, tail="-c 'ls'"),
+                    _fill("bash -c ", tail="ls", size=65000),
+                    _fill("eval 'bash -c ls'; ", size=65000)):
+            with self.subTest(cmd=fam.text[:30]):
+                _cpu_fam(self, worker_guard._py_startup_write_match, fam, "/tmp", label=fam.text[:40])
 
     # The round-5 review's findings (T-4397 part B r6), each ALLOW at 9837f049a.
     R6_MUST_DENY = [
@@ -8474,10 +8683,11 @@ class TestPythonStartupHookWrites(unittest.TestCase):
 
     def test_r6_wrapper_scan_stays_linear(self):
         n = 10000
-        for cmd in ("flock /tmp/l -c 'ls'; " * n, "env " * n + "-S 'ls'",
-                    "script " * n + "-qc ls /dev/null", "echo $'a\\tb' " * n):
-            with self.subTest(cmd=cmd[:30]):
-                _cpu_bounded(self, worker_guard._py_startup_write_match, cmd[:65000], "/tmp", label=cmd[:40])
+        for fam in (_fill("flock /tmp/l -c 'ls'; ", size=65000), _rep("env ", n, tail="-S 'ls'"),
+                    _fill("script ", tail="-qc ls /dev/null", size=65000),
+                    _fill("echo $'a\\tb' ", size=65000)):
+            with self.subTest(cmd=fam.text[:30]):
+                _cpu_fam(self, worker_guard._py_startup_write_match, fam, "/tmp", label=fam.text[:40])
 
     def test_r4_review_findings_denied(self):
         for cwd, cmd in self._rows(self.R4_MUST_DENY + self.R4_NOW_DENIED):
@@ -8524,32 +8734,37 @@ class TestPythonStartupHookWrites(unittest.TestCase):
                 self.assertIsNotNone(worker_guard._py_startup_write_match(cmd, "/tmp"))
 
     def test_new_walk_stays_linear(self):
-        n = 60000
-        for cmd, cwd in (('"' * n, "/tmp"), ("\\" * n, "/tmp"), ("'" * n, "/tmp"), ('"\\' * (n // 2), "/tmp"),
-                         ('"$(' * (n // 3), "/tmp"), ('echo "$(x)' * (n // 10), self.HOOK),
-                         ("echo " + "1" * n, "/tmp"), ("echo " + "&1" * (n // 2), "/tmp"),
-                         ("cp " + "x " * (n // 2), self.HOOK),
-                         ("cd a;" * (n // 5), "/tmp"), ("cp " + "a/../" * (n // 5), self.HOOK),
-                         ("cp " + ".local/" * (n // 7), "/tmp"),
-                         # r1: a deep hot cwd times many relative words, once per word not per char
-                         ("cp " + "b " * (n // 2), "/tmp/.local/" + "a/" * 2000),
-                         ("cd /tmp/.local/" + "a/" * 2000 + "; cp " + "b/ " * ((n - 4200) // 3), "/tmp"),
-                         ("cp " + "../b " * (n // 5), "/tmp/.local/" + "a/" * 2000),
-                         ("cd a\n" * (n // 5), self.HOOK),
-                         # r2: heredoc-heavy shapes and long cd chains
-                         ("cat <<'E' >/tmp/a\nit's\nE\n" * (n // 22), "/tmp"),
-                         ("cat <<E >/tmp/a\n$(date) x\nE\n" * (n // 26), "/tmp"),
-                         ("cat <<'E' >/tmp/a\n" + "x y z\n" * (n // 6), "/tmp"),
-                         ("cat " + "<<E " * (n // 8) + "\nE\n", "/tmp"),
-                         ("echo $(( " + "1<<" * (n // 3) + "1 ))", "/tmp"),
-                         ("cd /tmp" + " && cd ." * (n // 9), "/tmp"),
-                         ("cd src; " + "cd ..; cd src; " * (n // 15), "/tmp"),
-                         ("cd a && make && cd .. && " * (n // 26) + "ls", "/tmp"),
-                         ("".join(f"cd a{i};" for i in range(n // 9)), "/tmp"),
-                         ("cd ..;" * (n // 6), self.HOOK),
-                         ("".join(f"cd /d{i}; " for i in range(40)) + "cp " + "../b " * 5000, "/tmp")):
-            with self.subTest(cmd=cmd[:20]):
-                _cpu_bounded(self, worker_guard._py_startup_write_match, cmd, cwd, label=cmd)
+        # T-5838: each row is a family over its character budget `c` (60000 here), judged by
+        # growth over c/16, c/2 and c on a load miss; the deep cwd is a fixed argument.
+        deep = "/tmp/.local/" + "a/" * 2000
+        cds = "".join(f"cd /d{i}; " for i in range(40))
+        for build, cwd in ((lambda c: '"' * c, "/tmp"), (lambda c: "\\" * c, "/tmp"),
+                           (lambda c: "'" * c, "/tmp"), (lambda c: '"\\' * (c // 2), "/tmp"),
+                           (lambda c: '"$(' * (c // 3), "/tmp"), (lambda c: 'echo "$(x)' * (c // 10), self.HOOK),
+                           (lambda c: "echo " + "1" * c, "/tmp"), (lambda c: "echo " + "&1" * (c // 2), "/tmp"),
+                           (lambda c: "cp " + "x " * (c // 2), self.HOOK),
+                           (lambda c: "cd a;" * (c // 5), "/tmp"), (lambda c: "cp " + "a/../" * (c // 5), self.HOOK),
+                           (lambda c: "cp " + ".local/" * (c // 7), "/tmp"),
+                           # r1: a deep hot cwd times many relative words, once per word not per char
+                           (lambda c: "cp " + "b " * (c // 2), deep),
+                           (lambda c: "cd " + deep + "; cp " + "b/ " * ((c - 4200) // 3), "/tmp"),
+                           (lambda c: "cp " + "../b " * (c // 5), deep),
+                           (lambda c: "cd a\n" * (c // 5), self.HOOK),
+                           # r2: heredoc-heavy shapes and long cd chains
+                           (lambda c: "cat <<'E' >/tmp/a\nit's\nE\n" * (c // 22), "/tmp"),
+                           (lambda c: "cat <<E >/tmp/a\n$(date) x\nE\n" * (c // 26), "/tmp"),
+                           (lambda c: "cat <<'E' >/tmp/a\n" + "x y z\n" * (c // 6), "/tmp"),
+                           (lambda c: "cat " + "<<E " * (c // 8) + "\nE\n", "/tmp"),
+                           (lambda c: "echo $(( " + "1<<" * (c // 3) + "1 ))", "/tmp"),
+                           (lambda c: "cd /tmp" + " && cd ." * (c // 9), "/tmp"),
+                           (lambda c: "cd src; " + "cd ..; cd src; " * (c // 15), "/tmp"),
+                           (lambda c: "cd a && make && cd .. && " * (c // 26) + "ls", "/tmp"),
+                           (lambda c: "".join(f"cd a{i};" for i in range(c // 9)), "/tmp"),
+                           (lambda c: "cd ..;" * (c // 6), self.HOOK),
+                           (lambda c: cds + "cp " + "../b " * (c // 12), "/tmp")):
+            fam = _Fam(build, 60000)
+            with self.subTest(cmd=fam.text[:20]):
+                _cpu_fam(self, worker_guard._py_startup_write_match, fam, cwd, label=fam.text)
 
     # T-4491: `_py_cannot_match` skips the lexer walk only for text that cannot
     # write a startup-hook path. Each row reaches one through a variable, a cd
@@ -8697,12 +8912,12 @@ class TestPythonStartupHookWrites(unittest.TestCase):
         # Shapes the pre-filter does NOT skip (an option dash, a relevant cwd),
         # so the lexer walk itself is timed on many writing commands.
         n = 60000
-        for cmd, cwd in (("cp -p a b; " * (n // 11), "/tmp"),
-                         ("cp a b; " * (n // 8), self.HOOK),
-                         ("arr=(a); cp $(pwd)x " * (n // 20) + "x", self.HOOK),
-                         ("mv -f a b && " * (n // 13) + "x", "/tmp")):
-            with self.subTest(cmd=cmd[:20]):
-                _cpu_bounded(self, worker_guard._py_startup_write_match, cmd, cwd, label=cmd)
+        for fam, cwd in ((_fill("cp -p a b; ", size=n), "/tmp"),
+                         (_fill("cp a b; ", size=n), self.HOOK),
+                         (_rep("arr=(a); cp $(pwd)x ", n // 20, tail="x"), self.HOOK),
+                         (_rep("mv -f a b && ", n // 13, tail="x"), "/tmp")):
+            with self.subTest(cmd=fam.text[:20]):
+                _cpu_fam(self, worker_guard._py_startup_write_match, fam, cwd, label=fam.text)
 
     # T-4444: a pure `&&`-chain (with plain `;`/newline statements around it)
     # is read step by step, so a relative write resolves against the dir the
@@ -8844,16 +9059,17 @@ class TestPythonStartupHookWrites(unittest.TestCase):
     def test_t4444_chain_stays_linear(self):
         n = 60000
         pc = os.path.dirname(os.path.dirname(self.HOOK))
-        for cmd, cwd in (("cd a && make && " * (n // 16) + "ls", "/tmp"),
-                         ("cd a && make && " * (n // 16) + "cp x tools/hooks/y.py", pc),
-                         ("cd a && make && cd .. && " * (n // 24) + "cp x tools/hooks/y.py", pc),
-                         ("cd src && make && cd .. && cd docs && make && cd .. && " * (n // 52) + "ls", "/tmp"),
-                         ("cd a && make && cd ..; " * (n // 22) + "ls", "/tmp"),
-                         ("cd $X && make && cd /tmp && " * (n // 28) + "cp x tools/hooks/y.py", pc),
-                         ("(" + " " * (n // 2) + "x" + ")" * (n // 2 - 4), "/tmp"),
-                         ("cd src && (( " + "1 && " * (n // 6) + "1 )) && cd .. && cd ..", "/tmp")):
-            with self.subTest(cmd=cmd[:30]):
-                _cpu_bounded(self, worker_guard._py_startup_write_match, cmd, cwd, label=cmd)
+        for fam, cwd in ((_rep("cd a && make && ", n // 16, tail="ls"), "/tmp"),
+                         (_rep("cd a && make && ", n // 16, tail="cp x tools/hooks/y.py"), pc),
+                         (_rep("cd a && make && cd .. && ", n // 24, tail="cp x tools/hooks/y.py"), pc),
+                         (_rep("cd src && make && cd .. && cd docs && make && cd .. && ", n // 52, tail="ls"),
+                          "/tmp"),
+                         (_rep("cd a && make && cd ..; ", n // 22, tail="ls"), "/tmp"),
+                         (_rep("cd $X && make && cd /tmp && ", n // 28, tail="cp x tools/hooks/y.py"), pc),
+                         (_Fam(lambda m: "(" + " " * m + "x" + ")" * (m - 4), n // 2), "/tmp"),
+                         (_rep("1 && ", n // 6, "cd src && (( ", "1 )) && cd .. && cd .."), "/tmp")):
+            with self.subTest(cmd=fam.text[:30]):
+                _cpu_fam(self, worker_guard._py_startup_write_match, fam, cwd, label=fam.text)
 
     def test_heredoc_into_startup_path_denied(self):
         cmd = f"cat > {self.USITE}/usercustomize.py <<'EOF'\nimport os\nEOF"
@@ -8869,23 +9085,23 @@ class TestNestedSubstitutionStaysLinear(unittest.TestCase):
     each level once; these rows measure 0.6-1.0 s CPU (the base walk's cost
     at this size)."""
 
-    def _timed(self, cmd):
+    def _timed(self, fam):
         worker_guard._scan.cache_clear()
-        return _cpu_bounded(self, _blocked, cmd, "implementer", label=cmd)
+        return _cpu_fam(self, _blocked, fam, "implementer", label=fam.text)
 
     def test_nested_groups_decide_fast(self):
         # T-5140 r2: every row nests past `_SCAN_NEST_MAX` scan frames, so the
         # benign rows are now refused as a scan overflow (fail-closed) too;
         # the rows still bound the decide() cost.
-        for cmd, blocked in (("echo " + "$(" * 12500 + "printf zzmark" + ")#" * 12500, True),
-                             ("echo $(" + "(" * 20000 + "printf zzmark" + ")" * 20000 + ")", True),
-                             ("printf zzmark " + "$(ls " * 10000 + ")" * 10000, True),
-                             ("echo " + "$(" * 12500 + "sudo id" + ")#" * 12500, True),
-                             ("echo $(" + "(" * 20000 + "sudo id" + ")" * 20000 + ")", True),
-                             ("(ls; " * 10000 + "sudo id" + ")" * 10000, True)):
-            with self.subTest(cmd=cmd[:40], chars=len(cmd)):
-                self.assertLessEqual(len(cmd), worker_guard.BASH_COMMAND_MAX_CHARS)
-                self.assertEqual(self._timed(cmd), blocked)
+        for fam, blocked in ((_Fam(lambda m: "echo " + "$(" * m + "printf zzmark" + ")#" * m, 12500), True),
+                             (_Fam(lambda m: "echo $(" + "(" * m + "printf zzmark" + ")" * m + ")", 20000), True),
+                             (_Fam(lambda m: "printf zzmark " + "$(ls " * m + ")" * m, 10000), True),
+                             (_Fam(lambda m: "echo " + "$(" * m + "sudo id" + ")#" * m, 12500), True),
+                             (_Fam(lambda m: "echo $(" + "(" * m + "sudo id" + ")" * m + ")", 20000), True),
+                             (_Fam(lambda m: "(ls; " * m + "sudo id" + ")" * m, 10000), True)):
+            with self.subTest(cmd=fam.text[:40], chars=len(fam.text)):
+                self.assertLessEqual(len(fam.text), worker_guard.BASH_COMMAND_MAX_CHARS)
+                self.assertEqual(self._timed(fam), blocked)
 
 
 
@@ -9202,23 +9418,25 @@ class TestEvalJoinsItsArguments(unittest.TestCase):
 
     def test_t5109_reader_check_stays_linear(self):
         c = self.JOIN_ONLY[1]
-        for cmd in (("cat <<'E'\n" + c + "\nE\n") * 700, ("python3 - <<'E'\n" + c + "\nE\n") * 700,
-                    ("bash <<'E'\n" + c + "\nE\n") * 700,
-                    "cat <<'E'\n" + ("eval x\n" * 7000) + "E\n" + c):
-            with self.subTest(cmd=cmd[:30]):
-                _cpu_bounded(self, _blocked, cmd[:60000], "implementer", label=cmd[:30])
+        # T-5838: whole units up to 60000 characters (was a `[:60000]` cut; the sizes are the same)
+        for fam in (_Fam(lambda m: (("cat <<'E'\n" + c + "\nE\n") * m)[:60000], 700),
+                    _Fam(lambda m: (("python3 - <<'E'\n" + c + "\nE\n") * m)[:60000], 700),
+                    _Fam(lambda m: (("bash <<'E'\n" + c + "\nE\n") * m)[:60000], 700),
+                    _rep("eval x\n", 7000, "cat <<'E'\n", "E\n" + c)):
+            with self.subTest(cmd=fam.text[:30]):
+                _cpu_fam(self, _blocked, fam, "implementer", label=fam.text[:30])
 
     def test_eval_join_stays_linear(self):
-        for cmd in (('eval echo "a;" b; ' * 2000)[:30000],
-                    "echo $(eval a " * 2000 + ")" * 2000,
-                    "echo `eval a b` " * 2000,
-                    ">f " * 10000 + "eval a b",
-                    "eval " * 6000 + "a",
-                    'eval "a" $(' * 3000,
-                    "( eval '" * 4000,
-                    "eval x $(eval x \"$(eval x `eval " * 1000):
-            with self.subTest(cmd=cmd[:30]):
-                _cpu_bounded(self, _blocked, cmd, "implementer", label=cmd[:30])
+        for fam in (_fill('eval echo "a;" b; ', size=30000),
+                    _Fam(lambda m: "echo $(eval a " * m + ")" * m, 2000),
+                    _rep("echo `eval a b` ", 2000),
+                    _rep(">f ", 10000, tail="eval a b"),
+                    _rep("eval ", 6000, tail="a"),
+                    _rep('eval "a" $(', 3000),
+                    _rep("( eval '", 4000),
+                    _rep("eval x $(eval x \"$(eval x `eval ", 1000)):
+            with self.subTest(cmd=fam.text[:30]):
+                _cpu_fam(self, _blocked, fam, "implementer", label=fam.text[:30])
 
 
 class TestBareDirOperandAndCdChain(unittest.TestCase):
@@ -9642,12 +9860,10 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
                 self.assertFalse(_blocked_cwd(cmd, root, agent_type="implementer"))
 
     def test_long_dynamic_write_gate_stays_linear(self):
-        prefix = "printf x >/tmp/out; "
-        suffix = 'echo x > "$P"'
-        cmd = prefix * 2500 + suffix
-        self.assertLessEqual(len(cmd), worker_guard.BASH_COMMAND_MAX_CHARS)
-        self.assertTrue(_cpu_bounded(self, _blocked_cwd, cmd, "/tmp", "implementer",
-                                     label="long dynamic write gate trailing target"))
+        fam = _rep("printf x >/tmp/out; ", 2500, tail='echo x > "$P"')
+        self.assertLessEqual(len(fam.text), worker_guard.BASH_COMMAND_MAX_CHARS)
+        self.assertTrue(_cpu_fam(self, _blocked_cwd, fam, "/tmp", "implementer",
+                                 label="long dynamic write gate trailing target"))
 
     # --- T-5325: the bare-dir rule judges the wrapped and code-string command too ---
     # `rm -rf <R>/ledger` was denied but `env rm -rf <R>/ledger`, `nice ...`, `timeout 5 ...`,
@@ -9919,14 +10135,14 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
     def test_t5326_destroy_shapes_stay_linear(self):
         root = self._shapes()["iso"]
         n = 2500
-        for label, cmd in (("rm glob chain", ("rm -rf /tmp/x/*; " * n)[:60000]),
-                           ("time env -C chain", ("time -p env -C /tmp rm -rf b*; " * n)[:60000]),
-                           ("bash -c rm chain", ("bash -c 'rm -rf /tmp/x/*'; " * n)[:60000]),
-                           ("nested braces", "rm -rf " + "{" * 20000 + "x" + "}" * 20000),
-                           ("brace product", "rm -rf /tmp/" + "{a,b}" * 30),
-                           ("find exec run", "find " + "-exec x " * 5000 + "/tmp/x -delete")):
+        for label, fam in (("rm glob chain", _rep("rm -rf /tmp/x/*; ", n)),
+                           ("time env -C chain", _fill("time -p env -C /tmp rm -rf b*; ")),
+                           ("bash -c rm chain", _fill("bash -c 'rm -rf /tmp/x/*'; ")),
+                           ("nested braces", _Fam(lambda m: "rm -rf " + "{" * m + "x" + "}" * m, 20000)),
+                           ("brace product", _rep("{a,b}", 30, "rm -rf /tmp/")),
+                           ("find exec run", _rep("-exec x ", 5000, "find ", "/tmp/x -delete"))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._deny, cmd, root, label=label)
+                _cpu_fam(self, self._deny, fam, root, label=label)
 
     def test_t5326_benign_controls_allowed(self):
         root = self._shapes()["iso"]
@@ -10157,13 +10373,14 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
 
     def test_t5326r6_extglob_rule_stays_linear(self):
         root = self._shapes()["iso"]
-        for label, cmd in (("shell words", "bash " * 12000 + "x"), ("shell -O run", "bash " + "-O x " * 12000),
-                           ("shopt words", "shopt " * 12000 + "x"), ("shopt -s run", "shopt " + "-aaaa " * 10000),
-                           ("BASHOPTS run", "BASHOPTS" * 7000 + " x"), ("dash run", "bash -" + "a" * 59000),
-                           ("dollar chain", "bash -c $( " * 5000)):
+        # T-5838: whole units up to 60000 characters (was a `[:60000]` cut)
+        for label, fam in (("shell words", _fill("bash ", tail="x")), ("shell -O run", _fill("-O x ", "bash ")),
+                           ("shopt words", _fill("shopt ", tail="x")), ("shopt -s run", _fill("-aaaa ", "shopt ")),
+                           ("BASHOPTS run", _rep("BASHOPTS", 7000, tail=" x")), ("dash run", _rep("a", 59000, "bash -")),
+                           ("dollar chain", _rep("bash -c $( ", 5000))):
             with self.subTest(label=label):
-                _cpu_bounded(self, worker_guard._extglob_enable_match, cmd[:60000], label=label)
-                _cpu_bounded(self, self._deny, cmd[:60000], root, label=label)
+                _cpu_fam(self, worker_guard._extglob_enable_match, fam, label=label)
+                _cpu_fam(self, self._deny, fam, root, label=label)
 
     def test_t5326r6_extglob_controls_allowed(self):
         self._all_t5326(("ls *(x)", "ls @(a|b)", "echo !(x)", "shopt -s nullglob; ls", "shopt -s globstar; ls **/*.py",
@@ -10249,13 +10466,14 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
     def test_t5326r2_shapes_stay_linear(self):
         root = self._shapes()["iso"]
         n = 2500
-        for label, cmd in (("posix class chain", ("rm -rf /tmp/x/[[:alpha:]]*; " * n)[:60000]),
-                           ("dynamic -C abs chain", ('env -C "$D" rm -rf /tmp/x/b*; ' * n)[:60000]),
-                           ("unclosed classes", ("rm -rf " + " ".join(f"/tmp/x{i}/" + "[[:" * 21
-                                                                     for i in range(800)))[:60000]),
-                           ("find order chain", ("find /tmp/x -delete -name '*.pyc'; " * n)[:60000])):
+        for label, fam in (("posix class chain", _fill("rm -rf /tmp/x/[[:alpha:]]*; ")),
+                           ("dynamic -C abs chain", _fill('env -C "$D" rm -rf /tmp/x/b*; ')),
+                           ("unclosed classes", _Fam(lambda m: "rm -rf " + " ".join(f"/tmp/x{i}/" + "[[:" * 21
+                                                                                  for i in range(m))[:60000],
+                                                 800)),
+                           ("find order chain", _fill("find /tmp/x -delete -name '*.pyc'; "))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._deny, cmd, root, label=label)
+                _cpu_fam(self, self._deny, fam, root, label=label)
 
     # L1: the `env -S` re-split peel is capped; past the cap a destroy fails closed.
     def _env_s_chain(self, n: int, tail: str) -> str:
@@ -10267,9 +10485,9 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
             for tail, expect in (("-C . rm -rf ledger", True), ("-C . rm -rf build", n > 64),
                                  ("-C . find . -delete", True), ("-C . ls ledger", False),
                                  ("-C /tmp/x make clean", False)):
-                cmd = self._env_s_chain(n, tail)
+                fam = _Fam(lambda m, t=tail: self._env_s_chain(m, t), n)
                 with self.subTest(n=n, tail=tail):
-                    got = _cpu_bounded(self, self._deny, cmd, root, label=f"env -S x{n}")
+                    got = _cpu_fam(self, self._deny, fam, root, label=f"env -S x{n}")
                     if expect or n < 1000:  # a 1000+ word chain is denied by other rules (as on main)
                         self.assertEqual(got, expect)
 
@@ -10293,8 +10511,8 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
 
     def test_long_chain_stays_linear(self):
         root = self._shapes()["iso"]
-        cmd = " && ".join(["cd sub && cd .."] * 2000) + " && echo x > probe.md"
-        _cpu_bounded(self, self._deny, cmd, root, label="cd chain")
+        fam = _Fam(lambda m: " && ".join(["cd sub && cd .."] * m) + " && echo x > probe.md", 2000)
+        _cpu_fam(self, self._deny, fam, root, label="cd chain")
 
     # --- T-5332: rbash/busybox shells, stdin-fed shells, extglob run-time spellings ---
     T5332_SHELLS = (
@@ -10395,18 +10613,19 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
 
     def test_t5332_fed_feeds_stay_linear(self):
         root = self._shapes()["iso"]
-        for label, cmd in (("long printf", "printf '" + "x" * 59000 + "' | bash"),
-                           ("long echo", "echo " + "a " * 29000 + "| bash"),
+        for label, fam in (("long printf", _rep("x", 59000, "printf '", "' | bash")),
+                           ("long echo", _rep("a ", 29000, "echo ", "| bash")),
                            # 40 KB: the fed text is judged as `bash -c` code is, whose own 60 KB
                            # cost on main (~2.3 s) sits at this bound under suite load.
-                           ("long here-string", "bash <<< '" + "a;" * 20000 + "'"),
-                           ("many args", "printf '%s' " + "x " * 29000 + "| bash"),
-                           ("many pipes", "printf x | " * 6000 + "bash"),
-                           ("many feeds", "printf x | bash; " * 3000),
-                           ("nested feeds", "printf \"" * 2000 + "x"),
-                           ("wide printf", "printf '" + "%4096s" * 40 + "' | bash")):
+                           ("long here-string", _rep("a;", 20000, "bash <<< '", "'")),
+                           ("many args", _rep("x ", 29000, "printf '%s' ", "| bash")),
+                           ("many pipes", _fill("printf x | ", tail="bash")),
+                           ("many feeds", _rep("printf x | bash; ", 3000)),
+                           ("nested feeds", _rep("printf \"", 2000, tail="x")),
+                           ("wide printf", _rep("%4096s", 40, "printf '", "' | bash"))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._deny, cmd[:60000], root, label=label)
+                self.assertLessEqual(len(fam.text), 60000)
+                _cpu_fam(self, self._deny, fam, root, label=label)
 
     T5332_ENABLE = (
         "shopt -s ext{{g,g}}lob; {C}", "shopt -s ext{{g,}}lob 2>/dev/null; {C}", "shopt -s \\\nextglob\n{C}",
@@ -10439,14 +10658,16 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
 
     def test_t5332_extglob_rule_stays_linear(self):
         root = self._shapes()["iso"]
-        for label, cmd in (("shell -o run", "bash " + "-o bash " * 8000), ("brace shells", "{bash,} " * 8000),
-                           ("glob shells", "b?sh -O " * 8000), ("data pipes", "grep shopt $x | " * 6000),
-                           ("all-data pipes", "grep shopt $x | " * 3700 + "cat"),
-                           ("long brace word", ("{" + "b,a," * 300 + "}sh -O x ") * 50),
-                           ("continuations", "shopt -s \\\n" * 6000)):
+        # T-5838: whole units up to 60000 characters (was a `[:60000]` cut)
+        for label, fam in (("shell -o run", _rep("-o bash ", 7499, "bash ")), ("brace shells", _rep("{bash,} ", 7500)),
+                           ("glob shells", _rep("b?sh -O ", 7500)), ("data pipes", _fill("grep shopt $x | ")),
+                           ("all-data pipes", _rep("grep shopt $x | ", 3700, tail="cat")),
+                           ("long brace word", _rep("{" + "b,a," * 300 + "}sh -O x ", 49)),
+                           ("continuations", _fill("shopt -s \\\n"))):
             with self.subTest(label=label):
-                _cpu_bounded(self, worker_guard._extglob_enable_match, cmd[:60000], label=label)
-                _cpu_bounded(self, self._deny, cmd[:60000], root, label=label)
+                self.assertLessEqual(len(fam.text), 60000)
+                _cpu_fam(self, worker_guard._extglob_enable_match, fam, label=label)
+                _cpu_fam(self, self._deny, fam, root, label=label)
 
     # r2: every payload of the r1 review's probes (rr7 p1, p3-p11), judged at an isolation
     # worktree root ({R}). DENY rows; ALLOW rows are main's verdict too (residuals and
@@ -10930,20 +11151,24 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
 
     def test_t5332r2_feeds_stay_linear(self):
         root = self._r2_root()
-        for label, cmd in (("lit fmt reuse", "printf '" + "x" * 20000 + "%.0s' " + "a " * 20000 + "| bash"),
-                           ("many feeds", "printf a | bash; " * 3000), ("many herestrings", "bash <<< a; " * 3000),
-                           ("heredoc + cd", "cd /tmp && bash <<'E'\n" + "echo hi\n" * 7000 + "E"),
-                           ("bash -c feeds", "bash -c \"" + "printf a | bash; " * 2000 + "\""),
-                           ("deep subst", "echo " + "$(" * 300 + "printf a | bash" + ")" * 300),
-                           ("cat chain", "printf a" + " | cat" * 5000 + " | bash"),
-                           ("group chain", "(printf a)" + " | (cat)" * 3000 + " | bash"),
-                           ("subst bodies", "echo $(x) " * 6000), ("raw herestrings", "bash <<< \"$x\" " * 4000),
-                           ("brace groups", "{ printf a; } | " * 3000 + "bash"),
-                           ("many cds", "cd a; " * 3000 + "printf a | bash"),
-                           ("grep pipe", "grep shopt $x" + " | sort" * 8000),
-                           ("ansi-c", "bash $'-x' " * 6000), ("subst tokens", "bash $(x) " * 6000)):
+        for label, fam in (("lit fmt reuse", _Fam(lambda m: "printf '" + "x" * m + "%.0s' " + "a " * m + "| bash",
+                                                  19990)),
+                           ("many feeds", _rep("printf a | bash; ", 3000)),
+                           ("many herestrings", _rep("bash <<< a; ", 3000)),
+                           ("heredoc + cd", _rep("echo hi\n", 7000, "cd /tmp && bash <<'E'\n", "E")),
+                           ("bash -c feeds", _rep("printf a | bash; ", 2000, "bash -c \"", "\"")),
+                           ("deep subst", _Fam(lambda m: "echo " + "$(" * m + "printf a | bash" + ")" * m, 300)),
+                           ("cat chain", _rep(" | cat", 5000, "printf a", " | bash")),
+                           ("group chain", _rep(" | (cat)", 3000, "(printf a)", " | bash")),
+                           ("subst bodies", _rep("echo $(x) ", 6000)),
+                           ("raw herestrings", _rep("bash <<< \"$x\" ", 4000)),
+                           ("brace groups", _rep("{ printf a; } | ", 3000, tail="bash")),
+                           ("many cds", _rep("cd a; ", 3000, tail="printf a | bash")),
+                           ("grep pipe", _rep(" | sort", 8000, "grep shopt $x")),
+                           ("ansi-c", _rep("bash $'-x' ", 5454)), ("subst tokens", _rep("bash $(x) ", 6000))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._deny, cmd[:60000], root, label=label)
+                self.assertLessEqual(len(fam.text), 60000)
+                _cpu_fam(self, self._deny, fam, root, label=label)
 
     # r2: the review's named forms, over the three checkout shapes, from the root and /tmp.
     T5332R2_NAMED = (
@@ -11298,15 +11523,16 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
 
     def test_t5332r3_feeds_stay_linear(self):
         root = self._r2_root()
-        for label, cmd in (("unquoted heredoc backslashes", "bash <<E\n" + "echo hi\\\\\n" * 5000 + "E"),
-                           ("xargs huge text", "printf '" + "a " * 25000 + "' | xargs rm -rf"),
-                           ("xargs -I lines", "printf '" + "a\\n" * 12000 + "' | xargs -I{} echo {}"),
-                           ("group echo readings", "{ " + "echo 'a\\0101'; " * 3000 + "} | bash"),
-                           ("cd chain", "cd a; " * 3000 + "printf 'ls' | bash"),
-                           ("cat chain", "printf a" + " | cat" * 5000 + " | bash"),
-                           ("raw herestrings", "bash <<< \"$x\"; " * 3000)):
+        for label, fam in (("unquoted heredoc backslashes", _rep("echo hi\\\\\n", 5000, "bash <<E\n", "E")),
+                           ("xargs huge text", _rep("a ", 25000, "printf '", "' | xargs rm -rf")),
+                           ("xargs -I lines", _rep("a\\n", 12000, "printf '", "' | xargs -I{} echo {}")),
+                           ("group echo readings", _rep("echo 'a\\0101'; ", 3000, "{ ", "} | bash")),
+                           ("cd chain", _rep("cd a; ", 3000, tail="printf 'ls' | bash")),
+                           ("cat chain", _rep(" | cat", 5000, "printf a", " | bash")),
+                           ("raw herestrings", _rep("bash <<< \"$x\"; ", 3000))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._deny, cmd[:60000], root, label=label)
+                self.assertLessEqual(len(fam.text), 60000)
+                _cpu_fam(self, self._deny, fam, root, label=label)
 
     # r4: every payload of the r3 review's probes (rr9 q7, q8) and its named forms, judged at
     # an isolation worktree root ({R}; {P} its parent, {B} the parent's name). ALLOW rows are
@@ -13015,7 +13241,7 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
         n = 30_000
 
         def fill(unit, head="", tail="", size=n):
-            return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+            return _fill(unit, head, tail, size)
         m = 20_000  # r3: a body of env -S lines costs more per character (its fed reading)
         for label, cmd in (
                 ("fed body + env -S", fill("ls\n", "bash <<'E'\n", "E\nenv -S'ls'")),
@@ -13028,7 +13254,7 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
                 ("env -S bash fed env -S body",
                  fill("env -S'ls'\n", "env -S'bash' <<'E'\n", "E", m))):
             with self.subTest(label=label):
-                self.assertFalse(_cpu_bounded(self, self._deny, cmd, root, label=label))
+                self.assertFalse(_cpu_fam(self, self._deny, cmd, root, label=label))
 
     def test_t5363_glued_and_quoted_split_string_denied(self):
         for shape, root in self._shapes().items():
@@ -13408,7 +13634,7 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
         root = self._shapes()["main"]
 
         def fill(unit, head="", tail="", size=30_000):
-            return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+            return _fill(unit, head, tail, size)
         for label, cmd in (
                 ("ifs near-miss", fill(",-i", "IFS=,; x='env", "'; $x")),
                 ("filler near-miss", fill("$a ", "${x:-env ", "}")),
@@ -13441,7 +13667,7 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
                 ("body clusters fed to env", fill("-S'a\\_b'\n", "xargs env <<'E'\n", "E")),
                 ("escaped value words", fill("x\\_", "x=env; $x -S'", "'"))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._deny, cmd, root, label=label)
+                _cpu_fam(self, self._deny, cmd, root, label=label)
 
     def test_t5379_text_reading(self):
         split = worker_guard._env_s_glued_split
@@ -13579,7 +13805,7 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
         root = self._shapes()["main"]
 
         def fill(unit, head="", tail="", size=30_000):
-            return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+            return _fill(unit, head, tail, size)
         for label, cmd in (
                 ("unquoted body clusters", fill("-Sa\n", "xargs env <<E\n", "-S$x\nE")),
                 ("unquoted body expansions", fill("$a ", "xargs env <<E\n-Sx ", "\nE")),
@@ -13598,7 +13824,7 @@ class TestBareDirOperandAndCdChain(unittest.TestCase):
                 ("default sets", fill(": ${O:=a}\n", "env\n", "cat <<E\n$O\nE")),
                 ("option targets", fill("-va ", "env | grep X; ", "\ncat <<E\n$O\nE"))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._deny, cmd, root, label=label)
+                _cpu_fam(self, self._deny, cmd, root, label=label)
 
 
 class TestCommandWordRenames(unittest.TestCase):
@@ -13832,7 +14058,7 @@ class TestCommandWordRenames(unittest.TestCase):
         root = self._shapes()["main"]
 
         def fill(unit, head="", tail="", size=30_000):
-            return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+            return _fill(unit, head, tail, size)
         for label, cmd in (
                 ("many hash -p", fill("hash -p /bin/ls a; ")),
                 ("hash -p names", fill("a ", "hash -p /bin/ls ")),
@@ -13852,7 +14078,7 @@ class TestCommandWordRenames(unittest.TestCase):
                 ("quoted args", fill("\"{ a\" ", "ls ")), ("hash $c runs", fill("hash $c; ")),
                 ("for loops", fill("for c in a b; do hash $c; done; "))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._deny, cmd, root, label=label)
+                _cpu_fam(self, self._deny, cmd, root, label=label)
 
 
 class TestNonLiteralCommandWordReadAsGit(unittest.TestCase):
@@ -13992,7 +14218,7 @@ class TestNonLiteralCommandWordReadAsGit(unittest.TestCase):
 
     def test_t5407_reading_stays_linear(self):
         def fill(unit, head="", tail="", size=30_000):
-            return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+            return _fill(unit, head, tail, size)
         # (the copy itself, on every shape; end to end below. `${${${...` is left out end to end:
         # main's own readers take ~2.7 s CPU on it at 30 KB, with or without this reading)
         for label, cmd in (("unclosed expansions", fill("${", "", " push")),
@@ -14003,7 +14229,7 @@ class TestNonLiteralCommandWordReadAsGit(unittest.TestCase):
                            ("assignment subscripts", fill("a[", "", " push")),
                            ("long runs", fill("a", "f() ", " push"))):
             with self.subTest(label="copy " + label):
-                _cpu_bounded(self, worker_guard._dc_copy, cmd, "git", label=label)
+                _cpu_fam(self, worker_guard._dc_copy, cmd, "git", label=label)
         for label, cmd in (
                 ("dynamic words", fill("$a ", "", " push")),
                 ("brace words", fill("{a,b} ", "", " push")),
@@ -14023,7 +14249,7 @@ class TestNonLiteralCommandWordReadAsGit(unittest.TestCase):
                 ("64 definitions, many push uses", fill("f1 a push; ", self._chain(64), "")),
                 ("$0 words", fill("$0 ", "", " push"))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._decide, cmd, label=label)
+                _cpu_fam(self, self._decide, cmd, label=label)
 
 
 class TestGitConfigValuesReadAsCode(unittest.TestCase):
@@ -14156,7 +14382,7 @@ class TestGitConfigValuesReadAsCode(unittest.TestCase):
 
     def test_t5414_reading_stays_linear(self):
         def fill(unit, head="", tail="", size=30_000):
-            return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+            return _fill(unit, head, tail, size)
         for label, cmd in (("alias -c run", fill("-c alias.a='!x' ", "git ", "a")),
                            ("pager -c run", fill("-c core.pager=x ", "git ", "log")),
                            ("rebase -x run", fill("-x x ", "git rebase ", "HEAD")),
@@ -14165,7 +14391,7 @@ class TestGitConfigValuesReadAsCode(unittest.TestCase):
                            ("alias uses", fill("-c alias.a='!git' a x ", "git ", "")),
                            ("alias git words", fill(" git a", "git -c alias.a='!x' a", ""))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._decide, cmd, label=label)
+                _cpu_fam(self, self._decide, cmd, label=label)
 
 
 class TestGitEnvValuesReadAsCode(unittest.TestCase):
@@ -14421,7 +14647,7 @@ class TestGitEnvValuesReadAsCode(unittest.TestCase):
 
     def test_t5637_reading_stays_linear(self):
         def fill(unit, head="", tail="", size=30_000):
-            return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+            return _fill(unit, head, tail, size)
         for label, cmd in (("env words", fill("GIT_PAGER=x ", "", "git log")),
                            ("unrelated VAR= words", fill("FOO=bar BAZ=1 ", "", "git log")),
                            ("unrelated VAR= commands", fill("FOO=bar echo x; ", "", "")),
@@ -14433,7 +14659,7 @@ class TestGitEnvValuesReadAsCode(unittest.TestCase):
                                                  "GIT_CONFIG_VALUE_0=b ", "", "git log")),
                            ("git words", fill("GIT_PAGER=x git log; ", "", ""))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._decide, cmd, label=label)
+                _cpu_fam(self, self._decide, cmd, label=label)
 
 
 class TestMapfileCallbackAndOperatorBuiltHashOption(unittest.TestCase):
@@ -14572,10 +14798,11 @@ class TestMapfileCallbackAndOperatorBuiltHashOption(unittest.TestCase):
         root = self._shapes()["main"]
 
         def fill(unit, head="", tail="", size=30_000):
-            return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+            return _fill(unit, head, tail, size)
         for label, cmd in (
                 ("many callbacks", fill("mapfile -C 'x' -c 1 a <<< z; ")),
-                ("distinct callbacks", "".join("mapfile -C 'x%d' a; " % i for i in range(1500))),
+                ("distinct callbacks", _Fam(lambda m: "".join("mapfile -C 'x%d' a; " % i for i in range(m)),
+                                            1500)),
                 ("callback clusters", fill("-tC x ", "mapfile ")),
                 ("mapfile words", fill("mapfile ")),
                 ("brace words with C", fill("{a,b} ", "C ")),
@@ -14587,7 +14814,7 @@ class TestMapfileCallbackAndOperatorBuiltHashOption(unittest.TestCase):
                 ("r1 allowlisted callbacks", fill("mapfile -C echo -c 1 a <<< z; ")),
                 ("r1 IFS joins", fill("IFS=p; o=\"$*\"; ", "", "hash $o"))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._deny, cmd, root, label=label)
+                _cpu_fam(self, self._deny, cmd, root, label=label)
 
 
 class TestQuotedAtExpansionSplits(unittest.TestCase):
@@ -14809,7 +15036,7 @@ class TestQuotedAtExpansionSplits(unittest.TestCase):
         root = self._shapes()["main"]
 
         def fill(unit, head="", tail="", size=30_000):
-            return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+            return _fill(unit, head, tail, size)
         for label, cmd in (("quoted @ words", fill("hash \"${a[@]}\"; ")),
                            ("r1 hash -- words", fill("hash -- \"$c\"; ")),
                            ("r1 long hash args", fill("$c ", "hash -- ")),
@@ -14818,7 +15045,7 @@ class TestQuotedAtExpansionSplits(unittest.TestCase):
                            ("r1 read options", fill("-r ", "read ")),
                            ("r1 printf formats", fill("printf -- \"$f\" \"$x\"; "))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._deny, cmd, root, label=label)
+                _cpu_fam(self, self._deny, cmd, root, label=label)
 
 
 class TestEscapedRenameOneLevelDown(unittest.TestCase):
@@ -15078,7 +15305,7 @@ class TestEscapedRenameOneLevelDown(unittest.TestCase):
         root = self._shapes()["main"]
 
         def fill(unit, head="", tail="", size=30_000):
-            return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+            return _fill(unit, head, tail, size)
         for label, cmd in (("many eval regions", fill("eval \"hash -- \\\"\\$c\\\"\"; ")),
                            ("one long eval region", fill("\\$c ", "eval hash -- ")),
                            ("many backtick bodies", fill("echo `hash -- \\`x\\``; ")),
@@ -15103,7 +15330,7 @@ class TestEscapedRenameOneLevelDown(unittest.TestCase):
                            ("many eval declare words", fill("eval declare 'x=1'; ")),
                            ("unclosed region, many evals", fill("eval alias a=1; ", "echo '`'; "))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._deny, cmd, root, label=label)
+                _cpu_fam(self, self._deny, cmd, root, label=label)
 
 
 class TestTrapActionReadAsCode(unittest.TestCase):
@@ -15263,7 +15490,7 @@ class TestTrapActionReadAsCode(unittest.TestCase):
 
     def test_t5441_reading_stays_linear(self):
         def fill(unit, head="", tail="", size=30_000):
-            return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+            return _fill(unit, head, tail, size)
         for label, cmd in (("trap words", fill("trap ", "", "")),
                            ("same action", fill("trap 'echo a' EXIT; ", "", "")),
                            ("option run", fill("-p ", "trap ", "x EXIT")),
@@ -15274,7 +15501,56 @@ class TestTrapActionReadAsCode(unittest.TestCase):
                            ("r1 time options", fill("-p ", "time ", "trap 'a' EXIT")),
                            ("r1 quoted actions under watch", fill("watch -n1 \"trap \\\"a 'b'\\\" EXIT\"; ", "", ""))):
             with self.subTest(label=label):
-                _cpu_bounded(self, self._decide, cmd, label=label)
+                _cpu_fam(self, self._decide, cmd, label=label)
+
+
+class TestT5574UsabilityRegressions(unittest.TestCase):
+    """T-5574: keep fail-closed verdicts usable and avoid unrelated over-blocks."""
+
+    @staticmethod
+    def _reason(command: str, cwd: str = _REPO_ROOT) -> str:
+        out = worker_guard.decide(_bash_cwd(command, cwd, "implementer"))
+        if out is None:
+            return ""
+        return out["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def test_venv_activate_denial_names_literal_interpreter_alternative(self):
+        with tempfile.TemporaryDirectory(prefix="wg-t5574-venv-") as td:
+            root = Path(td)
+            activate = root / ".venv" / "bin" / "activate"
+            activate.parent.mkdir(parents=True)
+            activate.write_text(
+                "deactivate () {\n"
+                "    if [ -n \"${_OLD_VIRTUAL_PATH:-}\" ]; then\n"
+                "        PATH=\"${_OLD_VIRTUAL_PATH:-}\"\n"
+                "    fi\n"
+                "}\n"
+                "VIRTUAL_ENV=\"$PWD/.venv\"\n"
+                "PATH=\"$VIRTUAL_ENV/bin:$PATH\"\n",
+                encoding="utf-8",
+            )
+            reason = self._reason(
+                f"source {activate} && python -m pytest -q", str(root)
+            )
+        self.assertIn("T-5505", reason)
+        self.assertIn("literal", reason)
+        self.assertIn(".venv/bin/python", reason)
+
+    def test_protected_docs_reason_names_read_tool(self):
+        reason = self._reason(
+            "head -n 5 ledger/2026-W45/2026-W45.jsonl | cut -c1-200"
+        )
+        self.assertIn("orchestrator-owned protected docs", reason)
+        self.assertIn("Read tool", reason)
+
+    def test_bulk_reason_has_one_backtick_pair(self):
+        with tempfile.TemporaryDirectory(prefix="wg-t5574-bulk-") as td:
+            root = Path(td)
+            (root / "ok.sh").write_text("echo ok\n", encoding="utf-8")
+            reason = self._reason("tar xf archive.tar; bash ok.sh", str(root))
+        self.assertIn("T-5505", reason)
+        self.assertIn("`tar`", reason)
+        self.assertNotIn("``tar``", reason)
 
 
 class TestScriptFileContentsJudged(unittest.TestCase):
@@ -15456,18 +15732,29 @@ class TestScriptFileContentsJudged(unittest.TestCase):
                 self.assertEqual(sb(line), want)
 
     def test_t5505_reading_stays_bounded(self):
-        many = "; ".join(["bash ok.sh"] * 200)
         self._write("big_ok.sh", ("echo hi; ls -la /x; grep -n foo bar | wc -l\n" * 1500)[:65_000])
         for k in range(9):
             self._write(f"d{k}/ok.sh", "echo hi\n")
-        for label, cmd, expect in (("200 runs of one script", many, False),
-                                   ("a 64 KiB script", "bash big_ok.sh", False),
-                                   ("cd chain x scripts", " && ".join(f"cd d{k} && bash ok.sh"
-                                                                      for k in range(6)), False),
+        line = "echo hi; ls -la /x; grep -n foo bar | wc -l\n"
+
+        def sized_script(m):  # T-5838: the script's size is the family (1477 lines ~ 64 KiB)
+            self._write(f"big_{m}.sh", line * m)
+            return f"bash big_{m}.sh"
+        # T-5838: run counts and the script size are size families; a nesting depth and a
+        # past-the-bound chain are fixed inputs (`_cpu_best_of`).
+        for label, cmd, expect in (("200 runs of one script",
+                                    _Fam(lambda m: "; ".join(["bash ok.sh"] * m), 200), False),
+                                   ("a 64 KiB script", _Fam(sized_script, 65_000 // len(line)), False),
+                                   ("cd chain x scripts",
+                                    _Fam(lambda m: " && ".join(f"cd d{k} && bash ok.sh" for k in range(m)), 6),
+                                    False),
                                    ("4 deep", "bash d1.sh", False),
                                    ("past the bound", "bash e1.sh", True)):
             with self.subTest(label=label):
-                got = _cpu_bounded(self, self._out, cmd, label=label)
+                if isinstance(cmd, _Fam):
+                    got = _cpu_fam(self, self._out, cmd, label=label)
+                else:
+                    got = _cpu_best_of(self, self._out, cmd, label=label)
                 self.assertEqual(got is not None, expect)
         # T-5817: past the reading budget (4 x 64 KiB) more scripts must cost nothing more. On an
         # absolute-bound miss under load it is judged by growth from the 4-script chain, the last
@@ -16149,7 +16436,7 @@ class TestRuntimeCommandWordScriptReader(unittest.TestCase):
 
     def test_run_time_command_word_walk_stays_linear(self):
         def fill(unit, head="", tail="", size=32_000):
-            return head + unit * ((size - len(head) - len(tail)) // len(unit)) + tail
+            return _fill(unit, head, tail, size)
         for size in (32_000, 64_000):
             for label, cmd in (
                     ("many assignments", fill("x=a; ", "", "$x s.sh", size)),
@@ -16160,7 +16447,7 @@ class TestRuntimeCommandWordScriptReader(unittest.TestCase):
                     ("for lists", fill("for x in a b; do $x; done; ", "", "", size)),
                     ("many substitutions", fill("$(a) ", "", "ok.sh", size))):
                 with self.subTest(label=label, size=size):
-                    _cpu_bounded(self, self._out, cmd, label=label)
+                    _cpu_fam(self, self._out, cmd, label=label)
 
 
 class TestPromptExpansionReadAsCode(unittest.TestCase):

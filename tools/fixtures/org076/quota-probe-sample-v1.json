@@ -1,0 +1,1 @@
+{"account": "claude-fallback", "detail": "refresh_primary_quota: TimeoutExpired: probe timed out after 45s", "detector": "claude-quota-probe-readability", "kind": "quota-probe-sample", "outcome_kind": "probe-error", "persona": "recovery", "run_id": "20261102T2030Z", "sample_id": "085f71ed-6994-4b3b-82e6-439716105736", "sampled_at": "2026-11-02T20:35:12.125508Z", "schema": 1}

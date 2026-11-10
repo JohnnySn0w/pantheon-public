@@ -8,7 +8,8 @@
 # or directory`. T-0658 traced this across the T-0500 / T-0642 / T-0643 cycles.
 #
 # Fix: after `git worktree add`, symlink the worktree's `vendor/` entries to
-# the canonical /home/claude/echo-prismatic/vendor/ entries. Vendor binaries
+# the canonical /home/claude/echo-prismatic/vendor/ entries (a seat clone's vendor/
+# entry is a symlink into the shared read-only /var/lib/pantheon/echo-vendor, T-6014). Vendor binaries
 # are identical across worktrees by design (same ORT version pinned in
 # tools/setup-onnxruntime.sh) so the symlink is structurally correct.
 #
@@ -28,7 +29,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 TICKET="$1"
-ECHO_CANONICAL="/home/claude/echo-prismatic"
+ECHO_CANONICAL="${ECHO_CANONICAL:-/home/claude/echo-prismatic}"  # T-5006: override for a seat with its own clone (mason/artisan)
 WORKTREE_PATH="/tmp/echo-${TICKET}"
 BRANCH_NAME="agent/${TICKET}"
 
@@ -99,7 +100,9 @@ git -C "${WORKTREE_PATH}" config core.hooksPath .githooks
 # NEVER `cargo clean` from a lane mid-sprint (it empties the shared dir for
 # every lane); GC happens at arc close. Home-checkout builds keep their own
 # target/ and never contend. Opt out per-stage with ECHO_STAGE_SHARED_TARGET=0.
-LANE_TARGET_DIR="${ECHO_STAGE_LANE_TARGET_DIR:-/home/claude/.cache/echo-lane-target}"
+# T-6014: under $HOME, not /home/claude, so a seat with its own clone (mason/artisan, via
+# ECHO_CANONICAL) can stage; unchanged on the claude account.
+LANE_TARGET_DIR="${ECHO_STAGE_LANE_TARGET_DIR:-${HOME}/.cache/echo-lane-target}"
 if [[ "${ECHO_STAGE_SHARED_TARGET:-1}" == "1" ]]; then
   mkdir -p "${LANE_TARGET_DIR}"
   mkdir -p "${WORKTREE_PATH}/.cargo"

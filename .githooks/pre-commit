@@ -456,6 +456,7 @@ def _ledger_validity_findings(staged: list[str]) -> list[str] | None:
     try:
         from tools.ledger_placement_lint import (
             format_validity_lines,
+            lint_staged_org001,
             lint_staged_validity,
         )
     except Exception as exc:  # fail-OPEN: module unavailable, nothing to scan
@@ -479,6 +480,16 @@ def _ledger_validity_findings(staged: list[str]) -> list[str] | None:
         )
         return None
 
+    # T-4739: ORG-001 rules on the same added lines (pre-existing rows grandfathered).
+    try:
+        invalid = invalid + lint_staged_org001(repo_root=_REPO_ROOT)
+    except Exception as exc:  # fail-OPEN, like the scan above
+        print(
+            "ledger-org001 WARNING (non-blocking, fail-open): "
+            f"{exc.__class__.__name__}: {exc} — SKIPPING the ORG-001 check on staged "
+            "ledger lines, commit allowed",
+            file=sys.stderr,
+        )
     return format_validity_lines(invalid)
 
 

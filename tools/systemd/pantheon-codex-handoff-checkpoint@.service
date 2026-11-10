@@ -1,0 +1,16 @@
+[Unit]
+# T-6115 D-1 / T-6125: daily HANDOFF checkpoint for the codex seat on ACCOUNT %i
+# (one instance per codex seat account). Installed on the head_system_orchestrator
+# seat (recovery) by the persona installer; instances are named in instance.yaml
+# persona_installer.codex_seat_timers. The persona is not on the command line: the tool
+# derives it from the account it runs as (agent_role_map / instance.yaml).
+Description=T-6115 D-1: daily HANDOFF checkpoint for the codex seat on account %i
+Documentation=file:///home/claude-fallback/pantheon-config/tools/codex_handoff_checkpoint.py
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+# Runs AS the seat account from its own clone (homes are 0750); exit 3 = no ack yet (seat busy), soft.
+ExecStart=/usr/bin/sudo -n -u %i /usr/bin/sg pantheon-mailbox -c "python3 /home/%i/pantheon-config/tools/codex_handoff_checkpoint.py"
+SuccessExitStatus=3
+TimeoutStartSec=30min

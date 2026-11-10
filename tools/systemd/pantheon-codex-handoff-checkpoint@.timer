@@ -1,0 +1,10 @@
+[Unit]
+Description=T-6115 D-1: daily HANDOFF checkpoint timer for the codex seat on account %i
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 UTC
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

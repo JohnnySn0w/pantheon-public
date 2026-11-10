@@ -16,7 +16,7 @@ import argparse
 import json
 import math
 import os
-import select
+import selectors
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -201,16 +201,19 @@ def _ask_jsonrpc(proc: subprocess.Popen[str], message: Mapping[str, Any], *, tim
     if "id" not in message:
         return None
     target = message["id"]
-    while True:
-        ready, _, _ = select.select([proc.stdout], [], [], timeout)
-        if not ready:
-            raise TimeoutError(f"timed out waiting for response id={target}")
-        line = proc.stdout.readline()
-        if not line:
-            raise RuntimeError(f"server exited before response id={target}")
-        reply = json.loads(line)
-        if reply.get("id") == target:
-            return reply
+    # T-5872: selectors (poll), not select.select() — the latter raises
+    # ValueError for any fd >= FD_SETSIZE (1024).
+    with selectors.PollSelector() as sel:
+        sel.register(proc.stdout, selectors.EVENT_READ)
+        while True:
+            if not sel.select(timeout):
+                raise TimeoutError(f"timed out waiting for response id={target}")
+            line = proc.stdout.readline()
+            if not line:
+                raise RuntimeError(f"server exited before response id={target}")
+            reply = json.loads(line)
+            if reply.get("id") == target:
+                return reply
 
 
 def probe_stdio_tools(spec: ServerSpec, *, cwd: Path, timeout: float) -> list[Mapping[str, Any]]:

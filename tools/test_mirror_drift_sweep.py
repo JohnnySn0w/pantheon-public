@@ -9,6 +9,7 @@ Run: python3 -m unittest tools.test_mirror_drift_sweep
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -17,6 +18,11 @@ from unittest import mock
 
 from tools import mirror_drift_sweep as mds
 from tools import mirror_state as ms
+
+# Never let a suite run deliver the owner digest into the live mailbox hub,
+# even in tests that strip PANTHEON_DISABLE_LIVE_TELEGRAM to exercise the
+# token read (the 2026-10-12 ticket_grooming leak class).
+os.environ.setdefault("PANTHEON_DISABLE_LIVE_MAILBOX", "1")
 
 
 ANCHOR = "a" * 40
@@ -294,8 +300,9 @@ class TestConfigParsing(unittest.TestCase):
             )
 
     def test_real_state_generator_pairs_carry_the_published_tree(self):
-        # T-4768 C5: the state pins each pair's latest publish (claude: T-5594 e2b21b88,
-        # tree fb497e8d, source a7284967; codex: PR7 d157fae0^{tree}), and each manifest's
+        # T-4768 C5: the state pins each pair's latest publish (claude: T-6361 62536e17,
+        # tree 9f04a88b, source a778e41d; codex: T-6362 67b5de93,
+        # tree 316f7ce0, source 3b7ab62a), and each manifest's
         # acceptance block is anchored to exactly that publish, so a re-pin lands in the
         # same commit as its record-published. record-published drops the T9/T10 rebased_from (a real publish
         # supersedes the rebase), so none may linger.
@@ -552,11 +559,15 @@ class TestGeneratedLeak(GenScratch):
                 mock.patch.object(mds, "load_pairs", return_value=[self.pair()]), \
                 mock.patch.object(mds, "load_state", return_value=self.state()), \
                 mock.patch.object(mds, "file_refresh_ticket") as file_mock, \
-                mock.patch.object(mds, "_send_telegram") as tg:
+                mock.patch.object(mds, "_send_telegram") as tg, \
+                mock.patch.object(mds, "_send_owner_digest") as owner:
             rc = mds.main(["--commit-prod", "--no-fetch", "--tickets-root", t])
         file_mock.assert_not_called()
         self.assertEqual(rc, mds.EXIT_LEAK)
+        tg.assert_called_once()  # a leak needs the operator
+        self.assertIn("leak", tg.call_args[0][0])
         self.assertNotIn("artisan", tg.call_args[0][0])
+        self.assertNotIn("artisan", owner.call_args[0][0])
 
 
 class TestRedactLeakLine(unittest.TestCase):
@@ -853,8 +864,10 @@ class _MainHarness(unittest.TestCase):
              mock.patch.object(mds, "read_source_head", return_value=heads), \
              mock.patch.object(mds, "count_commits_behind", return_value=3), \
              mock.patch.object(mds, "file_refresh_ticket", side_effect=file_effect) as fm, \
-             mock.patch.object(mds, "_send_telegram", tg):
+             mock.patch.object(mds, "_send_telegram", tg), \
+             mock.patch.object(mds, "_send_owner_digest") as owner:
             rc = mds.main(["--no-fetch", "--tickets-root", str(self.tickets), *extra])
+        self.owner = owner
         return rc, fm, tg
 
 
@@ -864,7 +877,10 @@ class TestMain(_MainHarness):
                                    extra=["--commit-prod"], file_effect=["T-9999"])
         self.assertEqual(rc, 10)
         fm.assert_called_once()
-        tg.assert_called_once()
+        # Routine drift is owned by the filed ticket: full digest to the owner's
+        # mailbox, nothing to the operator's Telegram (TG 6039-6040).
+        tg.assert_not_called()
+        self.owner.assert_called_once()
 
     def test_filing_failure_exits_2_and_digest_still_sent(self):
         # recovery W6: ANY failure to file / commit / push a refresh ticket -> exit 2.
@@ -874,9 +890,10 @@ class TestMain(_MainHarness):
                                    extra=["--commit-prod"], file_effect=err)
         self.assertEqual(rc, mds.EXIT_CONFIG)
         fm.assert_called_once()
-        tg.assert_called_once()
-        self.assertIn("FILING FAILED", tg.call_args[0][0])
-        self.assertIn("push rejected", tg.call_args[0][0])
+        tg.assert_not_called()  # exit 2 pages the owner via OnFailure
+        self.owner.assert_called_once()
+        self.assertIn("FILING FAILED", self.owner.call_args[0][0])
+        self.assertIn("push rejected", self.owner.call_args[0][0])
 
     def test_filing_failure_is_not_counted_in_dry_run(self):
         rc, fm, _ = self.run_main([_pair()], _state_with("codex-harness-mirror", anchor=ANCHOR))
@@ -887,18 +904,22 @@ class TestMain(_MainHarness):
         with mock.patch.object(mds, "load_pairs", return_value=[_pair()]), \
              mock.patch.object(mds, "load_state", return_value=ms._empty_state()), \
              mock.patch.object(mds, "read_source_head", side_effect=RuntimeError("down")), \
-             mock.patch.object(mds, "_send_telegram") as tg:
+             mock.patch.object(mds, "_send_telegram") as tg, \
+             mock.patch.object(mds, "_send_owner_digest") as owner:
             rc = mds.main(["--no-fetch", "--tickets-root", str(self.tickets)])
         self.assertEqual(rc, 2)
-        tg.assert_called_once()
+        tg.assert_not_called()
+        owner.assert_not_called()  # dry run: report-only, nothing durable
 
     def test_sweep_failed_to_run_still_sends_digest(self):
         with mock.patch.object(mds, "load_pairs", side_effect=ValueError("bad yaml")), \
-             mock.patch.object(mds, "_send_telegram") as tg:
-            rc = mds.main(["--no-fetch"])
+             mock.patch.object(mds, "_send_telegram") as tg, \
+             mock.patch.object(mds, "_send_owner_digest") as owner:
+            rc = mds.main(["--no-fetch", "--commit-prod"])
         self.assertEqual(rc, 2)
-        tg.assert_called_once()
-        self.assertIn("SWEEP FAILED TO RUN", tg.call_args[0][0])
+        tg.assert_not_called()
+        owner.assert_called_once()
+        self.assertIn("SWEEP FAILED TO RUN", owner.call_args[0][0])
 
     def test_gated_legacy_pair_unchanged_exit_0(self):
         rc, fm, _ = self.run_main(
@@ -955,7 +976,8 @@ class TestCrashNeverReadsAsSuccess(_MainHarness):
                                       _state_with("codex-harness-mirror", anchor=ANCHOR),
                                       extra=["--commit-prod"], file_effect=self._filing_fails())
         self.assertEqual(rc, 2)
-        self.assertIn("DIGEST FAILED", tg.call_args[0][0])  # best-effort proof-of-life
+        tg.assert_not_called()
+        self.assertIn("DIGEST FAILED", self.owner.call_args[0][0])  # best-effort proof-of-life
 
     def test_send_failure_after_filing_failure_exits_2(self):
         tg = mock.MagicMock(side_effect=PermissionError("denied"))
@@ -965,6 +987,8 @@ class TestCrashNeverReadsAsSuccess(_MainHarness):
              mock.patch.object(mds, "read_source_head", return_value=CURRENT), \
              mock.patch.object(mds, "count_commits_behind", return_value=3), \
              mock.patch.object(mds, "file_refresh_ticket", side_effect=self._filing_fails()), \
+             mock.patch.object(mds, "operator_reasons", return_value=["x"]), \
+             mock.patch.object(mds, "_send_owner_digest"), \
              mock.patch.object(mds, "_send_telegram", tg), mock.patch("sys.stderr"):
             rc = mds.main(["--no-fetch", "--commit-prod", "--tickets-root", str(self.tickets)])
         self.assertEqual(rc, 2)
@@ -981,6 +1005,8 @@ class TestCrashNeverReadsAsSuccess(_MainHarness):
              mock.patch.object(mds, "read_source_head", return_value=CURRENT), \
              mock.patch.object(mds, "count_commits_behind", return_value=3), \
              mock.patch.object(mds, "file_refresh_ticket", side_effect=self._filing_fails()), \
+             mock.patch.object(mds, "operator_reasons", return_value=["x"]), \
+             mock.patch.object(mds, "_send_owner_digest"), \
              mock.patch("sys.stderr"), mock.patch("sys.stdout"):
             rc = mds.main(["--no-fetch", "--commit-prod", "--tickets-root", str(self.tickets)])
         self.assertEqual(rc, 2)
@@ -1034,18 +1060,25 @@ class TestLeakPathWithheldEverywhere(GenScratch):
         r = self.evaluate()
         self.assertEqual(r.status, "leak", r.detail)
         self.assertEqual(r.mismatches, [])
-        out, tg = io.StringIO(), mock.MagicMock()
+        out, tg, owner = io.StringIO(), mock.MagicMock(), mock.MagicMock()
         with mock.patch.object(mds, "load_pairs", return_value=[self.pair()]), \
              mock.patch.object(mds, "load_state", return_value=self.state()), \
              mock.patch.object(mds, "_send_telegram", tg), \
+             mock.patch.object(mds, "_send_owner_digest", owner), \
              mock.patch("sys.stdout", out):
             rc_json = mds.main(["--no-fetch", "--json", "--tickets-root", str(self.tmp)])
             rc = mds.main(["--no-fetch", "--tickets-root", str(self.tmp)])
         self.assertEqual((rc_json, rc), (mds.EXIT_LEAK, mds.EXIT_LEAK))
-        texts = [out.getvalue(), *(c[0][0] for c in tg.call_args_list)]
-        for text in texts:
+        owner.assert_not_called()  # dry run
+        # Full detail (redacted) goes to stdout/json (and, with --commit-prod, the owner digest).
+        for text in [out.getvalue()]:
             self.assertNotIn("artisan", text)
             self.assertIn("<path withheld", text)
+        # the operator's Telegram gets the short alert only: no path, no matched string.
+        self.assertTrue(tg.call_args_list)
+        for c in tg.call_args_list:
+            self.assertNotIn("artisan", c[0][0])
+            self.assertNotIn(self.LEAKY_PATH, c[0][0])
 
     def test_config_error_plus_leak_reports_the_leak_exit_4(self):
         # recovery N2: build() skips the gate on a config error; the sweep scans anyway.
@@ -1072,12 +1105,14 @@ class TestFilingBugKeepsOtherPairs(_MainHarness):
              mock.patch.object(mds, "load_state", return_value=ms._empty_state()), \
              mock.patch.object(mds, "evaluate_pair", side_effect=[drift, leak]), \
              mock.patch.object(mds, "file_refresh_ticket", side_effect=ValueError("bad")), \
-             mock.patch.object(mds, "_send_telegram", tg), mock.patch("sys.stdout"):
+             mock.patch.object(mds, "_send_telegram", tg), \
+             mock.patch.object(mds, "_send_owner_digest") as owner, mock.patch("sys.stdout"):
             rc = mds.main(["--no-fetch", "--commit-prod", "--tickets-root", str(self.tickets)])
         self.assertEqual(rc, mds.EXIT_LEAK)
         self.assertTrue(drift.filing_failed)
-        self.assertIn("LEAK ALERT", tg.call_args[0][0])
-        self.assertIn("FILING FAILED: bad", tg.call_args[0][0])
+        self.assertIn("LEAK ALERT", owner.call_args[0][0])
+        self.assertIn("FILING FAILED: bad", owner.call_args[0][0])
+        self.assertIn("leak", tg.call_args[0][0])  # the leak still reaches the operator
 
 
 class TestReadErrorDetailInDigest(unittest.TestCase):
@@ -1089,6 +1124,114 @@ class TestReadErrorDetailInDigest(unittest.TestCase):
                                             committed=False).splitlines()
                 if "pwa-release-mirror" in l][-1]
         self.assertIn("ls-remote timed out", line)
+
+
+
+class TestOperatorRouting(unittest.TestCase):
+    """the operator TG 6039-6040: Telegram only when something needs him."""
+
+    def _r(self, **kw):
+        base = dict(slug="codex-harness-mirror", status="stale", detail="d")
+        base.update(kw)
+        return mds.PairResult(**base)
+
+    def test_routine_drift_and_stale_need_nobody(self):
+        results = [self._r(status="stale", stale_days=3), self._r(slug="b", status="drift", stale_days=5),
+                   self._r(slug="g", status="drift", gated=True, stale_days=400)]
+        self.assertEqual(mds.operator_reasons(results, sla_threshold=14), [])
+
+    def test_leak_and_sla_breach_need_operator(self):
+        results = [self._r(status="leak"), self._r(slug="b", status="drift", stale_days=30,
+                                                   filed_ticket="T-1")]
+        reasons = mds.operator_reasons(results, sla_threshold=14)
+        self.assertEqual(len(reasons), 2)
+        self.assertIn("leak", reasons[0])
+        self.assertIn("30d", reasons[1])
+        self.assertIn("T-1", reasons[1])
+
+    def test_alert_is_short_and_carries_no_hashes(self):
+        alert = mds.build_operator_alert(["possible leak in a (alert only, nothing filed)"])
+        self.assertLessEqual(len(alert.splitlines()), 4)
+        self.assertNotRegex(alert, r"[0-9a-f]{40}")
+        self.assertIn("mailbox", alert)
+
+
+class TestCountPaths(unittest.TestCase):
+    def test_no_count_paths_counts_everything(self):
+        self.assertIsNone(mds._count_paths({"slug": "s", "source": {"local_repo": "."}}))
+
+    def test_seed_uses_the_seed_allowlist(self):
+        from tools.neutralize_seed import seed_pathspecs
+        paths = mds._count_paths({"slug": "s", "source": {"local_repo": ".", "count_paths": "seed"}})
+        self.assertEqual(paths, seed_pathspecs())
+        self.assertIn("rulebook", paths)
+        self.assertNotIn("tickets", paths)
+        self.assertNotIn("ledger", paths)
+
+    def test_explicit_list_and_bad_value(self):
+        self.assertEqual(mds._count_paths({"slug": "s", "source": {"count_paths": ["a", "b"]}}),
+                         ["a", "b"])
+        with self.assertRaises(ValueError):
+            mds._count_paths({"slug": "s", "source": {"count_paths": 3}})
+
+    def test_rev_list_passes_pathspecs(self):
+        with mock.patch.object(mds, "_run_git") as rg:
+            rg.return_value = mock.Mock(returncode=0, stdout="7\n")
+            self.assertEqual(mds._rev_list_count(Path("."), "a", "b", paths=["rulebook"]), 7)
+        self.assertEqual(rg.call_args[0][0], ["rev-list", "--count", "a..b", "--", "rulebook"])
+
+    def test_live_pairs_file_scopes_the_public_mirror(self):
+        pairs = {p["slug"]: p for p in mds.load_pairs(mds.DEFAULT_PAIRS_PATH)}
+        self.assertEqual(pairs["pantheon-public-mirror"]["source"].get("count_paths"), "seed")
+
+
+
+class TestAlertSurvivesOwnerFailure(_MainHarness):
+    """recovery review of cc26b9c947: an owner-mailbox failure must never swallow
+    the operator's leak/SLA alert or downgrade exit 4."""
+
+    def _run(self, results, *, extra=("--commit-prod",), owner_effect=OSError("hub down")):
+        tg = mock.MagicMock()
+        with mock.patch.object(mds, "load_pairs", return_value=[_pair(slug=r.slug) for r in results]), \
+             mock.patch.object(mds, "load_state", return_value=ms._empty_state()), \
+             mock.patch.object(mds, "evaluate_pair", side_effect=results), \
+             mock.patch.object(mds, "file_refresh_ticket", return_value="T-1"), \
+             mock.patch.object(mds, "_send_telegram", tg), \
+             mock.patch.object(mds, "_send_owner_digest", side_effect=owner_effect) as owner, \
+             mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+            rc = mds.main(["--no-fetch", "--tickets-root", str(self.tickets), *extra])
+        return rc, tg, owner
+
+    def test_leak_alert_fires_and_exit_4_survives_owner_failure(self):
+        leak = mds.PairResult(slug="claude-harness-mirror", status="leak", leaks=1,
+                              leak_findings=["LEAK a.md:1 [c:persona]"], detail="LEAK GATE FAILED")
+        rc, tg, owner = self._run([leak])
+        tg.assert_called_once()
+        self.assertIn("leak", tg.call_args[0][0])
+        owner.assert_called_once()
+        self.assertEqual(rc, mds.EXIT_LEAK)
+
+    def test_owner_failure_on_routine_week_exits_2(self):
+        drift = mds.PairResult(slug="pwa-release-mirror", status="drift", detail="d")
+        rc, tg, _ = self._run([drift])
+        tg.assert_not_called()
+        self.assertEqual(rc, mds.EXIT_CONFIG)
+
+    def test_dry_run_sends_no_owner_digest(self):
+        drift = mds.PairResult(slug="pwa-release-mirror", status="drift", detail="d")
+        rc, _, owner = self._run([drift], extra=(), owner_effect=None)
+        owner.assert_not_called()
+
+
+class TestZeroScopedCommitsIsCurrent(unittest.TestCase):
+    def test_zero_seed_commits_reports_no_drift(self):
+        pair = {"slug": "pantheon-public-mirror", "gated": True, "gate_tickets": ["T-1327"],
+                "source": {"local_repo": ".", "count_paths": "seed"}}
+        state = {"pairs": {"pantheon-public-mirror": {"source_head_at_last_publish": "a" * 40}}}
+        with mock.patch.object(mds, "read_source_head", return_value="b" * 40), \
+             mock.patch.object(mds, "count_commits_behind", return_value=0):
+            r = mds.evaluate_pair(pair, state, Path("/nonexistent"))
+        self.assertEqual(r.status, "no_drift", r.detail)
 
 
 if __name__ == "__main__":

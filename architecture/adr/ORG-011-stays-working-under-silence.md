@@ -1,13 +1,13 @@
 ---
 aliases: [ORG-011]
 title: Structural enforcement for HO-stays-working-under-silence
-status: Ratified 2026-05-11
+status: "Ratified 2026-05-11 by the operator (msg_1305, msg_1307); predicate P1.c withdrawn 2026-05-12 (the operator msg_1326, T-0228, 6e55b9f536); a narrower form is reopened by ORG-037 (supersedes-partial)"
 date: 2026-05-11
 build_disposition: built
 ---
 # ORG-011 — Structural enforcement for HO-stays-working-under-silence
 
-**Status:** **Ratified 2026-05-11** per the operator msg_1305 + msg_1307 (all open questions closed). Prior draft trail: drafted 2026-05-11; revised per msg_1296 + msg_1298 (15min-absent-keep-working operational rule + SOP-vs-memory layering correction); refined per msg_1305 (1hr P1.a threshold, context-fill conditional removed, P4 retires at Phase B); final ratification msg_1307 (check cadence 15min + bundling-friendly, activity signals OK, await-state phrases OK but Recovery's judgement supersedes, orchestrator-only initially with multi-agent rollout after empirical confirmation).
+**Status:** **Ratified 2026-05-11** per the operator msg_1305 + msg_1307 (all open questions closed); predicate P1.c withdrawn 2026-05-12 (the operator msg_1326, T-0228, 6e55b9f536); a narrower form is reopened by ORG-037 (supersedes-partial). Prior draft trail: drafted 2026-05-11; revised per msg_1296 + msg_1298 (15min-absent-keep-working operational rule + SOP-vs-memory layering correction); refined per msg_1305 (1hr P1.a threshold, context-fill conditional removed, P4 retires at Phase B); final ratification msg_1307 (check cadence 15min + bundling-friendly, activity signals OK, await-state phrases OK but Recovery's judgement supersedes, orchestrator-only initially with multi-agent rollout after empirical confirmation).
 
 **Date authored:** 2026-05-11
 

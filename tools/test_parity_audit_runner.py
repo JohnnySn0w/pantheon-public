@@ -406,16 +406,54 @@ class TestMaintenanceHold(unittest.TestCase):
     def test_fault_fails_open(self):
         f = par.classify(self._reports())
         with unittest.mock.patch("tools.notify_policy.in_maintenance", side_effect=OSError("x")):
-            self.assertFalse(par._seat_in_maintenance("mason"))
+            self.assertEqual(par.held_seats(f), ())
             self.assertEqual(par.exclude_held(f), f)
+
+    def test_fault_is_silent_as_before(self):
+        # T-5585 pin: the old private wrapper logged nothing on a registry fault; the
+        # shared seat_state.maintenance_active (no on_fault) must stay silent too.
+        import contextlib
+        import io
+        f = par.classify(self._reports())
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                unittest.mock.patch("tools.notify_policy.in_maintenance", side_effect=OSError("x")):
+            par.held_seats(f)
+        self.assertEqual((out.getvalue(), err.getvalue()), ("", ""))
 
     def test_seat_names_are_notify_policy_personas(self):
         # SeatReport.seat is SeatBinding.persona — the same key space as notify_policy.
+        f = par.classify(self._reports())
         with unittest.mock.patch("tools.notify_policy.in_maintenance",
                                  side_effect=lambda a, *x, **k: a == "mason") as m:
-            self.assertTrue(par._seat_in_maintenance("mason"))
-            self.assertFalse(par._seat_in_maintenance("recovery"))
-        self.assertEqual(m.call_args_list[0].args[0], "mason")
+            self.assertEqual(par.held_seats(f), ("mason",))
+        self.assertEqual({c.args[0] for c in m.call_args_list}, {"mason", "recovery"})
+
+    def test_default_check_is_the_shared_seat_state_helper(self):
+        f = par.classify(self._reports())
+        with unittest.mock.patch("tools.seat_state.maintenance_active",
+                                 side_effect=lambda p: p == "recovery") as m:
+            self.assertEqual(par.held_seats(f), ("recovery",))
+        self.assertEqual({c.args[0] for c in m.call_args_list}, {"mason", "recovery"})
+
+    def test_injected_seam_overrides_default(self):
+        f = par.classify(self._reports())
+        with unittest.mock.patch("tools.seat_state.maintenance_active") as m:
+            self.assertEqual(par.held_seats(f, self._held("recovery")), ("recovery",))
+        m.assert_not_called()
+
+    def test_deep_sleep_and_halted_alone_are_not_held(self):
+        # T-5585 pin: the hold is maintenance-only (observation-side). A deep-sleep or
+        # halted seat is NOT held here (no maintenance entry) and no seat-state read happens.
+        f = par.classify(self._reports())
+        for state in ("deep-sleep", "halted", "paused"):
+            eff = unittest.mock.Mock(state=state, remediation_vetoed=True)
+            with self.subTest(state=state), \
+                    unittest.mock.patch("tools.notify_policy.in_maintenance", return_value=False), \
+                    unittest.mock.patch("tools.seat_state.safe_effective_for",
+                                        return_value=eff) as m:
+                self.assertEqual(par.held_seats(f), ())
+                m.assert_not_called()
 
     def test_first_post_hold_alert_not_swallowed(self):
         now = datetime(2026, 10, 20, tzinfo=UTC)

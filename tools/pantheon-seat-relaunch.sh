@@ -46,6 +46,8 @@
 #     the launch ARGV + cwd are captured live from the running session, because
 #     for a not-cut-over seat they live in no canonical config (T-3829 did the
 #     same); the capture FAILS LOUD rather than respawn a guessed command.
+#   * T-5843: the respawn also sets CLAUDE_CODE_DISABLE_FILE_MENTIONS=1 (matching the
+#     controller launch), so a ctxfill relaunch never re-opens @-mention file loads.
 #   * ENV FIDELITY (limitation): the respawn restores argv + cwd + PANTHEON_TMUX_*
 #     only; /proc/<pid>/environ is ptrace-blocked (artisan), so the rest of the env
 #     is INHERITED from the (sudo -u, env_reset) invocation — the seat's standard
@@ -566,6 +568,20 @@ if is_echo_builder_persona "$PERSONA"; then
   log "echo-builder $PERSONA: wrapping respawn with umask 002 + CARGO_TARGET_DIR=$ECHO_TARGET_DIR (if writable)"
 fi
 
+# T-4533 / T-4643 step 4: the fleet-usage seat env (PANTHEON_FLEET_USAGE_SEAT only; the mod loads from managed settings) rides
+# the respawn like PANTHEON_TMUX_*. One source with the controller launch path:
+# fleet_usage_env.py, called by an absolute path from this script's own dir (any cwd).
+# FAIL OPEN: a helper error or empty output leaves the array empty and the respawn
+# proceeds without the keys. A key the seat's settings.json env sets is never emitted.
+FLEET_ENV=()
+if _fu_out="$(/usr/bin/python3 "$SCRIPT_DIR/fleet_usage_env.py" --persona "$PERSONA" \
+      --home "/home/${ACCOUNT}" \
+      --clone-root "${PANTHEON_SEAT_RELAUNCH_CLONE_ROOT:-/home/${ACCOUNT}/pantheon-config}" 2>/dev/null)"; then
+  while IFS= read -r _fu_line; do
+    [[ "$_fu_line" == *=* ]] && FLEET_ENV+=("$_fu_line")
+  done <<< "$_fu_out"
+fi
+
 if [[ "$DRY_RUN" == "1" ]]; then
   cat <<EOF
 DRY RUN — no side effects.
@@ -581,7 +597,7 @@ DRY RUN — no side effects.
   launch argv:    ${CAPTURED_ARGV[*]}   (captured, then role config applied — T-4085)
   old harness:    pid ${HARNESS_PID:-?} — wait <=${OLD_HARNESS_EXIT_SECS}s after kill-server, SIGTERM, then refuse (exit 11) (T-4171)
   respawn:        systemd-run --user --scope --unit=$SCOPE_UNIT tmux start-server \; set-option -g remain-on-exit on \; new-session -d -s $SESSION -n $WINDOW -c $CAPTURED_CWD \\
-                    /usr/bin/env -- PANTHEON_TMUX_SESSION=$SESSION PANTHEON_TMUX_WINDOW=$WINDOW PANTHEON_TMUX_PANE=0 ${CARGO_WRAP[*]:+${CARGO_WRAP[*]} }${CAPTURED_ARGV[*]}
+                    /usr/bin/env -- PANTHEON_TMUX_SESSION=$SESSION PANTHEON_TMUX_WINDOW=$WINDOW PANTHEON_TMUX_PANE=0 CLAUDE_CODE_DISABLE_FILE_MENTIONS=1 ${FLEET_ENV[*]:+${FLEET_ENV[*]} }${CARGO_WRAP[*]:+${CARGO_WRAP[*]} }${CAPTURED_ARGV[*]}
 EOF
   exit 0
 fi
@@ -879,6 +895,8 @@ if ! systemd-run --user --scope --unit="$SCOPE_UNIT" \
           "PANTHEON_TMUX_SESSION=$SESSION" \
           "PANTHEON_TMUX_WINDOW=$WINDOW" \
           "PANTHEON_TMUX_PANE=0" \
+          "CLAUDE_CODE_DISABLE_FILE_MENTIONS=1" \
+          "${FLEET_ENV[@]}" \
           "${CARGO_WRAP[@]}" \
           "${CAPTURED_ARGV[@]}" 9>&- ; then
   err "respawn: systemd-run --scope failed"
@@ -988,9 +1006,9 @@ if [[ "$KICK_ENABLED" == "1" ]]; then
   KICK_POLL_SECS="${PANTHEON_SEAT_RELAUNCH_KICK_POLL_SECS:-12}"
   KICK_POLL_INTERVAL="${PANTHEON_SEAT_RELAUNCH_KICK_POLL_INTERVAL:-2}"
   KICK_MAX_ATTEMPTS="${PANTHEON_SEAT_RELAUNCH_KICK_MAX_ATTEMPTS:-3}"
-  # T-4456: render-gate each inject into the fresh TUI (T-4362/T-4455); 8s is the
-  # runtime_controller fresh-runtime bound.
-  KICK_RENDER_WAIT="${PANTHEON_SEAT_RELAUNCH_KICK_RENDER_WAIT:-8}"
+  # T-4456: render-gate each inject into the fresh TUI (T-4362/T-4455). T-6293: the bound
+  # comes from the submit_verify harness profile (one source; 8 only if python is unavailable).
+  KICK_RENDER_WAIT="${PANTHEON_SEAT_RELAUNCH_KICK_RENDER_WAIT:-$(/usr/bin/python3 "$SCRIPT_DIR/submit_verify.py" --harness claude-code --print-first-paste-render-wait 2>/dev/null || echo 8)}"
   if /usr/bin/python3 "$SCRIPT_DIR/kick_verify.py" \
         --pane "$TARGET_PANE" --prompt "$KICK_PROMPT" \
         --settle "$KICK_SETTLE_SECS" \

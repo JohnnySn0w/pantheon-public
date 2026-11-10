@@ -209,6 +209,27 @@ def test_client_without_key_does_not_call_out(tmp_path):
     assert called == []
 
 
+def test_key_holding_proxy_mode_never_reads_or_sends_provider_key(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text(f"DEEPSEEK_API_KEY={FAKE_KEY}\n", encoding="utf-8")
+    seen = {}
+
+    def opener(request, timeout):
+        seen["url"] = request.full_url
+        seen["auth"] = request.get_header("Authorization")
+        return _FakeResponse(json.dumps(DOCUMENTED_BODY).encode("utf-8"))
+
+    body = read_deepseek_balance(
+        env,
+        base_url="https://deepseek-proxy.invalid:8448/v1",
+        key_holding_proxy=True,
+        opener=opener,
+    )
+    assert body == DOCUMENTED_BODY
+    assert seen == {"url": "https://deepseek-proxy.invalid:8448/v1/user/balance", "auth": "Bearer proxy-held-dummy"}
+    assert FAKE_KEY not in json.dumps(seen)
+
+
 class _RedirectingTransport(urllib.request.BaseHandler):
     """A fake https transport: api.deepseek.com answers 302 to another host;
     any other host would answer 200. Records every request it is handed.

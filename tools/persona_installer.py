@@ -16,6 +16,7 @@ import argparse
 import base64
 import dataclasses
 import difflib
+import errno
 import grp
 import hashlib
 import json
@@ -35,7 +36,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Literal, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, Sequence
 
 import yaml
 
@@ -44,6 +45,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools import codex_telegram_bridge  # noqa: E402  (needs sys.path bootstrap)
+from tools import persona_installer_credential_report as _cred  # noqa: E402
 from tools.mcp_allowlist_registry import RegistryError, load_registry  # noqa: E402
 from tools.harness_adapter.diagnostics import flip_key_violations  # noqa: E402
 from tools.codex_telegram_actions import receiver_handoff_actions  # noqa: E402
@@ -61,6 +63,9 @@ from tools.persona_brief import (  # noqa: E402  (needs sys.path bootstrap)
     PersonaBriefError,
     resolve_persona_brief_path,
     validate_persona_brief_ref,
+)
+from tools.appserver_seats import (  # noqa: E402  (T-6118: shared with the memex export)
+    APPSERVER_SEATS, SEAT_NAME_RE, AppserverSeatsError, appserver_seat_for_account,
 )
 from tools import user_systemd as _us  # noqa: E402  (needs sys.path bootstrap)
 from tools.user_systemd import ReadPurpose, UnitSnapshot  # noqa: E402
@@ -141,6 +146,17 @@ from tools.persona_installer_activation import (  # noqa: E402,F401
     _bootstrap_residue_entries,
     _RESIDUE_SAFE_ACTIVE_STATES,
     _runtime_liveness_refusal,
+    PANE_PROBE_TIMEOUT_SECONDS,
+    pane_liveness_states,
+    PANE_ABSENT,
+    PANE_LIVE,
+    TMUX_SESSION_KEY_PREFIX,
+    _PANE_ABSENT_STDERR,
+    _TMUX_SESSION_NAME,
+    pane_probe_argv,
+    pane_state_from_probe,
+    read_seat_pane_state,
+    seat_tmux_socket,
     _quarantine_stamp,
     _quarantine_dir_for,
     _quarantine_pairs,
@@ -184,6 +200,8 @@ SEAT_LOCAL_RESIDUE_KINDS = frozenset(
         "seat-service-decommission",
         # T-5454: shell-box containment wiring in the seat's own settings.json.
         "seat-claude-settings-env",
+        # T-5480: shell-box PreToolUse hook + trust in the seat's ~/.codex/config.toml.
+        "seat-codex-hook-config",
         # T-5474: phase-Q first-launch workspace trust, before the consume bootstrap fire.
         # (T-5473's residue quarantine is executor-admitted as files.seat_root since T-5608;
         # the installer's own backends still execute it in an installer flow.)
@@ -197,6 +215,14 @@ SETTINGS_ENV_KIND = "seat-claude-settings-env"
 SHELL_BOX_ENV_KEY = "CLAUDE_CODE_SHELL_PREFIX"
 SHELL_BOX_RELATIVE = Path("pantheon-config") / "tools" / "oom" / "pantheon-shell-box.sh"
 SHELL_BOX_PROVENANCE_KEY = "shell_box_containment"
+# T-5480: codex-runtime counterpart. No codex config key wraps the shell; the wiring is a
+# PreToolUse hook block (matcher Bash) + its trusted_hash in the seat's ~/.codex/config.toml
+# (tools.harness_adapter.codex_shell_box). Applies to every seat with a codex runtime candidate.
+# Not must-run-before-launch (HO ruling): restart codex runtimes at live wiring.
+CODEX_HOOK_KIND = "seat-codex-hook-config"
+CODEX_HOOK_OP_ID = "harness.codex-shell-box"
+CODEX_HOOK_PROVENANCE_KEY = "codex_shell_box_containment"
+CODEX_EXECUTABLE = "/usr/bin/codex"
 # T-5473 / T-5474 (SOP hand-moving-an-established-seat §4 phase Q).
 RESIDUE_QUARANTINE_KIND = "seat-runtime-residue-quarantine"
 RESIDUE_QUARANTINE_OP_ID = "service.runtime-residue.quarantine"
@@ -213,6 +239,15 @@ LAYER_NAMES = {
 
 class PlanRefused(InstallerError):
     """Apply or rollback was refused before an unsafe mutation."""
+
+
+class CredentialRefused(PlanRefused):
+    """T-4835 / ORG-050 gate 3: a declared credential ref did not resolve. Carries
+    the value-free per-ref resolution so the refusal can be recorded in a receipt."""
+
+    def __init__(self, message: str, resolution: "tuple[Mapping[str, Any], ...]") -> None:
+        super().__init__(message)
+        self.resolution = resolution
 
 
 # T-4803 / ORG-050 "Required installer gates": a leakage scan over the RENDERED
@@ -368,7 +403,11 @@ def _derive_allowed_roots(manifest: "Manifest", account: str, root: Path) -> str
     hub = mailbox.get("hub") if isinstance(mailbox, dict) else None
     if not isinstance(hub, str) or not Path(hub).is_absolute():
         raise ManifestError("persona_installer.mailbox.hub must be absolute")
-    return f"{home},{_rooted(root, Path(hub))}"
+    roots = f"{home},{_rooted(root, Path(hub))}"
+    export = _chronicle_export_config(manifest)  # T-6118: the installer-owned export tree
+    if export is not None:
+        roots += f",{_rooted(root, Path(export['root']))}"
+    return roots
 
 
 def _pinned_roots_refusal(plan: "InstallPlan", manifest: "Manifest | None") -> str | None:
@@ -391,6 +430,13 @@ def _pinned_roots_refusal(plan: "InstallPlan", manifest: "Manifest | None") -> s
     return None
 
 
+def _exact_entry_roots(allowed_roots: Sequence[str]) -> tuple[str, ...]:
+    """T-6118: the allowed roots an owned-mkdir entry may BE exactly. _derive_allowed_roots orders
+    roots home, mailbox hub, then the installer-owned export root; only the roots past those two
+    qualify, so a target equal to home or the hub stays refused."""
+    return tuple(allowed_roots[2:])
+
+
 def _realpath_containment_refusal(
     operation: "InstallOperation",
     allowed_roots: Sequence[str],
@@ -411,8 +457,16 @@ def _realpath_containment_refusal(
     if not roots:
         return f"{operation.operation_id}: no allowed roots supplied for realpath containment"
     parent = os.path.realpath(os.path.dirname(target))
+    # T-6118: the export root is created by the plan, so its parent is outside by construction.
+    # Accept the entry only for an owned mkdir whose resolved parent + name IS an export-only root.
+    entry = os.path.join(parent, os.path.basename(target))
+    exact = (
+        {os.path.realpath(item) for item in _exact_entry_roots(allowed_roots) if item}
+        if _mkdir_owned(operation)
+        else set()
+    )
     for root in roots:
-        if parent == root or parent.startswith(root.rstrip("/") + "/"):
+        if parent == root or parent.startswith(root.rstrip("/") + "/") or (entry == root and root in exact):
             return None
     return (
         f"{operation.operation_id}: target parent resolves outside allowed roots "
@@ -463,6 +517,9 @@ _READONLY_DESIRED_PATH_FIELDS = frozenset(
         "credential_env",    # path recorded in the unit, not written by the installer
         "env_value",         # settings-env: prefix path Claude Code execs; never written by us
         "project_path",      # workspace-trust: a JSON object key in ~/.claude.json, not a written path
+        "account_home",      # codex-hook-config: the seat home the hook/box paths derive from; read, never written
+        "hook_command",      # codex-hook-config: command string recorded in config.toml, not a written path
+        "codex_executable",  # codex-hook-config: the codex binary run (read-only hashing) to compute the trust hash
         "repo",              # direct-fire exec of the repo's own bringup script
         "manifest",          # direct-fire argument, read only
         "declared_path",     # source-check read
@@ -474,7 +531,7 @@ _READONLY_DESIRED_PATH_FIELDS = frozenset(
 
 
 def _path_containment_problem(
-    label: str, raw: str, mode: str, allowed_roots: Sequence[str]
+    label: str, raw: str, mode: str, allowed_roots: Sequence[str], *, exact_entry: bool = False
 ) -> str | None:
     """None when ``raw`` stays inside a resolved allowed root; else a reason.
     Empty ``raw`` means "field not set" and is skipped. Fail closed on no roots."""
@@ -486,8 +543,14 @@ def _path_containment_problem(
     if not roots:
         return f"{label}: no allowed roots supplied for realpath containment"
     resolved = os.path.realpath(raw if mode == "dir" else os.path.dirname(raw))
+    entry = os.path.join(resolved, os.path.basename(raw)) if mode != "dir" else resolved
+    exact = (
+        {os.path.realpath(item) for item in _exact_entry_roots(allowed_roots) if item}
+        if exact_entry
+        else set()
+    )
     for root in roots:
-        if resolved == root or resolved.startswith(root.rstrip("/") + "/"):
+        if resolved == root or resolved.startswith(root.rstrip("/") + "/") or (entry == root and root in exact):
             return None
     return f"{label}: path resolves outside allowed roots ({resolved})"
 
@@ -517,6 +580,9 @@ def _rollback_containment_refusal(
     if not [item for item in allowed_roots if item]:
         return f"{mutation.operation_id}: no allowed roots supplied for rollback containment"
     checks: list[tuple[str, str, str]] = []
+    # A receipt need not record ownership (simulated / plain-mkdir doubles), so the exact export
+    # root is accepted for a mkdir-kind receipt only, and only for the export-only root.
+    exact_dir = mutation.kind == "mkdir" and mutation.before.get("state") == "absent"
     if mutation.target.startswith("/") and mutation.kind not in _REPO_SOURCED_READONLY_KINDS:
         checks.append(("target", mutation.target, "entry"))
     for key, mode in (
@@ -530,7 +596,11 @@ def _rollback_containment_refusal(
             checks.append((f"before.{key}", value, mode))
     for key, raw, mode in checks:
         problem = _path_containment_problem(
-            f"{mutation.operation_id}.{key}", raw, mode, allowed_roots
+            f"{mutation.operation_id}.{key}",
+            raw,
+            mode,
+            allowed_roots,
+            exact_entry=exact_dir and key == "target",
         )
         if problem:
             return problem
@@ -1028,6 +1098,133 @@ def _settings_env_atomic_write(
 
 # ---- T-5474: first-launch workspace trust in ~/.claude.json ----
 
+# ---- T-5480: shell-box PreToolUse hook in the seat's ~/.codex/config.toml ---------------
+# Pure helpers; both backends share them. The TOML surgery and the codex trust-hash machinery
+# live in tools.harness_adapter.codex_shell_box (imported lazily: it pulls in the codex adapter).
+
+def _codex_hook_csb() -> Any:
+    from tools.harness_adapter import codex_shell_box
+
+    return codex_shell_box
+
+
+def _codex_hook_text(raw: bytes | None) -> str:
+    if raw is None:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise OperationFailed(f"codex config.toml is not UTF-8 ({exc}); refusing to touch it") from exc
+
+
+def _codex_hook_homes(target: str, desired: Mapping[str, str]) -> tuple[Path, Path]:
+    return Path(target).parent, Path(desired["account_home"])
+
+
+def _codex_hook_preflight(
+    raw: bytes | None, target: str, desired: Mapping[str, str], *, check_scripts: bool
+) -> "PreflightResult":
+    """Read-only (no codex call). Also fail-closed on a hook script or box this account cannot exec."""
+    csb = _codex_hook_csb()
+    codex_home, account_home = _codex_hook_homes(target, desired)
+    if desired.get("hook_command") != csb.hook_command(account_home):
+        return PreflightResult(False, "conflicting", "plan's hook_command does not match the seat's canonical command")
+    try:
+        text = _codex_hook_text(raw)
+    except OperationFailed as exc:
+        return PreflightResult(False, "conflicting", str(exc))
+    cls, detail = csb.classify(text, codex_home, account_home)
+    if cls == "conflicting":
+        return PreflightResult(False, cls, detail)
+    if check_scripts:
+        for path in (csb.hook_script(account_home), csb.box_script(account_home)):
+            if not (path.is_file() and os.access(path, os.X_OK)):
+                return PreflightResult(
+                    False, "missing-hook-target",
+                    f"{path} is missing or not executable by this account; "
+                    "pull or clone pantheon-config into the seat home first",
+                )
+    return PreflightResult(True, cls, detail)
+
+
+def _codex_hook_wire(
+    raw: bytes | None, operation: "InstallOperation", *, check_scripts: bool, read_hooks: Any
+) -> tuple[str, bytes | None, str]:
+    """(classification, new bytes or None when nothing changes, stored trusted_hash)."""
+    csb = _codex_hook_csb()
+    codex_home, account_home = _codex_hook_homes(operation.target, operation.desired)
+    text = _codex_hook_text(raw)
+    try:
+        cls, new = csb.wire(
+            text, codex_home, account_home,
+            executable=Path(operation.desired["codex_executable"]),
+            read_hooks=read_hooks, check_scripts=check_scripts,
+        )
+    except csb.WiringRefused as exc:
+        raise OperationFailed(f"{operation.operation_id}: {exc}") from exc
+    stored = csb.status(new, codex_home, account_home)["trusted_hash"] or ""
+    return cls, (None if cls == "matching" else new.encode("utf-8")), stored
+
+
+def _codex_hook_before(operation: "InstallOperation", raw: bytes | None, owned: bool, stored: str) -> dict[str, str]:
+    return {
+        "state": "absent" if raw is None else "file",
+        "owned": "true" if owned else "false",
+        "hook_command": operation.desired["hook_command"],
+        "account_home": operation.desired["account_home"],
+        "trusted_hash": stored,
+    }
+
+
+def _codex_hook_verdict(raw: bytes | None, operation: "InstallOperation") -> tuple[bool, str]:
+    result = _codex_hook_preflight(raw, operation.target, operation.desired, check_scripts=False)
+    return result.ok and result.classification == "matching", result.detail
+
+
+def _codex_hook_can_rollback(mutation: "MutationRecord", raw: bytes | None) -> "PreflightResult":
+    """Only a block THIS receipt added, and only while it is still exactly what was written."""
+    if mutation.before.get("owned") != "true":
+        return PreflightResult(True, "not-applied", "hook block was not added by this receipt; left alone")
+    csb = _codex_hook_csb()
+    codex_home = Path(mutation.target).parent
+    account_home = Path(mutation.before["account_home"])
+    try:
+        text = _codex_hook_text(raw)
+        status = csb.status(text, codex_home, account_home)
+        if not status["block_present"]:
+            return PreflightResult(True, "not-applied", "hook block already absent")
+        if not status["definition_ok"] or status["trusted_hash"] != mutation.before["trusted_hash"]:
+            return PreflightResult(False, "drifted", "hook block changed after apply; not removing it")
+        csb.remove(text, codex_home, account_home)
+    except (OperationFailed, csb.WiringRefused) as exc:
+        return PreflightResult(False, "drifted", str(exc))
+    return PreflightResult(True, "owned", "hook block matches the receipt")
+
+
+def _codex_hook_removed(mutation: "MutationRecord", raw: bytes | None) -> bytes:
+    csb = _codex_hook_csb()
+    try:
+        new = csb.remove(_codex_hook_text(raw), Path(mutation.target).parent, Path(mutation.before["account_home"]))
+    except csb.WiringRefused as exc:
+        raise OperationFailed(str(exc)) from exc
+    return (new or "").encode("utf-8")
+
+
+def _sim_codex_read_hooks(executable: Any, *, codex_home: Path, cwd: Any = None, timeout: float = 15.0) -> list[dict[str, Any]]:
+    """Simulated backend's stand-in for codex hooks/list: a deterministic hash over the
+    definition (matcher + hook), read from the scratch config the helper writes. No process."""
+    import tomllib
+
+    text = (Path(codex_home) / "config.toml").read_text(encoding="utf-8")
+    out: list[dict[str, Any]] = []
+    for g, group in enumerate(((tomllib.loads(text).get("hooks") or {}).get("PreToolUse")) or []):
+        for h, hook in enumerate(group.get("hooks") or []):
+            digest = "sha256:" + _sha256_bytes(_canonical_json([group.get("matcher"), hook]).encode("utf-8"))
+            out.append({"key": f"{os.path.realpath(codex_home)}/config.toml:pre_tool_use:{g}:{h}",
+                        "command": hook.get("command"), "eventName": "preToolUse", "currentHash": digest})
+    return out
+
+
 def _trust_parse(raw: bytes | None) -> dict[str, Any] | None:
     """The ~/.claude.json document, or None when absent. Same refusals as the settings parse
     (unparseable, duplicate keys, non-object top level) but no `env` rule: that is settings.json's."""
@@ -1312,10 +1509,24 @@ SEAT_TIMER_TEMPLATED_STEMS = frozenset(
         "pantheon-inbox-consumer",
         "pantheon-keep-going",
         "pantheon-mailbox-wake",
+        # T-5961: fleet-usage retention (every seat) and the Codex usage export (codex seats);
+        # the instance is the fleet-usage seat name (_fleet_usage_seat), not always the persona
+        "pantheon-fleet-usage-prune",
+        "pantheon-fleet-usage-codex-export",
+        # T-6141: owner-side prune of the seat's dead /tmp/claude-<uid> session dirs (Claude seats)
+        "pantheon-tmp-session-prune",
+        # T-6118 PR-5: receipt-driven prune of the seat's memex-exported Chronicle copies
+        "pantheon-chronicle-prune",
+        # T-6125: the owner seat's (recovery) daily codex checkpoint + rotate timers; the instance is
+        # the codex seat's ACCOUNT (codex, codex-fallback), which the service sudo's to
+        "pantheon-codex-handoff-checkpoint",
+        "pantheon-codex-thread-rotate",
     }
 )
-SEAT_TIMER_SINGLETON_UNITS = frozenset({"pantheon-restart-drain.timer"})
-_SEAT_TIMER_INSTANCE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
+# T-6121: pantheon-echo-target-prune.timer is a host-global singleton (one seat prunes the shared
+# /var/lib/pantheon/echo-target), so it is enabled by its own name, never instanced.
+SEAT_TIMER_SINGLETON_UNITS = frozenset({"pantheon-restart-drain.timer", "pantheon-echo-target-prune.timer"})
+_SEAT_TIMER_INSTANCE = SEAT_NAME_RE  # T-6118: one definition, tools/appserver_seats.py
 
 
 def _seat_timer_template_unit(timer_unit: str) -> str:
@@ -2106,6 +2317,114 @@ _SEAT_CORE_UNIT_FILES = (
     ("restart-drain", "pantheon-restart-drain.service", "pantheon-restart-drain.timer"),
 )
 _UNIT_FAILURE_ALERT_TEMPLATE = "pantheon-unit-failure-alert@.service"
+# T-5961: fleet-usage units, installed VERBATIM (banner + template) so the byte-identical
+# hand copies from T-5933 are adopted, never refused. (op-name, service, timer, codex only)
+_FLEET_USAGE_UNIT_FILES = (
+    ("fleet-usage-prune", "pantheon-fleet-usage-prune@.service",
+     "pantheon-fleet-usage-prune@.timer", False),
+    ("fleet-usage-codex-export", "pantheon-fleet-usage-codex-export@.service",
+     "pantheon-fleet-usage-codex-export@.timer", True),
+)
+_APPSERVER_SEATS = APPSERVER_SEATS
+# T-6141: owner-side /tmp session prune, instanced by persona, on the Claude-harness seats EXCEPT
+# the personas below. (op-name, service, timer)
+_TMP_SESSION_PRUNE_UNIT_FILES = (
+    ("tmp-session-prune", "pantheon-tmp-session-prune@.service", "pantheon-tmp-session-prune@.timer"),
+)
+# recovery ruling 2026-11-04 (T-6141): recovery's seat-periodic bucket is at the orchestrator B8 cap of 16 (watchman's
+# codex timers), so recovery self-prunes until a ruling; do NOT raise SEAT_PERIODIC_TIMER_LIMIT for it.
+_TMP_SESSION_PRUNE_EXCLUDED_PERSONAS = frozenset({"recovery"})
+# T-6118 PR-5 / T-6164: receipt-driven Chronicle prune, instanced by PERSONA (the tool resolves the
+# export seat, so codex -> consultant), on every seat when instance.yaml carries
+# persona_installer.chronicle_export. The service's ExecStart carries --execute. Recovery and orchestrator
+# deliberately spend the fourth and final timer-pair slot; the planner accepts exactly 16 periodic
+# residue ops and still refuses > 16. (op-name, service, timer)
+_CHRONICLE_PRUNE_UNIT_FILES = (
+    ("chronicle-prune", "pantheon-chronicle-prune@.service", "pantheon-chronicle-prune@.timer"),
+)
+# T-6121: the shared echo cargo target prune (instance.yaml persona_installer.echo_target_prune
+# .owner_persona runs it). Not instanced. (op-name, service, timer)
+_ECHO_TARGET_PRUNE_UNIT_FILES = (
+    ("echo-target-prune", "pantheon-echo-target-prune.service", "pantheon-echo-target-prune.timer"),
+)
+# T-6125: the owner seat (instance.yaml persona_installer.codex_seat_timers.owner_persona) runs
+# these AS each listed codex seat's account. (op-name, service, timer)
+_CODEX_SEAT_UNIT_FILES = (
+    ("codex-handoff-checkpoint", "pantheon-codex-handoff-checkpoint@.service",
+     "pantheon-codex-handoff-checkpoint@.timer"),
+    ("codex-thread-rotate", "pantheon-codex-thread-rotate@.service",
+     "pantheon-codex-thread-rotate@.timer"),
+)
+
+
+def _fleet_usage_seat(repo_root: Path, binding: "PersonaBinding") -> str:
+    """The seat name the fleet-usage ledger knows this binding by (its turns/<seat> dir and
+    PANTHEON_FLEET_USAGE_SEAT). A Claude seat is its persona (tools/fleet_usage_env.py); a
+    Codex seat is the harness/codex/appserver_seats.json key whose account is the binding's
+    account (the binding persona "codex" is the seat "consultant"). Exactly one must match.
+    The lookup lives in tools/appserver_seats.py (T-6118: the memex export shares it)."""
+    if binding.configured_harness != "codex":
+        return binding.persona
+    try:
+        return appserver_seat_for_account(repo_root, binding.account)
+    except AppserverSeatsError as exc:
+        raise ManifestError(str(exc)) from None
+
+
+_CHRONICLE_EXPORT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+_OCTAL_MODE = re.compile(r"^[0-7]{3,4}$")
+
+
+def _validate_chronicle_export_block(raw: Any) -> dict[str, str]:
+    """T-6118 PR-1: persona_installer.chronicle_export = {root, group, ingest_account}.
+    Instance names live in instance.yaml, never in tools/ code (leak gate)."""
+    where = "persona_installer.chronicle_export"
+    if not isinstance(raw, dict) or set(raw) != {"root", "group", "ingest_account"}:
+        raise ManifestError(f"{where} must be a mapping of root, group and ingest_account")
+    for key in ("root", "group", "ingest_account"):
+        if not isinstance(raw[key], str) or not raw[key]:
+            raise ManifestError(f"{where}.{key} must be a non-empty string")
+    root = raw["root"]
+    if not Path(root).is_absolute() or ".." in Path(root).parts or root != os.path.normpath(root):
+        raise ManifestError(f"{where}.root must be a normalized absolute path")
+    for key in ("group", "ingest_account"):
+        if not _CHRONICLE_EXPORT_NAME.match(raw[key]):
+            raise ManifestError(f"{where}.{key} must be an account/group name")
+    return {key: raw[key] for key in ("root", "group", "ingest_account")}
+
+
+def _chronicle_export_config(manifest: "Manifest") -> dict[str, str] | None:
+    raw = manifest.installer.get("chronicle_export")
+    return None if raw is None else _validate_chronicle_export_block(raw)
+
+
+def _chronicle_export_dirs(
+    manifest: "Manifest", repo_root: Path, binding: "PersonaBinding", root: Path
+) -> tuple[tuple[str, Path, dict[str, str]], ...]:
+    """The root, this seat's dir and .ingested, in create order (root first). Every seat's plan
+    carries all three, but only a root apply creates them: a root install creates the whole tree
+    once (root/, .ingested and every seat dir; the ownership-enforcing mkdir needs root for the
+    chown, and the parent is 2750 so a seat cannot create entries in it). A seat's unprivileged
+    apply in practice only verifies that each existing dir matches its owner, group and mode. The
+    per-day <date>/ dirs are not installer-owned: a seat creates its own inside its seat dir at
+    export time (chronicle_export.ExportDir)."""
+    config = _chronicle_export_config(manifest)
+    if config is None:
+        return ()
+    base = _rooted(root, Path(config["root"]))
+    seat = _fleet_usage_seat(repo_root, binding)
+    if not _SEAT_TIMER_INSTANCE.match(seat):
+        raise ManifestError(f"chronicle export seat name is not a safe path component: {seat!r}")
+    group = config["group"]
+    return (
+        ("chronicle-export.root", base, {"mode": "2750", "owner": "root", "group": group}),
+        ("chronicle-export.seat", base / seat, {"mode": "2750", "owner": binding.account, "group": group}),
+        (
+            "chronicle-export.ingested",
+            base / ".ingested",
+            {"mode": "2755", "owner": config["ingest_account"], "group": group},
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -2209,7 +2528,128 @@ def _seat_core_periodics(
                 f"{_mo.WAKE_UNIT_STEM}@{binding.persona}.service",
             )
         )
+    # T-5961: fleet-usage retention on every seat (fold-before-prune is inside the prune
+    # command, T-5962) and the Codex usage export on codex seats, as installer-owned units.
+    usage_seat = _fleet_usage_seat(repo_root, binding)
+    for name, service, timer, codex_only in _FLEET_USAGE_UNIT_FILES:
+        if codex_only and binding.configured_harness != "codex":
+            continue
+        installs.append((f"periodic.{name}.service-unit", service, render(service)))
+        installs.append((f"periodic.{name}.timer-unit", timer, render(timer)))
+        timers.append(
+            (name, timer.replace("@.", f"@{usage_seat}."), service.replace("@.", f"@{usage_seat}."))
+        )
+    # T-6121: the shared echo-target prune, on the one owner seat (default off).
+    if _echo_target_prune_owner(manifest) == binding.persona:
+        for name, service, timer in _ECHO_TARGET_PRUNE_UNIT_FILES:
+            installs.append((f"periodic.{name}.service-unit", service, render(service)))
+            installs.append((f"periodic.{name}.timer-unit", timer, render(timer)))
+            timers.append((name, timer, service))
+    # T-6141: owner-side /tmp session prune on Claude-harness seats (not codex, not recovery).
+    if (binding.configured_harness != "codex"
+            and binding.persona not in _TMP_SESSION_PRUNE_EXCLUDED_PERSONAS):
+        for name, service, timer in _TMP_SESSION_PRUNE_UNIT_FILES:
+            installs.append((f"periodic.{name}.service-unit", service, render(service)))
+            installs.append((f"periodic.{name}.timer-unit", timer, render(timer)))
+            timers.append((name, timer.replace("@.", f"@{binding.persona}."),
+                           service.replace("@.", f"@{binding.persona}.")))
+    # T-6118 PR-5 / T-6164: receipt-driven Chronicle prune on every configured export seat.
+    if _chronicle_export_config(manifest) is not None:
+        for name, service, timer in _CHRONICLE_PRUNE_UNIT_FILES:
+            installs.append((f"periodic.{name}.service-unit", service, render(service)))
+            installs.append((f"periodic.{name}.timer-unit", timer, render(timer)))
+            timers.append((name, timer.replace("@.", f"@{binding.persona}."),
+                           service.replace("@.", f"@{binding.persona}.")))
+    # T-6125: recovery's daily codex checkpoint + rotate timers, one pair per covered codex account.
+    codex_accounts = _codex_seat_timer_accounts(repo_root, manifest, binding)
+    if codex_accounts:
+        for name, service, timer in _CODEX_SEAT_UNIT_FILES:
+            installs.append((f"periodic.{name}.service-unit", service, render(service)))
+            installs.append((f"periodic.{name}.timer-unit", timer, render(timer)))
+            for account in codex_accounts:
+                timers.append((
+                    f"{name}@{account}",
+                    timer.replace("@.", f"@{account}."),
+                    service.replace("@.", f"@{account}."),
+                ))
     return _SeatCorePeriodics(tuple(installs), tuple(timers))
+
+
+def _periodic_enable_after(periodic_name: str, install_ids: Sequence[str], live: bool) -> str:
+    """T-6140: the prerequisite list of a seat-periodic timer-enable.
+
+    Fresh seat (default): wait for the consume bootstrap (unit-fire chain) and the controller.
+    Already-live seat (consume timer enabled, the predicate service.runtime-residue.quarantine
+    uses for its non-bootstrap no-op): no bootstrap fire exists to wait for, so depend only on
+    the daemon-reload and this periodic's OWN unit-install ops."""
+    if not live:
+        return (
+            "connective.timer-observe,periodic.daemon-reload,"
+            "service.runtime-controller.enable-observe"
+        )
+    base = periodic_name.split("@", 1)[0]
+    own = [f"periodic.{base}.service-unit", f"periodic.{base}.timer-unit"]
+    return ",".join(["periodic.daemon-reload", *[i for i in own if i in set(install_ids)]])
+
+
+def _echo_target_prune_owner(manifest: "Manifest") -> str | None:
+    """T-6121: the persona that owns the shared echo-target prune timer, or None (default off).
+    ``persona_installer.echo_target_prune`` must be exactly ``{owner_persona: <name>}``."""
+    raw = manifest.installer.get("echo_target_prune")
+    if raw is None:
+        return None
+    where = "persona_installer.echo_target_prune"
+    if not isinstance(raw, dict) or set(raw) != {"owner_persona"}:
+        raise ManifestError(f"{where} must be a mapping with only owner_persona")
+    owner = raw["owner_persona"]
+    if not isinstance(owner, str) or not owner:
+        raise ManifestError(f"{where}.owner_persona must be a persona name")
+    return owner
+
+
+def _codex_seat_timer_accounts(
+    repo_root: Path, manifest: "Manifest", binding: "PersonaBinding"
+) -> tuple[str, ...]:
+    """T-6125: the codex seat ACCOUNTS whose checkpoint/rotate timers this binding owns.
+
+    Default off: an absent ``persona_installer.codex_seat_timers`` key, a different
+    ``owner_persona``, or an empty list plans nothing. Each listed persona is resolved to its
+    account from the manifest bindings (never hard-coded), must be a codex-harness seat, and its
+    account must be an appserver_seats.json account. Anything else is a ManifestError."""
+    raw = manifest.installer.get("codex_seat_timers")
+    if raw is None:
+        return ()
+    where = "persona_installer.codex_seat_timers"
+    if not isinstance(raw, dict) or set(raw) != {"owner_persona", "personas"}:
+        raise ManifestError(f"{where} must be a mapping of owner_persona and personas")
+    owner, personas = raw["owner_persona"], raw["personas"]
+    if not isinstance(owner, str) or not owner:
+        raise ManifestError(f"{where}.owner_persona must be a persona name")
+    if not isinstance(personas, list) or not all(isinstance(p, str) and p for p in personas):
+        raise ManifestError(f"{where}.personas must be a list of persona names")
+    if owner != binding.persona:
+        return ()
+    if not personas:
+        return ()
+    try:
+        seats = json.loads((repo_root / _APPSERVER_SEATS).read_text(encoding="utf-8"))["seats"]
+        seat_accounts = {s.get("account") for s in seats.values() if isinstance(s, dict)}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise ManifestError(f"cannot read {_APPSERVER_SEATS}: {exc}") from None
+    accounts: list[str] = []
+    for persona in personas:
+        target = manifest.binding(persona)  # ManifestError when the persona is not bound
+        if target.configured_harness != "codex":
+            raise ManifestError(f"{where}.personas: {persona!r} is not a codex-harness seat")
+        if target.account not in seat_accounts:
+            raise ManifestError(
+                f"{where}.personas: account {target.account!r} of {persona!r} is not in {_APPSERVER_SEATS}"
+            )
+        if not _SEAT_TIMER_INSTANCE.match(target.account):
+            raise ManifestError(f"{where}.personas: account {target.account!r} is not a valid unit instance")
+        if target.account not in accounts:
+            accounts.append(target.account)
+    return tuple(accounts)
 
 
 def _artifact_digest(repo_root: Path, artifacts: Sequence[Path]) -> str:
@@ -2340,6 +2780,11 @@ class Manifest:
             try:
                 codex_telegram_bridge.validate_bridge_block(bridge)
             except codex_telegram_bridge.BridgeError as exc:
+                raise ManifestError(f"{path}: {exc}") from exc
+        if installer.get("chronicle_export") is not None:
+            try:
+                _validate_chronicle_export_block(installer.get("chronicle_export"))
+            except ManifestError as exc:
                 raise ManifestError(f"{path}: {exc}") from exc
         claude_mcp = installer.get("claude_mcp_servers")
         if claude_mcp is not None:
@@ -2644,9 +3089,16 @@ class ApplyReceipt:
     host: str = ""
     harness: str = ""
     source: str = ""
+    # T-4835 / ORG-050 gate 3: per declared credential ref {ref_id, status, checked_at,
+    # report_sha256}. Value-free; defaulted so receipts written before T-4835 load.
+    credential_resolution: tuple[Mapping[str, Any], ...] = ()
 
     def to_dict(self) -> Mapping[str, Any]:
-        return _jsonable(self)
+        value = _jsonable(self)
+        if not self.credential_resolution:
+            # no declared credential refs: keep the serialized bytes identical to pre-T-4835
+            value.pop("credential_resolution", None)
+        return value
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "ApplyReceipt":
@@ -2666,6 +3118,7 @@ class ApplyReceipt:
             host=raw.get("host", ""),
             harness=raw.get("harness", ""),
             source=raw.get("source", ""),
+            credential_resolution=tuple(dict(item) for item in raw.get("credential_resolution", ())),
         )
 
 
@@ -2898,7 +3351,7 @@ HARNESS_STANDING_SCHEMA = "pantheon-harness-standing-instructions/v1"
 #: The harnesses whose standing instructions something installs: codex (this
 #: installer) and hermes (prepare_hermes_launch via hermes_render_inputs).
 STANDING_INSTRUCTION_HARNESSES = ("codex", "hermes")
-_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def standing_instruction_entries(
@@ -3067,7 +3520,7 @@ def hermes_render_inputs(
     for field_name in ("source", "source_sha256", "source_commit", "target"):
         if not isinstance(main.get(field_name), str) or not main.get(field_name):
             raise ManifestError(f"{label}: hermes standing instructions.{field_name} missing")
-    if not _SHA256_RE.match(str(main["source_sha256"])):
+    if not _SHA256_RE.fullmatch(str(main["source_sha256"])):
         raise ManifestError(f"{label}: hermes standing instructions.source_sha256 must be 64 lowercase hex")
     if main["target"] != HERMES_PROJECT_CONTEXT_TARGET:
         raise ManifestError(f"{label}: hermes project context target must be {HERMES_PROJECT_CONTEXT_TARGET}")
@@ -3200,9 +3653,111 @@ def _standing_instruction_operations(
     return tuple(operations)
 
 
+CREDENTIAL_REPORT_SHA256_KEY = "credential_report_sha256"
+CREDENTIAL_REF_KINDS_KEY = "credential_ref_kinds"
+
+
+@dataclass(frozen=True)
+class CredentialResolution:
+    entries: tuple[Mapping[str, Any], ...]
+    refusal: str | None
+
+
 class PersonaInstaller:
-    def __init__(self, repo_root: Path = REPO_ROOT):
+    def __init__(
+        self,
+        repo_root: Path = REPO_ROOT,
+        *,
+        credential_report_source: "Callable[[], bytes | None] | None" = None,
+        clock: "Callable[[], datetime] | None" = None,
+    ):
         self.repo_root = repo_root.resolve()
+        # T-4835: where the credential describe report comes from. Production default is
+        # None ("no report configured"): no producer exists yet (T-6129), so every ref
+        # reads `undescribed`. The installer never opens a credential path itself.
+        self._credential_report_source = credential_report_source
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def _load_credential_report(self) -> "_cred.CredentialDescribeReport | None":
+        if self._credential_report_source is None:
+            return None
+        try:
+            raw = self._credential_report_source()
+        except Exception:
+            raise _cred.ReportInvalid("report source: unreadable") from None
+        if raw is None:
+            return None
+        return _cred.load_report(raw)
+
+    def credential_resolution(self, plan: InstallPlan) -> "CredentialResolution":
+        """Pure, value-free per-ref classification of the plan's credential refs
+        (shared by plan, dry-run and the apply gate so they cannot drift)."""
+        ids = [
+            action.target
+            for action in plan.operator_actions
+            if action.action_id == f"operator.credential.{action.target}"
+        ]
+        bound = plan.provenance.get(CREDENTIAL_REPORT_SHA256_KEY)
+        try:
+            kinds = json.loads(plan.provenance.get(CREDENTIAL_REF_KINDS_KEY, "{}"))
+        except ValueError:
+            kinds = {}
+        if not isinstance(kinds, dict):
+            kinds = {}
+        try:
+            report = self._load_credential_report()
+        except _cred.ReportInvalid as exc:
+            entries = tuple(
+                {"ref_id": ref, "status": "malformed", "checked_at": None, "report_sha256": None}
+                for ref in ids
+            )
+            return CredentialResolution(entries, f"credential report malformed ({exc})")
+        if (report.sha256 if report is not None else None) != bound:
+            entries = tuple(
+                {"ref_id": ref, "status": "unbound", "checked_at": None, "report_sha256": None}
+                for ref in ids
+            )
+            return CredentialResolution(
+                entries,
+                "credential report differs from the evidence the plan was approved against",
+            )
+        entries = _cred.classify_refs(
+            report, [(ref, str(kinds.get(ref, ""))) for ref in ids], self._clock()
+        )
+        values = tuple(_iter_strings(entries))
+        if any(pattern.search(value) for _n, pattern in _LEAKAGE_PATTERNS for value in values):
+            return CredentialResolution(entries, "leakage scan: secret-shaped content in credential resolution")
+        bad = [e for e in entries if e["status"] in _cred.REFUSING_STATUSES]
+        refusal = (
+            "; ".join(f"credential {e['ref_id']}: {e['status']}" for e in bad) if bad else None
+        )
+        return CredentialResolution(entries, refusal)
+
+    def _resolution_for(self, plan: InstallPlan) -> tuple[Mapping[str, Any], ...]:
+        return self.__dict__.get("_resolutions", {}).get(plan.digest, ())
+
+    def _refused_report(
+        self,
+        plan: InstallPlan,
+        actor: ActorContext,
+        exc: PlanRefused,
+        sink: "ReceiptSink",
+    ) -> "ApplyReport":
+        """A refusal returns no receipt, except a credential refusal (T-4835): that
+        records a failed-phase, no-mutation receipt so the evidence is auditable."""
+        if not isinstance(exc, CredentialRefused):
+            return ApplyReport("refused", 0, None, (str(exc),))
+        self.__dict__.setdefault("_resolutions", {})[plan.digest] = exc.resolution
+        receipt_id = f"{int(time.time())}-{plan.digest[:16]}-{uuid.uuid4().hex[:8]}"
+        receipt = self._make_apply_receipt(
+            plan, actor, receipt_id=receipt_id, phase="failed", mutations=(), evidence=()
+        )
+        errors = [str(exc)]
+        try:
+            sink.store_receipt(plan, receipt)
+        except Exception as receipt_exc:
+            errors.append(f"refusal receipt persistence: {type(receipt_exc).__name__}")
+        return ApplyReport("refused", 0, receipt, tuple(errors))
 
     def plan(
         self,
@@ -3214,7 +3769,10 @@ class PersonaInstaller:
         maintenance_bypass: bool = False,
         *,
         source_revision: str | None = None,
+        consume_timer_live: bool = False,
     ) -> InstallPlan:
+        # T-6140: consume_timer_live narrows the seat-periodic timer-enable edges. Only the --only
+        # builder passes it; False (the default) keeps every plan and digest unchanged.
         # T-5475: maintenance_bypass adds ONE desired key to the unit-fire op (absent when False, so
         # every default plan and digest is unchanged).
         # T-5091 U1: source_revision is the pure plan seam for the germinate harness-manager
@@ -3404,6 +3962,10 @@ class PersonaInstaller:
         claude_seat = "claude" in _runtime_candidate_harnesses_for_install(
             manifest, binding, selected_harness
         )
+        # T-5480: the codex counterpart; any codex candidate (primary or fallback) applies.
+        codex_seat = "codex" in _runtime_candidate_harnesses_for_install(
+            manifest, binding, selected_harness
+        )
         identity_cap = f"host.identity:{binding.account}"
         fs_cap = f"host.files:{binding.account}"
         manager_cap = f"systemd.user:{binding.account}"
@@ -3551,6 +4113,23 @@ class PersonaInstaller:
                     "mkdir",
                     target,
                     {"mode": mode},
+                    "privileged-helper",
+                    fs_cap,
+                    {"state": "remove-if-created-and-empty"},
+                )
+            )
+
+        # T-6118 PR-1: root, then this seat's dir, then .ingested; owner/group/mode enforced.
+        for operation_id, directory, desired in _chronicle_export_dirs(
+            manifest, self.repo_root, binding, root
+        ):
+            operations.append(
+                op(
+                    operation_id,
+                    1,
+                    "mkdir",
+                    str(directory),
+                    desired,
                     "privileged-helper",
                     fs_cap,
                     {"state": "remove-if-created-and-empty"},
@@ -3914,6 +4493,28 @@ class PersonaInstaller:
                     if claude_seat
                     else []
                 ),
+                # T-5480: codex shell-box hook. Plain seat-local residue, NOT must-run-before-
+                # launch (HO ruling option 2 / T-5608): a codex plan's launches stay broker-
+                # executed, so a runtime launched before this op lands runs unboxed until restart.
+                *(
+                    [
+                        op(
+                            CODEX_HOOK_OP_ID,
+                            1,
+                            CODEX_HOOK_KIND,
+                            str(home / ".codex" / "config.toml"),
+                            {
+                                "hook_command": _codex_hook_csb().hook_command(home),
+                                "account_home": str(home),
+                                "codex_executable": CODEX_EXECUTABLE,
+                            },
+                            "operator-required",
+                            fs_cap,
+                        )
+                    ]
+                    if codex_seat
+                    else []
+                ),
                 # T-5474: first-launch workspace trust, before ANY claude launch (direct-fire
                 # boots claude too). Gate predicate = the T-5471 blocker's: selected harness claude.
                 *(
@@ -3948,6 +4549,8 @@ class PersonaInstaller:
                         "persona_state_root": str(home / ".local" / "state" / "pantheon" / "personas"),
                         "persona": binding.persona,
                         "timer": consume_timer,
+                        # T-5612: the seat's tmux session; a live pane refuses the quarantine
+                        "tmux_session": _controller_tmux_target(manifest, binding).partition(":")[0],
                     },
                     "operator-required",
                     manager_cap,
@@ -4120,9 +4723,8 @@ class PersonaInstaller:
                     "seat-periodic-timer-enable",
                     timer_unit,
                     {
-                        "after": (
-                            "connective.timer-observe,periodic.daemon-reload,"
-                            "service.runtime-controller.enable-observe"
+                        "after": _periodic_enable_after(
+                            periodic_name, [i[0] for i in periodics.installs], consume_timer_live
                         ),
                         "enablement_link_path": str(_seat_timer_link_path(home, timer_unit)),
                         "canonical_template_path": str(_seat_timer_template_path(home, timer_unit)),
@@ -4246,12 +4848,32 @@ class PersonaInstaller:
                     layer=2,
                     target=ref.reference_id,
                     reason=(
-                        "resolve provider metadata and verify scope/rotation "
-                        "without reading or copying a secret value"
+                        "operator attestation that this credential ref resolves "
+                        "(provider, scope, rotation); the installer checks it "
+                        "automatically, metadata only, when a credential describe "
+                        "report is present; never reads or copies a secret value"
                     ),
                     required_capability=f"credential.check:{ref.reference_id}",
                 )
             )
+
+        # T-4835: bind the describe report (if any) into the plan so the approved plan
+        # names the evidence it was approved against. A malformed or absent report adds
+        # nothing here; the apply gate re-reads the source and refuses a malformed one.
+        credential_provenance: dict[str, str] = {}
+        try:
+            described = self._load_credential_report()
+        except _cred.ReportInvalid:
+            described = None
+        if described is not None:
+            credential_provenance = {
+                CREDENTIAL_REPORT_SHA256_KEY: described.sha256,
+                CREDENTIAL_REF_KINDS_KEY: json.dumps(
+                    {ref.reference_id: ref.kind for ref in binding.credential_refs},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
 
         built = InstallPlan.create(
             schema=PLAN_SCHEMA,
@@ -4273,9 +4895,15 @@ class PersonaInstaller:
                     if claude_seat
                     else "not-applicable: no claude runtime candidate"
                 ),
+                CODEX_HOOK_PROVENANCE_KEY: (
+                    "applicable"
+                    if codex_seat
+                    else "not-applicable: no codex runtime candidate"
+                ),
                 "receipt_dir": str(state_dir / binding.persona / "receipts"),
                 ALLOWED_TARGET_ROOTS_KEY: _derive_allowed_roots(manifest, binding.account, root),
-            },
+            }
+            | credential_provenance,
         )
         leaks = _leakage_scan(built)
         if leaks:
@@ -4296,17 +4924,19 @@ class PersonaInstaller:
         receipt_sink: ReceiptSink | None = None,
     ) -> ApplyReport:
         sink = receipt_sink if receipt_sink is not None else default_receipt_sink(backend)
+        context = _context_with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, plan)
         try:
             self._preflight_apply(
                 plan,
                 approved_digest,
                 backend,
                 actor,
+                context=context,
                 scopes=frozenset({"all"}),
                 manifest=manifest,
             )
         except PlanRefused as exc:
-            return ApplyReport("refused", 0, None, (str(exc),))
+            return self._refused_report(plan, actor, exc, sink)
 
         mutations: list[MutationRecord] = []
         evidence: list[OperationEvidence] = []
@@ -4341,6 +4971,7 @@ class PersonaInstaller:
                 mutations=tuple(receipt_mutations),
                 evidence=tuple(receipt_evidence),
                 created_at=created_at,
+                credential_resolution=self._resolution_for(plan),
                 **_receipt_audit_fields(plan),
             )
 
@@ -4367,7 +4998,7 @@ class PersonaInstaller:
                     staged = True
                 mutation, observed = backend.execute(
                     operation,
-                    _context_with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, plan),
+                    context,
                 )
                 mutations.append(mutation)
                 evidence.append(observed)
@@ -4485,6 +5116,7 @@ class PersonaInstaller:
             mutations=tuple(mutations),
             evidence=tuple(evidence),
             created_at=created_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            credential_resolution=self._resolution_for(plan),
             **_receipt_audit_fields(plan),
         )
 
@@ -4536,17 +5168,19 @@ class PersonaInstaller:
         receipt_sink: ReceiptSink | None = None,
     ) -> ApplyReport:
         sink = receipt_sink if receipt_sink is not None else default_receipt_sink(backend)
+        context = _context_with_roots(EXECUTION_CONTEXT_STAGE_PREFIX, plan)
         try:
             self._preflight_apply(
                 plan,
                 approved_digest,
                 backend,
                 actor,
+                context=context,
                 scopes=frozenset({"all", "staged-cutover"}),
                 manifest=manifest,
             )
         except PlanRefused as exc:
-            return ApplyReport("refused", 0, None, (str(exc),))
+            return self._refused_report(plan, actor, exc, sink)
         activation_index = self._activation_index(plan)
         mutations: list[MutationRecord] = []
         evidence: list[OperationEvidence] = []
@@ -4559,7 +5193,7 @@ class PersonaInstaller:
                     raise OperationFailed(f"{operation.operation_id}: activation operation in stage prefix")
                 mutation, observed = backend.execute(
                     operation,
-                    _context_with_roots(EXECUTION_CONTEXT_STAGE_PREFIX, plan),
+                    context,
                 )
                 mutations.append(mutation)
                 evidence.append(observed)
@@ -4693,17 +5327,19 @@ class PersonaInstaller:
         receipt_sink: ReceiptSink | None = None,
     ) -> ApplyReport:
         sink = receipt_sink if receipt_sink is not None else default_receipt_sink(backend)
+        context = _context_with_roots(EXECUTION_CONTEXT_STAGED_ACTIVATE, plan)
         try:
             self._preflight_apply(
                 plan,
                 approved_digest,
                 backend,
                 actor,
+                context=context,
                 scopes=frozenset({"all", "staged-cutover"}),
                 manifest=manifest,
             )
         except PlanRefused as exc:
-            return ApplyReport("refused", 0, None, (str(exc),))
+            return self._refused_report(plan, actor, exc, sink)
         validation_errors = self._validate_staged_receipt(plan, staged_receipt, backend, actor)
         if validation_errors:
             return ApplyReport("refused", 0, None, validation_errors)
@@ -4718,7 +5354,7 @@ class PersonaInstaller:
                 current_operation = operation
                 mutation, observed = backend.execute(
                     operation,
-                    _context_with_roots(EXECUTION_CONTEXT_STAGED_ACTIVATE, plan),
+                    context,
                 )
                 mutations.append(mutation)
                 evidence.append(observed)
@@ -4830,6 +5466,7 @@ class PersonaInstaller:
         backend: HostBackend,
         actor: ActorContext,
         *,
+        context: ExecutionContext,
         scopes: frozenset[ExecutionScope],
         manifest: "Manifest | None" = None,
     ) -> None:
@@ -4846,6 +5483,12 @@ class PersonaInstaller:
         if path_refusal:
             raise PlanRefused(path_refusal)
         _clean_home_dry_run(plan, scopes)
+        # T-4835 / ORG-050 gate 3 (staged): refuse refs the describe report says do not
+        # resolve; `undescribed` keeps the operator-attestation capability check below.
+        resolution = self.credential_resolution(plan)
+        self.__dict__.setdefault("_resolutions", {})[plan.digest] = resolution.entries
+        if resolution.refusal:
+            raise CredentialRefused(resolution.refusal, resolution.entries)
         if actor.instance != plan.instance:
             raise PlanRefused("actor instance does not match plan instance")
         for action in plan.operator_actions:
@@ -4862,7 +5505,7 @@ class PersonaInstaller:
                 raise PlanRefused(
                     f"{operation.operation_id}: actor lacks capability {capability!r}"
                 )
-            result = backend.preflight(operation)
+            result = preflight_in_context(backend, operation, context)
             if not result.ok:
                 raise PlanRefused(
                     f"{operation.operation_id}: {result.classification}: {result.detail}"
@@ -5009,6 +5652,243 @@ class PersonaInstaller:
         return RollbackReport("rolled-back" if restored else "noop", restored, (), unpinned)
 
 
+class _OwnedDirRefusal(Exception):
+    """An owner/group mkdir op was refused (symlink, wrong type, or ownership/mode mismatch)."""
+
+
+def _mkdir_owned(operation: "InstallOperation") -> bool:
+    """T-6118: a mkdir op carrying desired owner/group is an ownership-enforcing op. Every other
+    mkdir op takes the legacy path unchanged."""
+    return operation.kind == "mkdir" and ("owner" in operation.desired or "group" in operation.desired)
+
+
+def _owned_dir_spec(operation: "InstallOperation") -> tuple[str, str, str, int]:
+    owner = operation.desired.get("owner")
+    group = operation.desired.get("group")
+    mode = operation.desired.get("mode", "")
+    if not owner or not group:
+        raise _OwnedDirRefusal(f"{operation.target}: owner and group must be given together")
+    if not isinstance(mode, str) or not _OCTAL_MODE.match(mode):
+        raise _OwnedDirRefusal(f"{operation.target}: mode {mode!r} is not an octal string")
+    return owner, group, mode, int(mode, 8)
+
+
+def _owned_dir_mismatch(
+    target: str, owner: str, group: str, mode: int, actual_owner: str, actual_group: str, actual_mode: int | None
+) -> str | None:
+    problems = []
+    if actual_owner != owner:
+        problems.append(f"owner expected {owner!r} actual {actual_owner!r}")
+    if actual_group != group:
+        problems.append(f"group expected {group!r} actual {actual_group!r}")
+    if actual_mode != mode:
+        shown = "unknown" if actual_mode is None else f"{actual_mode:04o}"
+        problems.append(f"mode expected {mode:04o} actual {shown}")
+    if not problems:
+        return None
+    return f"{target}: refusing to adopt existing directory (never silently fixed): " + "; ".join(problems)
+
+
+_NOFOLLOW_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+class _ChainMissing(Exception):
+    """A path component above the final one does not exist (yet)."""
+
+
+def _open_dir_nofollow(name: str, dir_fd: int, label: str) -> int:
+    try:
+        return os.open(name, _NOFOLLOW_DIR, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise _ChainMissing(label) from None
+    except OSError as exc:
+        if exc.errno not in {errno.ELOOP, errno.ENOTDIR}:
+            raise _OwnedDirRefusal(f"{label}: cannot open: {exc}") from None
+        try:
+            kind = "a symlink" if stat.S_ISLNK(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode) else "not a directory"
+        except OSError:
+            kind = "not a plain directory"
+        raise _OwnedDirRefusal(f"{label}: path component is {kind}; refusing to traverse") from None
+
+
+def _open_parent_nofollow(install_root: str, target: str) -> tuple[int, str]:
+    """Open the target's parent by walking every component from the install root down with
+    O_DIRECTORY|O_NOFOLLOW (the narrow T-4855 instance): a symlink or non-directory anywhere on the
+    way is refused, and the returned fd pins the parent so the final component cannot be redirected
+    by a later swap. Returns (parent_fd, final name); the caller closes the fd."""
+    try:
+        relative = Path(target).relative_to(install_root)
+    except ValueError:
+        raise _OwnedDirRefusal(f"{target}: not under install root {install_root}") from None
+    parts = relative.parts
+    if not parts or ".." in parts:
+        raise _OwnedDirRefusal(f"{target}: not a plain path below install root {install_root}")
+    try:
+        current = os.open(install_root, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        raise _OwnedDirRefusal(f"{install_root}: install root unusable: {exc}") from None
+    walked = Path(install_root)
+    try:
+        for part in parts[:-1]:
+            walked = walked / part
+            nxt = _open_dir_nofollow(part, current, str(walked))
+            os.close(current)
+            current = nxt
+    except BaseException:
+        os.close(current)
+        raise
+    return current, parts[-1]
+
+
+def _open_final_nofollow(parent_fd: int, name: str, target: str) -> int | None:
+    """None when absent; else an O_NOFOLLOW directory fd (symlink / non-directory refused)."""
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(before.st_mode):
+        raise _OwnedDirRefusal(f"{target}: target is a symlink; refusing to follow")
+    if not stat.S_ISDIR(before.st_mode):
+        raise _OwnedDirRefusal(f"{target}: non-directory exists")
+    try:
+        return os.open(name, _NOFOLLOW_DIR, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _OwnedDirRefusal(f"{target}: cannot open without following symlinks: {exc}") from None
+
+
+def _owned_fd_mismatch(fd: int, target: str, owner: str, group: str, mode: int) -> str | None:
+    st = os.fstat(fd)
+    try:
+        actual_owner = pwd.getpwuid(st.st_uid).pw_name
+    except KeyError:
+        actual_owner = f"uid:{st.st_uid}"
+    try:
+        actual_group = grp.getgrgid(st.st_gid).gr_name
+    except KeyError:
+        actual_group = f"gid:{st.st_gid}"
+    return _owned_dir_mismatch(target, owner, group, mode, actual_owner, actual_group, stat.S_IMODE(st.st_mode))
+
+
+def _owned_ids(target: str, owner: str, group: str) -> tuple[int, int]:
+    try:
+        uid = pwd.getpwnam(owner).pw_uid
+    except KeyError:
+        raise _OwnedDirRefusal(f"{target}: owner account {owner!r} does not exist on this host") from None
+    try:
+        gid = grp.getgrnam(group).gr_gid
+    except KeyError:
+        raise _OwnedDirRefusal(f"{target}: group {group!r} does not exist on this host") from None
+    return uid, gid
+
+
+def _owned_mkdir_preflight(operation: "InstallOperation") -> "PreflightResult":
+    """Read-only. Absent -> will create; present -> must already match owner/group/full S_IMODE."""
+    install_root = operation.provenance.get("install_root", "/")
+    try:
+        owner, group, _mode_text, mode = _owned_dir_spec(operation)
+        _owned_ids(operation.target, owner, group)
+        try:
+            parent_fd, name = _open_parent_nofollow(install_root, operation.target)
+        except _ChainMissing:
+            return PreflightResult(True, "absent", "parent will be created by an earlier operation")
+        try:
+            fd = _open_final_nofollow(parent_fd, name, operation.target)
+            can_write = os.access(".", os.W_OK | os.X_OK, dir_fd=parent_fd, effective_ids=True)
+        finally:
+            os.close(parent_fd)
+        if fd is None:
+            # Honest dry run: creating needs write access to the parent and, unless the owner is the
+            # running user, root for the chown.
+            euid = os.geteuid()
+            if not can_write:
+                return PreflightResult(False, "conflicting", f"{operation.target}: parent is not writable by uid {euid}")
+            if euid != 0 and _owned_ids(operation.target, owner, group)[0] != euid:
+                return PreflightResult(
+                    False, "conflicting",
+                    f"{operation.target}: creating a directory owned by {owner!r} needs root (effective uid {euid}); "
+                    "an unprivileged run can only verify an existing correct directory",
+                )
+            return PreflightResult(True, "absent", "will create directory with owner, group and mode")
+        try:
+            problem = _owned_fd_mismatch(fd, operation.target, owner, group, mode)
+        finally:
+            os.close(fd)
+        if problem:
+            return PreflightResult(False, "conflicting", problem)
+        return PreflightResult(True, "directory", "directory already matches owner, group and mode")
+    except _OwnedDirRefusal as exc:
+        return PreflightResult(False, "conflicting", str(exc))
+
+
+def _owned_mkdir_apply(operation: "InstallOperation") -> bool:
+    """mkdir under a parent fd, then fchown, then fchmod LAST (setgid survives). An existing
+    directory is re-verified through its own fd (TOCTOU) and never altered. Returns changed."""
+    install_root = operation.provenance.get("install_root", "/")
+    try:
+        owner, group, _mode_text, mode = _owned_dir_spec(operation)
+        uid, gid = _owned_ids(operation.target, owner, group)
+        try:
+            parent_fd, name = _open_parent_nofollow(install_root, operation.target)
+        except _ChainMissing as exc:
+            raise _OwnedDirRefusal(f"{operation.target}: parent {exc} does not exist") from None
+        try:
+            for _attempt in range(2):
+                fd = _open_final_nofollow(parent_fd, name, operation.target)
+                if fd is not None:
+                    try:
+                        problem = _owned_fd_mismatch(fd, operation.target, owner, group, mode)
+                    finally:
+                        os.close(fd)
+                    if problem:
+                        raise _OwnedDirRefusal(problem)
+                    return False
+                try:
+                    os.mkdir(name, 0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    continue  # lost a creation race: re-verify what is there
+                created = _open_final_nofollow(parent_fd, name, operation.target)
+                if created is None:
+                    raise _OwnedDirRefusal(f"{operation.target}: vanished right after creation")
+                try:
+                    if os.fstat(created).st_uid != os.geteuid():
+                        raise _OwnedDirRefusal(f"{operation.target}: replaced right after creation; refusing")
+                    os.fchown(created, uid, gid)
+                    os.fchmod(created, mode)
+                except BaseException:
+                    try:
+                        os.rmdir(name, dir_fd=parent_fd)  # undo our own empty creation
+                    except OSError:
+                        pass
+                    raise
+                finally:
+                    os.close(created)
+                return True
+            raise _OwnedDirRefusal(f"{operation.target}: could not settle after creation race")
+        finally:
+            os.close(parent_fd)
+    except _OwnedDirRefusal as exc:
+        raise OperationFailed(str(exc)) from None
+
+
+def _owned_rmdir(target: str, install_root: str) -> None:
+    """Rollback of a directory this installer created: empty only, never through a symlink."""
+    try:
+        parent_fd, name = _open_parent_nofollow(install_root, target)
+    except _ChainMissing:
+        return
+    except _OwnedDirRefusal as exc:
+        raise OperationFailed(f"rollback refused: {exc}") from None
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        # absent, non-empty (durable receipts / user state) or not a directory: left alone
+        return
+    finally:
+        os.close(parent_fd)
+
+
 def _snapshot(path: Path) -> dict[str, str]:
     if not path.exists() and not path.is_symlink():
         return {"state": "absent"}
@@ -5022,6 +5902,17 @@ def _snapshot(path: Path) -> dict[str, str]:
             "fingerprint": _sha256_bytes(content),
             "mode": f"{path.stat().st_mode & 0o7777:04o}",
         }
+    return {"state": "other"}
+
+
+def _lstat_snapshot(path: Path) -> dict[str, str]:
+    """Like _snapshot but never follows a final-component link and never reads file bytes."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return {"state": "absent"}
+    if stat.S_ISDIR(st.st_mode):
+        return {"state": "directory", "mode": f"{stat.S_IMODE(st.st_mode):04o}"}
     return {"state": "other"}
 
 
@@ -5452,6 +6343,8 @@ class SimulatedHostBackend:
         # reviewer B1: simulated unit ActiveStates for the quarantine's liveness gate
         self.unit_active_states: dict[str, str] = {}
         self.unreadable_units: set[str] = set()
+        self.live_panes: set[str] = set()  # T-5612: tmux sessions with a live pane
+        self.unreadable_panes: set[str] = set()
         self.quarantine_stamp = "20000101T000000Z"
 
     def seed_consume_service(
@@ -5515,6 +6408,38 @@ class SimulatedHostBackend:
     def drift(self, target: str, content: str) -> None:
         self.seed_file(target, content)
 
+    def _owned_mkdir_preflight(self, operation: InstallOperation) -> PreflightResult:
+        """T-6118: ownership-enforcing mkdir in the simulated host. Entries carry owner/group/mode;
+        a symlink or non-directory on the way (or at the target) is refused."""
+        try:
+            owner, group, _text, mode = _owned_dir_spec(operation)
+        except _OwnedDirRefusal as exc:
+            return PreflightResult(False, "conflicting", str(exc))
+        for ancestor in Path(operation.target).parents:
+            kind = self.entries.get(str(ancestor), {}).get("state")
+            if kind == "symlink":
+                return PreflightResult(False, "conflicting", f"{ancestor}: path component is a symlink; refusing to traverse")
+            if kind not in {None, "directory"}:
+                return PreflightResult(False, "conflicting", f"{ancestor}: path component is not a directory")
+        entry = self._snapshot(operation.target)
+        if entry["state"] == "absent":
+            return PreflightResult(True, "absent", "will create directory with owner, group and mode")
+        if entry["state"] == "symlink":
+            return PreflightResult(False, "conflicting", f"{operation.target}: target is a symlink; refusing to follow")
+        if entry["state"] != "directory":
+            return PreflightResult(False, "conflicting", "non-directory exists")
+        try:
+            actual_mode = int(entry["mode"], 8) if "mode" in entry else None
+        except ValueError:
+            actual_mode = None
+        problem = _owned_dir_mismatch(
+            operation.target, owner, group, mode,
+            entry.get("owner", "unknown"), entry.get("group", "unknown"), actual_mode,
+        )
+        if problem:
+            return PreflightResult(False, "conflicting", problem)
+        return PreflightResult(True, "directory", "directory already matches owner, group and mode")
+
     def _snapshot(self, target: str) -> dict[str, str]:
         return dict(self.entries.get(target, {"state": "absent"}))
 
@@ -5533,6 +6458,8 @@ class SimulatedHostBackend:
             return self._decommission_preflight(operation)
         if operation.kind == SETTINGS_ENV_KIND:
             return self._settings_env_preflight(operation)
+        if operation.kind == CODEX_HOOK_KIND:
+            return self._codex_hook_preflight(operation)
         if operation.kind == WORKSPACE_TRUST_KIND:
             return self._workspace_trust_preflight(operation)
         if operation.kind == RESIDUE_QUARANTINE_KIND:
@@ -5558,6 +6485,8 @@ class SimulatedHostBackend:
                     return PreflightResult(False, "conflicting", detail)
                 if _maintenance_bypass_requested(operation) and self.in_maintenance:
                     return PreflightResult(True, "maintenance-bypass", MAINTENANCE_BYPASS_PREFLIGHT_NOTE)
+        if _mkdir_owned(operation):
+            return self._owned_mkdir_preflight(operation)
         if operation.kind == "mkdir":
             state = self._snapshot(operation.target)
             if state["state"] in {"absent", "directory"}:
@@ -5654,6 +6583,8 @@ class SimulatedHostBackend:
             return self._execute_decommission(operation)
         if operation.kind == SETTINGS_ENV_KIND:
             return self._execute_settings_env(operation)
+        if operation.kind == CODEX_HOOK_KIND:
+            return self._execute_codex_hook(operation)
         if operation.kind == WORKSPACE_TRUST_KIND:
             return self._execute_workspace_trust(operation)
         if operation.kind == RESIDUE_QUARANTINE_KIND:
@@ -5666,11 +6597,18 @@ class SimulatedHostBackend:
         detail = "typed operation passed"
         observed: dict[str, str] = {}
         if operation.kind == "mkdir":
+            if _mkdir_owned(operation):
+                check = self._owned_mkdir_preflight(operation)  # TOCTOU: re-check at mutation time
+                if not check.ok:
+                    raise OperationFailed(check.detail)
             if before["state"] == "absent":
                 self.entries[operation.target] = {
                     "state": "directory",
                     "mode": operation.desired.get("mode", "0755"),
                 }
+                if _mkdir_owned(operation):
+                    self.entries[operation.target]["owner"] = operation.desired["owner"]
+                    self.entries[operation.target]["group"] = operation.desired["group"]
                 changed = True
         elif operation.kind in {"atomic-write", "user-unit-install", "seat-periodic-unit-install", "codex-standing-instructions-install"}:
             raw = _desired_content(operation)
@@ -6337,6 +7275,9 @@ class SimulatedHostBackend:
         )
 
     # ---- T-5473: phase-Q residue quarantine (simulated twin; same shared helpers) ----
+    def consume_timer_live(self, timer: str) -> bool:
+        return not self._bootstrap_fire_pending()
+
     def _bootstrap_fire_pending(self) -> bool:
         """Twin of LocalHostBackend._bootstrap_fire_pending: the disabled-timer branch."""
         return not self.timer_enabled
@@ -6374,6 +7315,15 @@ class SimulatedHostBackend:
         for key in [k for k in self.entries if k == src or k.startswith(src + "/")]:
             self.entries[dst + key[len(src):]] = self.entries.pop(key)
 
+    def _sim_pane_states(self, operation: InstallOperation) -> dict[str, str | None]:
+        """T-5612: the injectable pane state, same pseudo-entry shape as the real reader. A session
+        the test never named is absent; a plan without ``tmux_session`` is unreadable (refuses)."""
+        session = operation.desired.get("tmux_session", "")
+        if not session:
+            return {"tmux-session:<unnamed>": None}
+        state = None if session in self.unreadable_panes else ("live" if session in self.live_panes else "absent")
+        return {f"tmux-session:{session}": state}
+
     def _residue_quarantine_preflight(self, operation: InstallOperation) -> PreflightResult:
         try:
             root, persona, _ = _quarantine_desired(operation)
@@ -6389,6 +7339,7 @@ class SimulatedHostBackend:
                 unit: (None if unit in self.unreadable_units else self.unit_active_states.get(unit, "inactive"))
                 for unit in (_controller_service_unit(persona), f"pantheon-persona-consume@{persona}.service")
             }
+            | self._sim_pane_states(operation)
         )
         if live:
             return PreflightResult(False, "conflicting", live)
@@ -6534,6 +7485,48 @@ class SimulatedHostBackend:
             if residue:
                 return "control-plane residue would block the bootstrap: " + ", ".join(n for _, n in residue)
         return None
+
+    # ---- T-5480: shell-box PreToolUse hook in the seat's ~/.codex/config.toml ----
+    def _codex_hook_preflight(self, operation: InstallOperation) -> PreflightResult:
+        try:
+            raw = self._settings_env_raw(operation.target)
+        except OperationFailed as exc:
+            return PreflightResult(False, "conflicting", str(exc))
+        return _codex_hook_preflight(raw, operation.target, operation.desired, check_scripts=False)
+
+    def _execute_codex_hook(
+        self, operation: InstallOperation
+    ) -> tuple[MutationRecord, OperationEvidence]:
+        preflight = self._codex_hook_preflight(operation)
+        if not preflight.ok:
+            raise OperationFailed(f"{operation.operation_id}: {preflight.detail}")
+        raw = self._settings_env_raw(operation.target)
+        _, new, stored = _codex_hook_wire(
+            raw, operation, check_scripts=False, read_hooks=_sim_codex_read_hooks
+        )
+        if new is not None:
+            self._settings_env_store(operation.target, new)
+        self.events.append(operation.operation_id)
+        changed = new is not None
+        return (
+            MutationRecord(
+                operation.operation_id, operation.kind, operation.target, operation.owner,
+                changed, _codex_hook_before(operation, raw, changed, stored),
+                _sha256_bytes(stored.encode("utf-8")),
+            ),
+            OperationEvidence(
+                operation.operation_id, operation.layer, operation.kind, True,
+                preflight.detail, {"hook_state": "set" if changed else "matching"},
+            ),
+        )
+
+    def _rollback_codex_hook(self, mutation: MutationRecord) -> None:
+        raw = self._settings_env_raw(mutation.target)
+        check = _codex_hook_can_rollback(mutation, raw)
+        if not check.ok:
+            raise OperationFailed(check.detail)
+        if check.classification == "owned":
+            self._settings_env_store(mutation.target, _codex_hook_removed(mutation, raw))
 
     # ---- T-5454: shell-box wiring in the seat's settings.json ----
     def _settings_env_raw(self, target: str) -> bytes | None:
@@ -6682,6 +7675,12 @@ class SimulatedHostBackend:
             return OperationEvidence(
                 operation.operation_id, operation.layer, operation.kind, cls == "matching", detail
             )
+        if operation.kind == CODEX_HOOK_KIND:
+            try:
+                ok, detail = _codex_hook_verdict(self._settings_env_raw(operation.target), operation)
+            except OperationFailed as exc:
+                ok, detail = False, str(exc)
+            return OperationEvidence(operation.operation_id, operation.layer, operation.kind, ok, detail)
         if operation.kind == WORKSPACE_TRUST_KIND:
             try:
                 prior = _trust_prior(
@@ -6800,6 +7799,12 @@ class SimulatedHostBackend:
             except OperationFailed as exc:
                 return PreflightResult(False, "drifted", str(exc))
             return _settings_env_can_rollback(mutation, raw)
+        if mutation.kind == CODEX_HOOK_KIND:
+            try:
+                raw = self._settings_env_raw(mutation.target)
+            except OperationFailed as exc:
+                return PreflightResult(False, "drifted", str(exc))
+            return _codex_hook_can_rollback(mutation, raw)
         if mutation.kind == WORKSPACE_TRUST_KIND:
             try:
                 raw = self._settings_env_raw(mutation.target)
@@ -6886,6 +7891,12 @@ class SimulatedHostBackend:
                 )
                 if new is not None:
                     self._settings_env_store(mutation.target, new)
+            self.events.append(f"rollback:{mutation.operation_id}")
+            return
+        if mutation.kind == CODEX_HOOK_KIND:
+            if self.fire_session_alive:
+                raise OperationFailed("codex hook kept: fire-launched session is still running")
+            self._rollback_codex_hook(mutation)
             self.events.append(f"rollback:{mutation.operation_id}")
             return
         if mutation.kind == WORKSPACE_TRUST_KIND:
@@ -8149,6 +9160,64 @@ class LocalHostBackend:
             )
         )
 
+    # ---- T-5480: shell-box PreToolUse hook in the seat's ~/.codex/config.toml ----
+    codex_hooks_reader: Any = None  # tests inject a stub; None = the real codex app-server read
+
+    def _codex_read_hooks(self) -> Any:
+        if self.codex_hooks_reader is not None:
+            return self.codex_hooks_reader
+        from tools.harness_adapter.provider_quota import read_codex_app_server_hooks
+
+        return read_codex_app_server_hooks
+
+    def _codex_hook_preflight(self, operation: InstallOperation) -> PreflightResult:
+        try:
+            raw, _ = _settings_env_load(Path(operation.target))
+        except OperationFailed as exc:
+            return PreflightResult(False, "conflicting", str(exc))
+        return _codex_hook_preflight(raw, operation.target, operation.desired, check_scripts=True)
+
+    def _execute_codex_hook(
+        self, operation: InstallOperation
+    ) -> tuple[MutationRecord, dict[str, str]]:
+        """Write the shell-box hook block + trusted_hash into the seat's codex config.toml.
+
+        NOT a must-run-before-launch op (HO ruling, T-5480 / T-5608): it is plain seat-local
+        residue, so a codex plan's launches stay broker-executed. A codex runtime that is
+        already running, or that the broker launches before this op lands, keeps its startup
+        snapshot of hooks and runs UNBOXED until restarted. LIVE WIRING MUST THEREFORE
+        RESTART EACH CODEX RUNTIME after this op applies; verify-seat's codex-hook-* checks
+        confirm the on-disk wiring afterwards.
+        """
+        preflight = self._codex_hook_preflight(operation)
+        if not preflight.ok:
+            raise OperationFailed(f"{operation.operation_id}: {preflight.detail}")
+        path = Path(operation.target)
+        raw, st = _settings_env_load(path)
+        _, new, stored = _codex_hook_wire(
+            raw, operation, check_scripts=True, read_hooks=self._codex_read_hooks()
+        )
+        if new is not None:
+            _settings_env_atomic_write(path, new, raw, st)
+        changed = new is not None
+        return (
+            MutationRecord(
+                operation.operation_id, operation.kind, operation.target, operation.owner,
+                changed, _codex_hook_before(operation, raw, changed, stored),
+                _sha256_bytes(stored.encode("utf-8")),
+            ),
+            {"hook_state": "set" if changed else "matching"},
+        )
+
+    def _rollback_codex_hook(self, mutation: MutationRecord) -> None:
+        path = Path(mutation.target)
+        raw, st = _settings_env_load(path)
+        check = _codex_hook_can_rollback(mutation, raw)
+        if not check.ok:
+            raise OperationFailed(check.detail)
+        if check.classification == "owned":
+            _settings_env_atomic_write(path, _codex_hook_removed(mutation, raw), raw, st)
+
     # ---- T-5454: shell-box wiring in the seat's settings.json ----
     def _settings_env_preflight(self, operation: InstallOperation) -> PreflightResult:
         """Read-only. Also fail-closed on a prefix target this account cannot exec: a
@@ -8208,6 +9277,10 @@ class LocalHostBackend:
             _settings_env_atomic_write(path, new, raw, st)
 
     # ---- T-5473: phase-Q residue quarantine ----
+    def consume_timer_live(self, timer: str) -> bool:
+        """T-6140: already-live seat == the consume unit-fire is not a bootstrap fire."""
+        return not self._bootstrap_fire_pending(timer)
+
     def _bootstrap_fire_pending(self, timer: str) -> bool:
         """THE predicate: is the consume unit-fire an actual bootstrap fire? Same read as the
         disabled-timer branch of `connective.unit-fire` (preflight and execute): timer not enabled."""
@@ -8216,16 +9289,40 @@ class LocalHostBackend:
         except _us.UserManagerError as exc:
             raise OperationFailed(f"cannot read the consume timer enablement: {exc}") from exc
 
-    def _runtime_liveness(self, persona: str) -> dict[str, str | None]:
+    _pane_stat = staticmethod(os.stat)  # class attribute so a test can fake the seat socket
+
+    def _runtime_liveness(
+        self, persona: str, tmux_session: str | None = None, seat_uid: int | None = None
+    ) -> dict[str, str | None]:
         """Read-only user-manager show (SERVICE_OBSERVE) of the units that mean a live runtime:
-        the runtime controller and the consume service. None == unreadable."""
+        the runtime controller and the consume service. None == unreadable. T-5612: also the
+        seat's tmux pane, read against the SEAT's socket (-S), as a ``tmux-session:`` pseudo-entry
+        when the caller names a session."""
         states: dict[str, str | None] = {}
         for unit in (_controller_service_unit(persona), f"pantheon-persona-consume@{persona}.service"):
             try:
                 states[unit] = self._user_unit_read(unit, ReadPurpose.SERVICE_OBSERVE).active_state
             except (OperationFailed, _us.UserManagerError):
                 states[unit] = None
+        if tmux_session is not None:
+            states.update(
+                pane_liveness_states(
+                    tmux_session, seat_uid,
+                    run=lambda argv: self._run(argv, timeout=PANE_PROBE_TIMEOUT_SECONDS),
+                    stat=self._pane_stat,
+                )
+            )
         return states
+
+    def _quarantine_liveness(self, operation: InstallOperation, persona: str) -> dict[str, str | None]:
+        """T-5612: units plus the seat's pane. The seat uid comes from the op's owner account (the
+        local backend runs inside it); an unresolvable owner gives None -> the pane read refuses."""
+        try:
+            uid: int | None = pwd.getpwnam(operation.owner).pw_uid
+        except (KeyError, TypeError):
+            uid = None
+        session = operation.desired.get("tmux_session", "") or "<unnamed>"
+        return self._runtime_liveness(persona, session, uid)
 
     def _residue_quarantine_preflight(self, operation: InstallOperation) -> PreflightResult:
         """Read-only; execute calls this first so both answer from the same code. T-5608: the
@@ -8233,7 +9330,7 @@ class LocalHostBackend:
         return _residue_quarantine_check(
             operation,
             bootstrap_fire_pending=self._bootstrap_fire_pending,
-            liveness=self._runtime_liveness,
+            liveness=lambda persona: self._quarantine_liveness(operation, persona),
             entries=lambda root, persona: _bootstrap_residue_entries(Path(root), persona),
         )
 
@@ -8759,6 +9856,8 @@ class LocalHostBackend:
                 "operator-required",
                 "local backend activates only a root=/ plan",
             )
+        if _mkdir_owned(operation):
+            return _owned_mkdir_preflight(operation)
         if operation.kind == "mkdir":
             path = Path(operation.target)
             if not path.exists():
@@ -8879,6 +9978,8 @@ class LocalHostBackend:
         if operation.kind == SETTINGS_ENV_KIND:
             # file-only: no user manager is needed to edit settings.json
             return self._settings_env_preflight(operation)
+        if operation.kind == CODEX_HOOK_KIND:
+            return self._codex_hook_preflight(operation)  # file-only (the codex read is a scratch app-server)
         if operation.kind == WORKSPACE_TRUST_KIND:
             return self._workspace_trust_preflight(operation)  # file-only, like settings-env
         manager = self._manager_ready()
@@ -9094,6 +10195,22 @@ class LocalHostBackend:
 
     def _simple_mutation(self, operation: InstallOperation) -> MutationRecord:
         path = Path(operation.target)
+        if _mkdir_owned(operation):
+            install_root = operation.provenance.get("install_root", "/")
+            marker = {"nofollow_root": install_root}
+            # lstat only: _snapshot follows links and would read a planted link's target bytes
+            # (as root) before the nofollow refusal runs; apply refuses link / non-directory.
+            before = {**_lstat_snapshot(path), **marker}
+            changed = _owned_mkdir_apply(operation)
+            return MutationRecord(
+                operation.operation_id,
+                operation.kind,
+                operation.target,
+                operation.owner,
+                changed,
+                before,
+                _snapshot_fingerprint(_lstat_snapshot(path)),
+            )
         before = _snapshot(path)
         changed = False
         if operation.kind == "mkdir" and before["state"] == "absent":
@@ -9971,6 +11088,8 @@ class LocalHostBackend:
             mutation, observed = self._execute_service_decommission(operation)
         elif operation.kind == SETTINGS_ENV_KIND:
             mutation, observed = self._execute_settings_env(operation)
+        elif operation.kind == CODEX_HOOK_KIND:
+            mutation, observed = self._execute_codex_hook(operation)
         elif operation.kind == WORKSPACE_TRUST_KIND:
             mutation, observed = self._execute_workspace_trust(operation)
         elif operation.kind == RESIDUE_QUARANTINE_KIND:
@@ -10270,6 +11389,13 @@ class LocalHostBackend:
             return OperationEvidence(
                 operation.operation_id, operation.layer, operation.kind, cls == "matching", detail
             )
+        if operation.kind == CODEX_HOOK_KIND:
+            try:
+                raw, _ = _settings_env_load(Path(operation.target))
+                ok, detail = _codex_hook_verdict(raw, operation)
+            except OperationFailed as exc:
+                ok, detail = False, str(exc)
+            return OperationEvidence(operation.operation_id, operation.layer, operation.kind, ok, detail)
         if operation.kind == WORKSPACE_TRUST_KIND:
             try:
                 raw, _ = _settings_env_load(Path(operation.target))
@@ -10367,6 +11493,12 @@ class LocalHostBackend:
             except OperationFailed as exc:
                 return PreflightResult(False, "drifted", str(exc))
             return _settings_env_can_rollback(mutation, raw)
+        if mutation.kind == CODEX_HOOK_KIND:
+            try:
+                raw, _ = _settings_env_load(Path(mutation.target))
+            except OperationFailed as exc:
+                return PreflightResult(False, "drifted", str(exc))
+            return _codex_hook_can_rollback(mutation, raw)
         if mutation.kind == WORKSPACE_TRUST_KIND:
             try:
                 raw, _ = _settings_env_load(Path(mutation.target))
@@ -10461,8 +11593,15 @@ class LocalHostBackend:
             except OperationFailed as exc:
                 return PreflightResult(False, "unreadable", str(exc))
             return _claude_mcp_registration_can_rollback(mutation, servers)
-        current = _snapshot_fingerprint(_snapshot(Path(mutation.target)))
-        before = _snapshot_fingerprint(mutation.before)
+        if mutation.kind == "mkdir" and mutation.before.get("nofollow_root"):
+            # owned mkdir receipt: lstat only, never follow a swapped-in link or read its bytes.
+            # The receipt carries an extra marker key, so compare on the snapshot keys only.
+            before_snap = {k: v for k, v in mutation.before.items() if k != "nofollow_root"}
+            current = _snapshot_fingerprint(_lstat_snapshot(Path(mutation.target)))
+            before = _snapshot_fingerprint(before_snap)
+        else:
+            current = _snapshot_fingerprint(_snapshot(Path(mutation.target)))
+            before = _snapshot_fingerprint(mutation.before)
         if current == before:
             return PreflightResult(
                 True,
@@ -10499,6 +11638,12 @@ class LocalHostBackend:
             if blocked is not None:
                 raise OperationFailed(blocked.detail)
             self._rollback_settings_env(mutation)
+            return
+        if mutation.kind == CODEX_HOOK_KIND:
+            blocked = self._live_session_key_block()
+            if blocked is not None:
+                raise OperationFailed(blocked.detail)
+            self._rollback_codex_hook(mutation)
             return
         if mutation.kind == WORKSPACE_TRUST_KIND:
             self._rollback_workspace_trust(mutation)
@@ -10595,6 +11740,9 @@ class LocalHostBackend:
                 return
         path = Path(mutation.target)
         before = mutation.before
+        if before.get("state") == "absent" and before.get("nofollow_root"):
+            _owned_rmdir(mutation.target, before["nofollow_root"])
+            return
         if before.get("state") == "absent":
             if path.is_dir():
                 try:
@@ -10781,6 +11929,14 @@ def _seat_verbs(parser: argparse.ArgumentParser, subparsers: Any) -> None:
     apply_p.add_argument("--plan-digest", help="digest printed by the dry run (required with --execute)")
     apply_p.add_argument("--receipt", help="staged receipt id (staged-activate only)")
     apply_p.add_argument(
+        "--only",
+        help=(
+            "T-6099: comma-separated operation ids; build and apply a digest-bound plan of ONLY "
+            "these (all-in-one workflow). Refuses an unknown id or a named op whose prerequisite "
+            "is not also named. Give the same --only on the dry run and on --execute."
+        ),
+    )
+    apply_p.add_argument(
         "--maintenance-bypass", action="store_true",
         help=(
             "T-5475: bootstrap a seat that is in maintenance by writing consume's one-shot bypass token "
@@ -10807,6 +11963,11 @@ def _seat_verbs(parser: argparse.ArgumentParser, subparsers: Any) -> None:
     verify_p.add_argument("--persona", required=True)
 
 
+def _only(args: argparse.Namespace) -> list[str] | None:
+    raw = getattr(args, "only", None)
+    return None if raw is None else raw.split(",")
+
+
 def _run_seat_verb(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     from tools import persona_installer_apply as _apply
 
@@ -10830,12 +11991,12 @@ def _run_seat_verb(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             code, summary = _apply.execute(
                 args.manifest, args.persona, plan_digest=args.plan_digest,
                 workflow=args.workflow, receipt_id=args.receipt, harness=args.harness,
-                maintenance_bypass=args.maintenance_bypass,
+                maintenance_bypass=args.maintenance_bypass, only=_only(args),
             )
         else:
             code, summary = _apply.dry_run(
                 args.manifest, args.persona, workflow=args.workflow, harness=args.harness,
-                maintenance_bypass=args.maintenance_bypass,
+                maintenance_bypass=args.maintenance_bypass, only=_only(args),
             )
     except InstallerError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
@@ -10867,7 +12028,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             root=args.root,
         )
         if args.command == "plan":
-            _print_json(plan)
+            _print_json(
+                {
+                    **plan.to_dict(),
+                    "credential_resolution": list(
+                        installer.credential_resolution(plan).entries
+                    ),
+                }
+            )
             return 0
         backend = SimulatedHostBackend()
         actor = ActorContext(

@@ -24,6 +24,17 @@ import handoff_conservation as hc  # noqa: E402
 
 # --------------------------------------------------------------- extractors
 class FingerprintExtractorsTest(unittest.TestCase):
+    def test_size_alert_once_per_crossing_and_names_sections(self):
+        text = "# HANDOFF\n" + ("x" * 40_000) + "\n## Durable\n" + ("y" * 2_000)
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "size.json"
+            first = hc.check_size_alert(text, state_file=state)
+            self.assertIsNotNone(first)
+            self.assertIn("largest sections", first)
+            self.assertIsNone(hc.check_size_alert(text, state_file=state))
+            self.assertIsNone(hc.check_size_alert("small", state_file=state))
+            self.assertIsNotNone(hc.check_size_alert(text, state_file=state))
+
     def test_ticket_ids(self):
         fp = hc.compute_fingerprint("Working T-1234 and T-99, blocked by T-1234 again.")
         self.assertEqual(fp["ticket_ids"], {"T-1234", "T-99"})

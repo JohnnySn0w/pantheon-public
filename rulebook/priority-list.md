@@ -18,7 +18,17 @@ Sort algorithm (per ORG-078 §3):
 ```yaml
 priority-1:
   # the operator TG 12363 (2026-10-27): ORG-052 installer + ORG-106 lead the stack.
+  # the operator TG 12753 (2026-11-02): "I want the germination engine but we want to
+  # build the sub-parts as we go" -- the ORG-080 germination engine is the P1
+  # target; its sub-parts are built along the way. TG 12754 named them: the
+  # brokers (ORG-051 auth/credential, ORG-052 capability), health monitoring
+  # (ORG-076), seat management (harness-manager, in ORG-080).
+  - org-080
+  - germinate
+  - germination
+  - org-051
   - org-052
+  - org-076
   - org-106
 
 priority-2:
@@ -27,6 +37,9 @@ priority-2:
   # the operator's top-of-stack per TG 8027 (2026-08-20)
   - harness-controller
   - t-2953-arc
+  # the operator TG 12794 (2026-11-02): the T-4924 DeepSeek/Hermes third recovery
+  # seat is P2, contingent on Watchman's app-server cutover (T-5740).
+  - deepseek-seat
 
 priority-3:
   # Ticket-system flow — the layer that enforces cascade, priority, dependency
@@ -41,17 +54,32 @@ priority-5:
   # Concordance / retrieval — decision-corpus recall + injection layer
   - concordance
   - org-073
+
+# Labels broad by design (T-6239): exempt from the validator's high-volume and
+# semantic-drift heuristics only (dead-label still applies). Not a tier; ranks
+# are unaffected. Re-check an entry when its label's meaning changes.
+expected-broad:
+  echo: "project label, not an arc (Echo, priority-2, TG 12385)"
+  org-080: "ADR-family umbrella: the germination engine and its sub-parts (priority-1)"
+  germination: "germination-engine umbrella label (priority-1, ORG-080)"
+  germinate: "germination-engine CLI label; spans every engine child (priority-1, ORG-080)"
+  org-051: "ADR-family label: auth/credential broker, a germination sub-part (priority-1)"
+  org-052: "ADR-family label: host capability broker (priority-1)"
+  org-076: "ADR-family label: health monitoring (priority-1)"
+  harness-controller: "substrate every persona runs on (priority-2, T-2953 arc)"
+  ticket-flow: "cross-cutting ticket-system layer (priority-3, with ORG-065)"
 ```
 <!-- PRIORITY-LIST-END -->
 
 ## Rationale for the current stack
 
-Per the operator TG 1676 (2026-08-29), the T-3338/T-3339 persona-orientation pair now jointly occupies the top slot and every prior rank shifts down by one without changing its internal order. The prior three-layer stack came from TG 8027 (2026-08-20): stable harness substrate, stable ticket-system flow, then excellent information traversal / Concordance. Layers cascade: upper layers depend on lower being stable.
+Rewritten 2026-11-02 to match the machine-parseable list above (the prior prose still described the 08-29 ordering).
 
-- **priority-1** = persona-orientation: the shared label carried by T-3338 and T-3339, covering Codex spawn preload and cross-harness/base-plus-child context parity.
-- **priority-2** = harness-controller / t-2953-arc: the substrate every persona runs on. Instability here means everything else is on shifting ground.
-- **priority-3** = ticket-flow / org-065 / org-013: the mechanism for tasks not getting lost + subtask completion triggering higher-order progress. Includes the first-class dependency graph work.
-- **priority-4** = concordance / org-073 plus Echo: the retrieval/injection layer shares the lowest active rank with the reactivated Echo arc. Arc tickets T-3006 (ORG-073 v2 PoC build) and T-3007 (concordance indexing pipeline coord) land here via their existing labels; Echo tickets carrying the broad `echo` label now leave tail FIFO without displacing persona, harness, or ticket-flow prerequisites.
+- **priority-1** = the germination engine (ORG-080, labels `org-080` / `germinate` / `germination`) and its sub-parts, built along the way: the brokers (ORG-051 auth/credential, ORG-052 host capability), health monitoring (ORG-076), seat management (the harness manager), plus ORG-106 (seat states). The operator TG 12363, 12753, 12754.
+- **priority-2** = Echo (TG 12385) and the harness controller / T-2953 arc, the substrate every persona runs on.
+- **priority-3** = ticket flow / ORG-065: tasks don't get lost, and completing a subtask moves its parent forward.
+- **priority-4** = persona orientation phases 3-5 (T-5674/75/76, TG 12358).
+- **priority-5** = concordance / ORG-073, the retrieval and injection layer.
 
 ## Deprioritized (not in the priority list)
 

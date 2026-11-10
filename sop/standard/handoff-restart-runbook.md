@@ -37,7 +37,7 @@ The wrapper executes 7 steps (each is also the script's exit code on failure —
 6. **`systemctl is-active` fast-fail** — poll until active or timeout (default 60s).
 7. **Capture target pane + grep for steady-state sentinel.** A three-way conjunction (T-0528): the prompt frame `(╭(─)+╮|(─){20,})` AND the `❯` cursor match, AND `DIALOG_EXCLUDE` does NOT (the confirm footers, plus the auto-mode startup prompt's option line since T-4646). All three must hold for steady-state.
 
-**Post-step-7 kick (T-0172, default-on):** A canned directive is injected into the fresh pane to trigger first-turn action — read HANDOFF.md + post a status snapshot to the operator's Telegram. Disable via `--no-kick`. Since T-4646 the kick refuses to paste or press Enter into a pane that is not at a composer (`send_keys_submit` exit 3) and does not re-fire; the restart then reports a failed kick.
+**Post-step-7 kick (T-0172, default-on):** A canned directive is injected into the fresh pane to trigger first-turn action — read HANDOFF.md and continue the queued work. The operator is messaged only if something needs him, and only from a seat with a Telegram channel (no routine restart snapshots, 2026-11-03). Disable via `--no-kick`. Since T-4646 the kick refuses to paste or press Enter into a pane that is not at a composer (`send_keys_submit` exit 3) and does not re-fire; the restart then reports a failed kick.
 
 ## Common failure modes
 

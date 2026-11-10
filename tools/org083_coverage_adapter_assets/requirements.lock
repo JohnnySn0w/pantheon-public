@@ -1,0 +1,11 @@
+# Hash-locked requirements for the ORG-083 adapter venv ONLY (T-5971, adapter id
+# pantheon-config.coveragepy-ctrace-arc.v1). coverage.py never enters the suite environment.
+# target: CPython 3.11 (cp311) and 3.12 (cp312), manylinux x86_64; binary wheels only.
+# The pure-Python py3-none-any wheel is FORBIDDEN (no C tracer); the sdist (sha256
+# cc010a0a7fbdd9bb8bdfd0d3f04a5151275860213cbd7e2b876b29778489c712) is provenance only.
+# install: pip install --require-hashes --no-deps --only-binary=:all: -r requirements.lock
+# coverage-7.17.0-cp311-cp311-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl
+# coverage-7.17.0-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl
+coverage==7.17.0 \
+    --hash=sha256:8e8113d3852e9377421a61de1917df27b3abb25404a4ecf69f9e64612c4345b5 \
+    --hash=sha256:85932227e9dd38e62cd29c17fefdfecfb919eead6af1e3259522d03cf85de983

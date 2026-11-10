@@ -215,6 +215,62 @@ class TestWriteAndEntry(unittest.TestCase):
         # closed-at-startup stdin => empty, no deadline hit, no exception
         self.assertEqual(ups.read_stdin_bounded(None), (b"", False))
 
+    def test_bounded_stdin_read_with_fd_above_1024(self) -> None:
+        # T-5872: select.select() raises ValueError for fd >= 1024, which the
+        # old code swallowed into an empty read (silent payload loss).
+        from tools._test_fixtures import fds_above_select_ceiling
+        with fds_above_select_ceiling():
+            r, w = os.pipe()
+            try:
+                self.assertGreaterEqual(r, 1024)
+                os.write(w, b"high-fd-payload")
+                os.close(w)
+                w = -1
+                data, hit = ups.read_stdin_bounded(r, deadline_s=2.0)
+                self.assertEqual(data, b"high-fd-payload")
+                self.assertFalse(hit)
+            finally:
+                os.close(r)
+                if w >= 0:
+                    os.close(w)
+
+    def test_bounded_stdin_read_from_regular_file_and_devnull(self) -> None:
+        # T-5872 REBOUND: epoll refuses regular files and /dev/null (EPERM);
+        # `hook < file` / `hook < /dev/null` must read exactly as before.
+        with tempfile.NamedTemporaryFile() as tf:
+            tf.write(b"from-a-file")
+            tf.flush()
+            fd = os.open(tf.name, os.O_RDONLY)
+            try:
+                self.assertEqual(ups.read_stdin_bounded(fd, deadline_s=2.0), (b"from-a-file", False))
+                self.assertIsNone(ups.LAST_READ_ERROR)
+            finally:
+                os.close(fd)
+        fd = os.open(os.devnull, os.O_RDONLY)
+        try:
+            self.assertEqual(ups.read_stdin_bounded(fd, deadline_s=2.0), (b"", False))
+            self.assertIsNone(ups.LAST_READ_ERROR)
+        finally:
+            os.close(fd)
+
+    def test_read_error_is_surfaced_not_silent(self) -> None:
+        # T-5872: a genuine read failure keeps partial data (fail-open) but is
+        # visible: stderr line + a record field distinguishing it from empty.
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            r, w = os.pipe()
+            os.close(r)
+            os.close(w)
+            data, hit = ups.read_stdin_bounded(r)  # guaranteed-closed fd
+        self.assertEqual((data, hit), (b"", False))
+        self.assertIn("read error", err.getvalue())
+        self.assertIsNotNone(ups.LAST_READ_ERROR)
+        rec = ups.main(argv=["x"], environ={}, stdin_reader=lambda: (b"", False),
+                       stdout=io.StringIO())
+        self.assertIn("read_error", rec["stdin"])
+
 
 # ---------------------------------------------------------------------------
 # Subprocess: the real process contract

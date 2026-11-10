@@ -205,5 +205,122 @@ class MainTests(unittest.TestCase):
         self.assertNotEqual(sweep.main(argv, now=NOW.timestamp()), 0)
 
 
+POLLER_SUFFIX = ('  (Reply via the telegram MCP `reply` tool with chat_id="%s". For attachments, call the '
+                 'telegram MCP `download_attachment` tool with attachment_file_id, then read the returned '
+                 'local path.)')
+
+
+def codex_dm(mid, body, chat=CHAT, ts=None):
+    """Fixture re-derived from a real DM-bearing record in ~/.codex/sessions (rollout of
+    2026-11-05, message_id 13063): record keys, header and the poller's reply-instructions
+    suffix are exact (suffix also matches poller.py wrap()); message text is redacted to
+    neutral. T-5054."""
+    ts = ts or (NOW - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return {"timestamp": ts, "ordinal": 614, "type": "response_item", "payload": {
+        "type": "message", "id": "msg_x", "role": "user", "content": [{"type": "input_text", "text":
+            f"[inbound Telegram DM from the operator | chat_id={chat} | message_id={mid}] {body}"
+            + POLLER_SUFFIX % chat}],
+        "internal_chat_message_metadata_passthrough": {"turn_id": "t"}}}
+
+
+def codex_assistant(text):
+    return {"timestamp": "2026-10-16T08:00:00.000Z", "type": "response_item", "payload": {
+        "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}}
+
+
+class SeatTests(unittest.TestCase):
+    def _codex_fx(self):
+        fx = Fixture(self)
+        d = fx.root / "sessions" / "2026" / "10" / "16"
+        d.mkdir(parents=True)
+        return fx, d
+
+    def test_codex_parse(self):
+        fx, d = self._codex_fx()
+        entries = [codex_assistant("Proceed with the swap? " + "x" * 400), codex_dm(300, "yes swap it"),
+                   codex_dm(301, "ratified", chat="999"),
+                   {"timestamp": "2026-10-16T08:00:00.000Z", "type": "response_item", "payload": {
+                       "type": "message", "role": "user", "content": [{"type": "input_text",
+                       "text": "quote: [inbound Telegram DM from the operator | chat_id=%s | message_id=302] no" % CHAT}]}}]
+        (d / "rollout-x.jsonl").write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        msgs = sweep.extract_messages(fx.root / "sessions", 0, NOW.timestamp(), harness="codex", seat="watchman")
+        self.assertEqual([m["id"] for m in msgs], ["watchman:300"])
+        self.assertEqual(msgs[0]["text"], "yes swap it")
+        self.assertTrue(msgs[0]["prior_ask"].startswith("Proceed with the swap?"))
+        self.assertLessEqual(len(msgs[0]["prior_ask"]), 300)
+
+    def test_codex_suffix_stripped_and_short_answer_flagged(self):
+        fx, d = self._codex_fx()
+        entries = [codex_assistant("Option A or option B?"), codex_dm(400, "B")]
+        (d / "rollout-y.jsonl").write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        (m,) = sweep.extract_messages(fx.root / "sessions", 0, NOW.timestamp(), harness="codex", seat="watchman")
+        self.assertEqual(m["text"], "B")
+        self.assertTrue(sweep.is_decision_shaped(m["text"], m["prior_ask"])[0])
+
+    def test_codex_missing_root_raises(self):
+        with self.assertRaises(OSError):
+            sweep.extract_messages(Path("/nonexistent-root-xyz"), 0, NOW.timestamp(), harness="codex")
+
+    def test_seat_key_and_orchestrator_bare(self):
+        fx = Fixture(self)
+        fx.session([user_entry(tag(5, "yes"))])
+        a = sweep.extract_messages(fx.projects, 0, NOW.timestamp())
+        b = sweep.extract_messages(fx.projects, 0, NOW.timestamp(), seat="recovery")
+        self.assertEqual(a[0]["id"], "5")
+        self.assertEqual(b[0]["id"], "recovery:5")
+
+    def test_covered_ids_seat_forms(self):
+        self.assertEqual(sweep.covered_ids("(TG recovery:123) and TG 5 and TGs specialist:7/specialist:8"),
+                         {"recovery:123", "5", "specialist:7", "specialist:8"})
+        self.assertNotIn("123", sweep.covered_ids("TG recovery:123"))
+
+    def test_seat_run_files_to_head_role_as_seat_and_dedups_by_key(self):
+        fx = Fixture(self)
+        fx.session([reply_entry("Proceed?"), user_entry(tag(11782, "yes")), user_entry(tag(200, "go ahead"))])
+        ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(sweep.subprocess, "run", return_value=ok) as run:
+            self.assertEqual(fx.run("--seat", "recovery"), 0)
+            args = run.call_args[0][0]
+            self.assertEqual(args[args.index("--requester") + 1], "recovery")
+            self.assertEqual(args[args.index("--target") + 1], "role:head_engineering_orchestrator")
+            joined = " ".join(args)
+            self.assertIn("TG recovery:200", joined)
+            self.assertIn("TG recovery:11782", joined)   # bare register row 11782 is orchestrator's, not recovery's
+            self.assertNotIn("go ahead", joined)
+            self.assertEqual(fx.run("--seat", "recovery"), 0)
+            self.assertEqual(run.call_count, 1)
+        st = json.loads((fx.state / "state.json").read_text())
+        self.assertIn("recovery:200", st["flagged"])
+
+    def test_default_run_still_orchestrator(self):
+        fx = Fixture(self)
+        fx.session([user_entry(tag(200, "go ahead"))])
+        ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(sweep.subprocess, "run", return_value=ok) as run:
+            fx.run()
+            args = run.call_args[0][0]
+            self.assertEqual(args[args.index("--requester") + 1], "orchestrator")
+            self.assertEqual(args[args.index("--target") + 1], "role:engineering_orchestrator")
+
+    def test_sessions_root_alias_and_codex_main(self):
+        fx, d = self._codex_fx()
+        (d / "rollout-x.jsonl").write_text(json.dumps(codex_dm(9, "ratified")) + "\n")
+        argv = ["--sessions-root", str(fx.root / "sessions"), "--harness", "codex", "--seat", "watchman",
+                "--state-dir", str(fx.state), "--register", str(fx.register), "--dry-run"]
+        self.assertEqual(sweep.main(argv, now=NOW.timestamp()), 0)
+
+
+class UnitTemplateTests(unittest.TestCase):
+    D = Path(__file__).resolve().parent / "systemd"
+
+    def test_template_is_instanced_and_dry_run(self):
+        svc = (self.D / "pantheon-decision-sweep@.service").read_text()
+        self.assertIn("--seat %i", svc)
+        self.assertIn("--dry-run", svc)
+        self.assertIn("OnFailure=pantheon-unit-failure-alert@%n.service", svc)
+        tim = (self.D / "pantheon-decision-sweep@.timer").read_text()
+        self.assertIn("pantheon-decision-sweep@%i.service", tim)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -195,21 +195,18 @@ def test_generic_cap_is_unchanged_for_encode_and_load():
     assert A.load_canonical_json(data, max_bytes=RS.MAX_PLAN_BYTES) == _over_generic()
 
 
-def test_run_record_keeps_the_generic_cap_on_write_and_read(tmp_path):
+def test_run_record_has_its_own_bound_not_the_generic_cap_nor_the_plan_bound(tmp_path):
+    """Superseded by T-6146: the record is no longer under the generic cap (an orchestrator/specialist
+    decommission record is >64 KiB); it has MAX_RECORD_BYTES, symmetric on write and read
+    (see test_record_bound.py). It is a distinct bound from MAX_PLAN_BYTES."""
+
+    assert MAX_ARTIFACT_BYTES < RS.MAX_RECORD_BYTES < RS.MAX_PLAN_BYTES
     store = RS.RunStore(tmp_path / "rs")
     big_ops = [{"op_id": f"op-{i}", "crash_contract": "stageable", "postcondition_check": {"note": "x" * 2000}} for i in range(40)]
-    with pytest.raises(Exception, match="json-too-large"):
-        store.create(RS.RunTuple("sim", "comp-a", "system", "install", RS.new_ulid()), operations=big_ops, plan=RS.encode_plan({}))
-    # a canonical record planted over the generic cap still refuses on read, as before T-5809
-    tup = RS.RunTuple("sim", "comp-b", "system", "install", RS.new_ulid())
-    with store.create(tup, operations=[{"op_id": "op-1", "crash_contract": "stageable"}], plan=RS.encode_plan({})) as handle:
-        record = handle.read_record()
-        record["operations"] = big_ops
-        planted = A.canonical_json_bytes(record, max_bytes=RS.MAX_PLAN_BYTES)
-        assert MAX_ARTIFACT_BYTES < len(planted) < RS.MAX_PLAN_BYTES
-        handle.held.replace_regular("record.json", planted, expected_uid=store.uid, mode=RS.FILE_MODE)
-        with pytest.raises(RS.RunStateError, match="json-too-large"):
-            handle.read_record()
+    tup = RS.RunTuple("sim", "comp-a", "system", "install", RS.new_ulid())
+    with store.create(tup, operations=big_ops, plan=RS.encode_plan({})) as handle:  # ~80 KB record
+        assert (handle.path / "record.json").stat().st_size > MAX_ARTIFACT_BYTES
+        assert len(handle.read_record()["operations"]) == 40
 
 
 def test_wal_intent_artifacts_keep_the_generic_cap(tmp_path):

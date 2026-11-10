@@ -2,7 +2,7 @@
 
 Builds the ``--property=`` list ``harness.sandbox_runner.run_in_sandbox()``
 takes as its ``properties`` kwarg (per T-3295 brief). Follows
-``adr/ORG-080-germination-engine.md`` Component contract (L103-177) with
+``adr/ORG-080-germination-engine.md`` Component contract (relocated verbatim to notes/2026-11-02-org-080-sandbox-relocated.md §Planner-launch profile and §Enforced properties) with
 empirically-required deviations from the documentary text, each logged
 below and in this arc's DECISIONS (T-3295 Phase 1+2, host: Ubuntu 24.04
 noble, kernel 6.8.0, systemd 255, x86_64, KVM guest).
@@ -98,6 +98,12 @@ hosts where unprivileged netns/ipcns creation IS permitted).
 
 from __future__ import annotations
 
+# T-6167 PR-4 (documentary, no behaviour change): finding 5's ``TemporaryFileSystem=`` failure is a
+# property of the USER manager. ``build_properties(system_scope=True)`` already carries the system-scope
+# set, and ``host_substrate/root_launcher.py`` (dark, pin-gated) runs it on root's SYSTEM manager with
+# ``User=<seat>`` added, where the filesystem-visibility root is expressible. Whether it starts on prod
+# (``PrivateUsers=yes`` with ``User=``, ``RuntimeDirectory=`` inside the tmpfs root) is proven only by
+# the supervised real-host step (T-3296); CI proves argv and outcome parsing, not kernel confinement.
 import socket
 import sys
 from pathlib import Path

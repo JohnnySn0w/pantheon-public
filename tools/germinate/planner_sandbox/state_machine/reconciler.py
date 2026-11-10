@@ -14,7 +14,7 @@ Open Question #3): `boot_id`, `_prior_state`, `_handle_written`,
 (L290-302) -- production reconciliation assembles this context by joining
 the run-record with sibling on-disk artifacts (the gate's `boot_id`, the
 parking transaction's `_prior_state.json` / `resume/handle.json` /
-`schema-v1/handles/<handle>.json`, per ORG-080 L342 and L398-409). Tranche
+`schema-v1/handles/<handle>.json`, per the ORG-080 run-state note (notes/2026-11-02-org-080-run-state-relocated.md) §Acquire order and admission table and §Reconciliation for every prefix state). Tranche
 B pre-flattens that joined context onto `record` so the state-transition
 LOGIC is testable standalone, without a live Tranche-A gate-tree join.
 These fields are test-only fixture fields; the production record shape

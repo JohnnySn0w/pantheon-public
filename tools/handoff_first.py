@@ -68,15 +68,19 @@ def request_handoff(
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
     monotonic: Callable[[], float] = time.monotonic,
+    prompt: str | None = None,
 ) -> HandoffOutcome:
     """Send the handoff prompt via ``submit_fn`` and wait for the file's mtime to move.
+
+    ``prompt`` (a template with ``{path}``) replaces the default swap wording; a routine
+    checkpoint is not a swap (T-6115).
 
     Never raises for a delivery failure: it returns ``confirmed=False`` with the
     reason, so callers apply their own policy (refuse / defer / proceed).
     """
     baseline = _mtime_ns(handoff_path)
     try:
-        submit_fn(HANDOFF_PROMPT_TEMPLATE.format(path=handoff_path))
+        submit_fn((prompt or HANDOFF_PROMPT_TEMPLATE).format(path=handoff_path))
     except Exception as exc:  # noqa: BLE001 - any delivery failure is "not confirmed"
         return HandoffOutcome(False, f"handoff prompt not delivered: {type(exc).__name__}: {exc}", handoff_path)
     deadline = monotonic() + timeout_seconds

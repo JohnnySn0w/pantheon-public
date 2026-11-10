@@ -833,12 +833,19 @@ class ApprovalStatus:
 
     By construction this type carries no authority record id and no nonce:
     the broker cannot substitute a status read for binding.
+
+    ``plan_handle`` and ``plan_owner`` are the grant's plan binding (T-4875,
+    ORG-052 §4 "handle bound to subject"): they let the broker refuse a
+    status read whose grant is not bound to the caller's own plan. Both are
+    already-persisted ``GrantRecord`` fields; neither is authority.
     """
 
     approval_handle: str
     state: GrantState
     expires_at: str
     summary: str
+    plan_handle: str
+    plan_owner: str
 
 
 @dataclass(frozen=True)

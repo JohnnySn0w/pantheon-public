@@ -49,6 +49,8 @@ import json
 import os
 import pwd
 import re
+import select
+import signal
 import shutil
 import subprocess
 import sys
@@ -66,7 +68,7 @@ from tools import agent_role_map  # noqa: E402  — T-4737 ledger identity
 from tools import harness_state as hs  # noqa: E402
 from tools import seat_sleep  # noqa: E402  — ORG-106 L3a (T-5526)
 from tools import seat_state  # noqa: E402  — ORG-106 L1 (T-5524)
-from tools.ledger_shard import append_entry, existing_entry_ids  # noqa: E402
+from tools.ledger_shard import append_entry, check_new_entry, existing_entry_ids  # noqa: E402
 
 LEDGER_DIR = _REPO_ROOT / "ledger"
 
@@ -274,6 +276,16 @@ def build_parser() -> argparse.ArgumentParser:
         "wake", parents=[sub_global_opts], help="ORG-106: end the seat's pause (tombstones the record)."
     )
     wake_p.add_argument("--reason", default=None, help="Required: reason for this wake.")
+    wake_p.add_argument(
+        "--clear-halted", action="store_true",
+        help="T-5868: the ledgered escape for a HALTED record (a U5 pause that halted partway). Refused unless "
+             "the run is ROLLED_BACK (see --simulated-host-root), or --force. Plain `wake` never clears a halted record.",
+    )
+    wake_p.add_argument("--force", action="store_true", help="With --clear-halted: clear although the run is not rolled back.")
+    wake_p.add_argument(
+        "--simulated-host-root", default=None, metavar="DIR",
+        help="With --clear-halted: the germinate simulated host whose run store holds the halted run.",
+    )
 
     quarantine_p = subparsers.add_parser(
         "quarantine",
@@ -333,6 +345,9 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.command in MUTATING_COMMANDS and not args.reason:
         raise MissingReasonError(args.command)
 
+    if args.command == "wake" and not args.clear_halted and (args.force or args.simulated_host_root):
+        raise HarnessCliError("--force and --simulated-host-root are only for wake --clear-halted")
+
     if args.command == "clear-cooldown":
         if bool(args.runtime) == bool(args.all):
             raise HarnessCliError("clear-cooldown requires exactly one of <runtime> or --all")
@@ -359,6 +374,8 @@ def validate_args(args: argparse.Namespace) -> None:
     hs.validate_persona(args.persona)
     # T-4737: a role id shared by several seats cannot say whose override this
     # is (ORG-001 executor attribution); refuse it before anything runs.
+    if getattr(args, "operator", None) is not None:
+        args.operator = normalize_operator(args.operator)
     operator = getattr(args, "operator", None)
     if operator and operator in agent_role_map.NON_INJECTIVE_ROLE_IDS:
         seats = ", ".join(agent_role_map.personas_for_role_id(operator))
@@ -369,6 +386,52 @@ def validate_args(args: argparse.Namespace) -> None:
     runtime = getattr(args, "runtime", None)
     if runtime:
         hs.validate_runtime(runtime)
+
+
+def _entry_stamp(entry: dict[str, Any]) -> datetime | None:
+    """The entry's own ts as a datetime, or None when it is not a valid stamp.
+
+    T-4739 (review F1): the ts-vs-clock rule was checked when the entry was stamped
+    (the pre-handler validation). A slow handler or a spooled retry appends it later,
+    so landing measures skew against the entry's own ts, never the wall clock; every
+    other ORG-001 rule still applies, and an unparseable ts still fails its format rule."""
+    ts = entry.get("ts")
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _effective_os_user() -> str:
+    """The OS account of the effective uid. Not getpass.getuser(), which trusts
+    LOGNAME/USER from the environment (T-4739 review F2)."""
+    euid = os.geteuid()
+    try:
+        return pwd.getpwuid(euid).pw_name
+    except KeyError:
+        return str(euid)
+
+
+#: T-4739: the OS account whose runs the harness refuses (ORG-087, T-3422).
+_DEPRECATED_ACCOUNT = "the-ancestor"
+
+
+def normalize_operator(value: str) -> str:
+    """T-5621: the bare operator name. Accepts `orchestrator` or `operator:orchestrator`; refuses an
+    empty value or any other `<kind>:` prefix (callers add `operator:` themselves)."""
+    name = value.strip()
+    if name.startswith("operator:"):
+        name = name[len("operator:"):]
+    if not name:
+        raise HarnessCliError("--operator must not be empty")
+    if ":" in name:
+        raise HarnessCliError(
+            f"--operator {value!r}: give a bare name (orchestrator) or operator:<name>; "
+            f"other prefixes such as {name.split(':', 1)[0]!r}: are not accepted"
+        )
+    return name
 
 
 def resolve_operator(args: argparse.Namespace) -> str:
@@ -398,8 +461,139 @@ def _kill_tmux_session(session: str, *, dry_run: bool) -> bool:
     check = subprocess.run(["tmux", "has-session", "-t", session], capture_output=True)
     live = check.returncode == 0
     if live and not dry_run:
-        subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
+        pane_pid, pane_command = _tmux_pane_identity(session)
+        if "appserver_supervise.py" in pane_command and "--controller-owned" in pane_command.split():
+            _graceful_controller_owned_shutdown(session, pane_pid, pane_command)
+        else:
+            subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
     return live
+
+
+def _tmux_pane_identity(session: str) -> tuple[int, str]:
+    """Return the exact live pane process and launch command, or fail closed.
+
+    Restart used to hard-kill tmux without knowing that its pane was the
+    controller-owned app-server wrapper.  That bypassed the wrapper's
+    identity-safe child cleanup and orphaned the server.  Ambiguous tmux
+    metadata must therefore refuse before any destructive fallback.
+    """
+    result = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", session, "#{pane_pid}\t#{pane_start_command}"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise hs.HarnessStateError(
+            f"restart refused: cannot prove pane identity for tmux session {session!r}"
+        )
+    raw = result.stdout.rstrip("\n")
+    pid_text, separator, command = raw.partition("\t")
+    try:
+        pid = int(pid_text)
+    except ValueError as exc:
+        raise hs.HarnessStateError(
+            f"restart refused: invalid pane pid for tmux session {session!r}"
+        ) from exc
+    if not separator or pid <= 1 or not command.strip():
+        raise hs.HarnessStateError(
+            f"restart refused: incomplete pane identity for tmux session {session!r}"
+        )
+    return pid, command
+
+
+def _live_process_identity(pid: int) -> tuple[int, tuple[str, ...]]:
+    """Return Linux starttime + argv for ``pid``, or fail closed.
+
+    ``pane_start_command`` is tmux launch history, not proof of what the pane
+    process is executing now.  Pair a live argv check with the proc starttime
+    on both sides of ``pidfd_open`` so an exec-away or numeric-PID reuse can
+    never inherit the controller-owned wrapper classification.
+    """
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+        # comm is parenthesized and may contain spaces or ')', so split only
+        # after its final closing parenthesis.  starttime is field 22, hence
+        # index 19 in the suffix beginning with field 3 (state).
+        suffix = stat_text[stat_text.rfind(")") + 2 :].split()
+        starttime = int(suffix[19])
+        raw_argv = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, ValueError, IndexError) as exc:
+        raise hs.HarnessStateError(
+            f"restart refused: cannot prove live process identity for pane pid {pid}: {exc}"
+        ) from exc
+    argv = tuple(part.decode(errors="surrogateescape") for part in raw_argv.split(b"\0") if part)
+    if not argv:
+        raise hs.HarnessStateError(
+            f"restart refused: live pane pid {pid} has no readable argv"
+        )
+    return starttime, argv
+
+
+def _is_controller_owned_wrapper_argv(argv: tuple[str, ...]) -> bool:
+    return "--controller-owned" in argv and any(
+        Path(arg).name == "appserver_supervise.py" for arg in argv
+    )
+
+
+def _graceful_controller_owned_shutdown(
+    session: str, pane_pid: int, pane_command: str, *, timeout: float = 45.0
+) -> None:
+    """Ask the app-server wrapper to reap its children before tmux disappears.
+
+    The wrapper's SIGTERM handler unwinds through ``Supervisor.shutdown``.
+    That method refuses to exit when any recorded process-group identity is
+    unknown or reused, so session disappearance is the cleanup receipt.  A
+    timeout is a HOLD: never fall back to ``tmux kill-session``.
+    """
+    before_identity = _live_process_identity(pane_pid)
+    if not _is_controller_owned_wrapper_argv(before_identity[1]):
+        raise hs.HarnessStateError(
+            "restart refused: tmux reports a controller-owned wrapper but the live pane "
+            f"argv does not match appserver_supervise.py --controller-owned (pid {pane_pid})"
+        )
+    try:
+        pidfd = os.pidfd_open(pane_pid)
+    except OSError as exc:
+        raise hs.HarnessStateError(
+            f"restart refused: cannot pin controller-owned pane pid {pane_pid}: {exc}"
+        ) from exc
+    try:
+        current_pid, current_command = _tmux_pane_identity(session)
+        if (current_pid, current_command) != (pane_pid, pane_command):
+            raise hs.HarnessStateError(
+                f"restart refused: controller-owned pane identity changed for {session!r}"
+            )
+        after_identity = _live_process_identity(pane_pid)
+        if after_identity != before_identity:
+            raise hs.HarnessStateError(
+                f"restart refused: live pane process identity changed while pinning pid {pane_pid}"
+            )
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except OSError as exc:
+            raise hs.HarnessStateError(
+                f"restart refused: could not signal controller-owned pane {pane_pid}: {exc}"
+            ) from exc
+
+        # Keep the pinned identity open through the whole wait.  A nonzero
+        # ``tmux has-session`` result is ambiguous (the session may be gone,
+        # but the socket/probe may also be unreadable), so it cannot prove the
+        # wrapper ran its fail-closed child cleanup.  Linux makes a pidfd
+        # readable only when its exact process exits; that is the receipt we
+        # need before allowing a successor launch.
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise hs.HarnessStateError(
+                    "restart refused: controller-owned wrapper cleanup did not complete; "
+                    "the pinned wrapper remained live and no hard-kill fallback was attempted"
+                )
+            readable, _, _ = select.select([pidfd], [], [], min(0.25, remaining))
+            if readable:
+                return
+    finally:
+        os.close(pidfd)
 
 
 def _request_handoff_first(persona: str) -> Any:
@@ -474,6 +668,14 @@ def _print_seat_state(persona: str, *, root: Path) -> None:
             print("  expires: never")
     if eff.fault:
         print(f"  fault: {eff.fault}")
+    try:  # T-5868: a halted record is an incident; show its rollback line
+        rec = hs.load_seat_state(persona, root=root)
+        if isinstance(rec, dict) and rec.get("state") == seat_state.STATE_HALTED:
+            print("  INCIDENT: HALTED run_state pause (intake blocked, repair withheld)")
+            for k in ("run_id", "op_id", "pause_id", "halted_at", "rollback_cmd"):
+                print(f"  {k}: {rec.get(k) or '-'}")
+    except Exception:  # noqa: BLE001 -- status must never raise
+        pass
     try:  # ORG-106 L3: the deep-sleep phase (draining -> asleep)
         rec = hs.load_seat_state(persona, root=root)
         if isinstance(rec, dict) and rec.get("state") == seat_state.STATE_DEEP_SLEEP:
@@ -1283,14 +1485,51 @@ def _do_sleep_unlocked(args: argparse.Namespace, *, operator: str, root: Path, d
     return OverrideResult(action_slug="sleep", summary=summary, runtime=None, after_landing=after_landing)
 
 
+def _check_clear_halted(args: argparse.Namespace, record: dict) -> str | None:
+    """T-5868 Phase B (notes s10): only the run's completed rollback, or this ledgered escape, clears a
+    HALTED record. Returns the ledger note for an allowed clear (None for an ordinary wake); raises
+    HarnessStateError for a refusal. The run must be ROLLED_BACK (read from the run store) unless --force."""
+
+    halted = isinstance(record, dict) and record.get("state") == seat_state.STATE_HALTED
+    if not args.clear_halted:
+        if halted:
+            raise hs.HarnessStateError(
+                f"{args.persona} is HALTED: roll the run back ({record.get('rollback_cmd')}), "
+                "or use `wake --clear-halted --reason ...`"
+            )
+        return None
+    if not halted:
+        raise hs.HarnessStateError(f"wake --clear-halted: {args.persona}'s record is not halted")
+    run_id = record.get("run_id")
+    run_state: str | None = None
+    problem = "no --simulated-host-root given to look the run up"
+    if args.simulated_host_root:
+        from tools.germinate.engine.executor import run_state_of
+        from tools.germinate.engine.run_state import RunStateError
+        try:
+            run_state = run_state_of(args.simulated_host_root, str(run_id))
+            problem = f"run {run_id} not found in the run store"
+        except RunStateError as exc:
+            problem = f"run {run_id} unreadable: {exc}"
+    if run_state != "ROLLED_BACK" and not args.force:
+        raise hs.HarnessStateError(
+            f"wake --clear-halted: run {run_id} is not in a terminal rollback state "
+            f"({'state ' + run_state if run_state else problem}); complete its rollback, or pass --force"
+        )
+    return f"run {run_id} state {run_state or 'unknown'}{', FORCED' if args.force else ''}"
+
+
 def _do_wake_unlocked(args: argparse.Namespace, *, operator: str, root: Path, dry_run: bool) -> OverrideResult:
     persona = args.persona
     record = hs.load_seat_state(persona, root=root)  # raises (path named) if unparseable
     if record is None:
+        if args.clear_halted:
+            raise hs.HarnessStateError(f"wake --clear-halted: {persona} has no seat-state record")
         detail = "no seat-state record (nothing to wake)"
     else:
         ts = args.ledger_ts
         now = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        halted_note = _check_clear_halted(args, record)  # T-5868: refuses before any write
         valid = not seat_state.validate_record(record)
         expired = valid and not seat_state.parse_record(record, now=now).active
         ended_by = "expiry" if expired else f"operator:{operator}"
@@ -1302,6 +1541,8 @@ def _do_wake_unlocked(args: argparse.Namespace, *, operator: str, root: Path, dr
                 persona, {**record, "ended_ts": ts, "ended_by": ended_by}, root=root)
             hs.clear_seat_state(persona, root=root)
         detail = "expired record cleared" if expired else "seat-state record removed"
+        if halted_note:
+            detail = f"HALTED record cleared ({halted_note})"
         if not valid:
             detail += " (it was invalid)"
     summary = f"wake on {persona}: {detail} — reason: {args.reason}"
@@ -1593,7 +1834,7 @@ def land_ledger_entries(
                     rejected.append((entry["id"], "HERMES guard refused the entry text"))
                     continue
                 try:
-                    path = append_entry(ledger, entry)
+                    path = append_entry(ledger, entry, now=_entry_stamp(entry))
                 except ValueError as exc:  # refused before the file is opened
                     rejected.append((entry["id"], f"ledger writer refused: {exc}"[:300]))
                     continue
@@ -1779,6 +2020,7 @@ def main(
     landing_tmp_root: Path | None = None,
     euid_fn: Callable[[], int] | None = None,
     account_fn: Callable[[str], str | None] | None = None,
+    os_user_fn: Callable[[], str] | None = None,
 ) -> int:
     parser = build_parser()
     try:
@@ -1795,6 +2037,18 @@ def main(
         return 2
     ledger_root = ledger_dir if ledger_dir is not None else LEDGER_DIR
     operator = resolve_operator(args)
+
+    # T-4739 (orchestrator ruling F1 a): the-ancestor is deprecated (ORG-087/T-3422) and has no
+    # ORG-100 role, so an override run from its account has no valid ledger agent. Refuse
+    # up front, before anything runs (a late refusal is the act-then-fail-to-record hole).
+    if (os_user_fn or _effective_os_user)() == _DEPRECATED_ACCOUNT:
+        print(
+            f"harness: error: refusing to run from the deprecated {_DEPRECATED_ACCOUNT!r} "
+            "account (ORG-087): it has no ORG-100 role, so the override could not be "
+            "recorded in the ledger; run it from the persona's seat account",
+            file=sys.stderr,
+        )
+        return 2
 
     # T-5483: seat-account guard. Production always has root=None (the CLI entry); a
     # caller injecting a temp state root (the unit suite) is not touching a seat's home,
@@ -1834,6 +2088,21 @@ def main(
         slugs.append("clear-hold")
     entry_ids = {_ledger_entry_id(persona=args.persona, action_slug=slug, ts=ts) for slug in slugs}
     entry_id = next(iter(entry_ids)) if len(entry_ids) == 1 else None
+
+    # T-4739 (orchestrator requirement 2): validate the entries BEFORE the handler mutates state
+    # or kills tmux. A rejected entry must mean no action taken. The summary is only known
+    # after the handler runs, so validate the shape with a placeholder result: identity,
+    # ts, id, rationale and justifies_via do not depend on the result.
+    for slug in slugs:
+        probe = _build_ledger_entry(
+            persona=args.persona, operator=operator, ts=ts,
+            result=OverrideResult(action_slug=slug, summary="(preflight)", runtime=None),
+        )
+        try:
+            check_new_entry(probe)
+        except ValueError as exc:
+            print(f"harness: error: no override applied; its ledger entry would be refused: {exc}", file=sys.stderr)
+            return 2
 
     if not args.dry_run:
         try:
@@ -1931,7 +2200,7 @@ def _record_entry(
             return ("spooled" if spooled else "failed"), 2
         return "landed", 0
     try:
-        append_entry(ledger_root, entry)
+        append_entry(ledger_root, entry, now=_entry_stamp(entry))
     except Exception as exc:  # noqa: BLE001 — last-resort guard; see DECISIONS (residual TOCTOU)
         print(f"harness: error: failed to append ledger entry: {exc}", file=sys.stderr)
         return "failed", 2

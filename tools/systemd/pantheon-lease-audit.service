@@ -5,8 +5,9 @@ Documentation=file:///home/%u/pantheon-config/notes/2026-10-12-t4884-codex-recov
 # NOT auto-installed by any provision script. Template only (T-4884 B4b). Runs
 # on BOTH recovery seats' accounts (claude-fallback = Recovery, codex-fallback =
 # the recovery seat) so that if one seat is dark the other's check still covers it.
-# Explicit --dry-run: it prints findings and would-act lines to the journal and
-# writes only its state file; --live is refused until T-4884 B13.
+# T-5937 live routing was armed only after supervised canaries on BOTH recovery
+# accounts.  The tool remains dry-run by default; this explicit --live is the
+# narrow, reversible scheduled-mode opt-in.
 #
 # `sg systemd-journal -c` is REQUIRED: a --user unit runs with only the
 # account's primary group (user-mode systemd cannot set SupplementaryGroups),
@@ -32,7 +33,7 @@ Type=oneshot
 WorkingDirectory=%h/pantheon-config
 # The window overlaps the 5-min cadence; findings are de-duplicated per sudo
 # record through the state file (~/.local/state/pantheon/lease_audit.json).
-ExecStart=/usr/bin/sg systemd-journal -c "/usr/bin/python3 %h/pantheon-config/tools/lease_audit.py --dry-run --since=-15min"
+ExecStart=/usr/bin/sg systemd-journal -c "/usr/bin/python3 %h/pantheon-config/tools/lease_audit.py --live --since=-15min"
 StandardOutput=journal
 StandardError=journal
 TimeoutStartSec=240s

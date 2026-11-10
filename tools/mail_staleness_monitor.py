@@ -164,8 +164,22 @@ _KIND_URGENT_UNDELIVERED = "urgent_undelivered"
 # Fallback names ONLY (strategy 3 above) — never the primary source of truth, because
 # a list of names cannot contain the box nobody named. specialist-a2a is here precisely
 # because it is not a persona and my T-2159 probe missed it for that reason.
+# T-6165: the hand-kept names stay as a floor (specialist-a2a is not a persona) and every
+# registry persona is unioned in, so a new seat cannot be missed the way watchman was.
 CANDIDATE_INBOXES = ["recovery", "orchestrator", "specialist", "archivist", "codex", "mason", "artisan",
                      "specialist-a2a"]
+
+
+def _candidate_inboxes() -> list[str]:
+    try:
+        try:
+            from tools.agent_role_map import account_persona_map
+        except ImportError:
+            from agent_role_map import account_persona_map  # type: ignore
+        personas = set(account_persona_map().values())
+    except Exception:  # the registry is a widening, never a dependency of the fallback
+        personas = set()
+    return sorted(set(CANDIDATE_INBOXES) | personas)
 
 
 # ---------------------------------------------------------------- enumeration
@@ -230,7 +244,10 @@ def discover_inboxes(hub: Path = MAILBOX_HUB) -> tuple[list[str], str | None]:
             pass
 
     if not found:
-        found = _shaped(CANDIDATE_INBOXES)
+        # Resolve the registry only when the two authoritative enumeration paths
+        # fail.  Besides avoiding an import-time registry snapshot, this preserves
+        # the intended failure boundary: registry trouble drops only the widening.
+        found = _shaped(_candidate_inboxes())
 
     expected = _hub_subdir_count(hub)
     warning = None
@@ -713,7 +730,8 @@ def _inbox_seat_paused(inbox: str) -> bool:
     Fail-open: an unreadable / unknown seat reads False, so an alert is never silenced."""
     try:
         seat = _seat_state_mod().safe_effective_for(inbox)
-        return bool(seat is not None and seat.state != "active")
+        # T-5868: a halted seat is an incident, not a declared pause; its mail still pages.
+        return bool(seat is not None and seat.state not in ("active", "halted"))
     except Exception:  # noqa: BLE001
         return False
 
@@ -1110,6 +1128,74 @@ def coarse_view(obs: dict[str, ms.InboxObservation]) -> dict[str, ms.InboxObserv
     }
 
 
+# ------------------------------------------------ ORG-076 BT5a: raw per-sample verdicts (T-6001)
+def raw_sample_verdicts(obs: dict[str, ms.InboxObservation]) -> dict:
+    """One RAW per-inbox verdict per sample, for the ORG-076 episode store: inbox -> (verdict, kind).
+
+    This is the SAME classification the monitor already computes, taken BEFORE any cooldown or
+    consecutive-sample counter (a cooldown Alert can never give N consecutive non-healthy samples):
+    `ms.detect` on a single observation with empty prior state and a threshold of 1, then the coarse
+    tier's own `coarse_view` for an unreadable pane. `obs` must be what main() feeds `evaluate` (after
+    the draining coercion; held inboxes already removed).
+
+      unreadable inbox                                  -> unknown (KIND_UNREADABLE)
+      never received                                    -> broken  (KIND_NEVER_RECEIVED)
+      pane idle + unread, no consumer lease             -> broken  (KIND_IDLE_WITH_UNREAD)
+      pane None (always so on codex TUI / absent pane) with unread older than the coarse tier's own
+        budget (COARSE_SAMPLES * SAMPLE_INTERVAL_SECONDS) -> unknown (the coarse tier's unreadable-pane case)
+      everything else (nothing unread, busy pane, lease held, pane None within budget) -> healthy
+    """
+    coarse_budget_s = COARSE_SAMPLES * SAMPLE_INTERVAL_SECONDS
+    out = {}
+    for name, o in sorted(obs.items()):
+        kinds = {a.kind for a in ms.detect({name: o}, {}, idle_samples_required=1, realert_after_samples=1)[0]}
+        if ms.KIND_UNREADABLE in kinds:
+            out[name] = ("unknown", ms.KIND_UNREADABLE)
+        elif ms.KIND_NEVER_RECEIVED in kinds:
+            out[name] = ("broken", ms.KIND_NEVER_RECEIVED)
+        elif ms.KIND_IDLE_WITH_UNREAD in kinds:
+            out[name] = ("broken", ms.KIND_IDLE_WITH_UNREAD)
+        elif (o.pane_idle is None and o.unread > 0 and o.oldest_unread_age_s is not None
+              and o.oldest_unread_age_s >= coarse_budget_s
+              and ms.detect(coarse_view({name: o}), {}, idle_samples_required=1, realert_after_samples=1)[0]):
+            out[name] = ("unknown", ms.KIND_UNREADABLE + "-pane")
+        else:
+            out[name] = ("healthy", "ok")
+    return out
+
+
+def feed_mail_delivery(obs: dict, held: "set | frozenset" = frozenset(), now=None, drop=None, env=None) -> list:
+    """Write this cycle's raw verdicts as ORG-076 drops (dark unless the switch is exactly "1"). Never
+    raises and never touches alerting: a failure is logged and the monitor carries on. Held (maintenance /
+    paused / asleep) and muted inboxes get no verdict and are logged as suppressed."""
+    try:
+        try:
+            from tools import org076_mail_delivery as omd
+        except ImportError:
+            import org076_mail_delivery as omd  # type: ignore
+        if not omd.enabled(env):
+            return []
+        suppressed = [(n, "held: seat-maintenance / paused / deep-sleep") for n in sorted(held)]
+        live = {}
+        for name, o in obs.items():
+            if _recipient_is_muted(name):
+                suppressed.append((name, "muted"))
+            else:
+                live[name] = o
+        samples = []
+        for name, (verdict, kind) in raw_sample_verdicts(live).items():
+            o = live[name]
+            samples.append(omd.Sample(
+                inbox=name, verdict=verdict, kind=kind, unread=o.unread, in_flight=o.in_flight,
+                oldest_age_s=o.oldest_unread_age_s,
+                pane={True: "idle", False: "busy", None: "unknown"}[o.pane_idle]))
+        return omd.feed_safely(samples, suppressed=suppressed, drop=drop, now=now, env=env)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[mail_staleness_monitor] ORG-076 mail-delivery feed failed (ignored; alerting unaffected): "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return []
+
+
 def evaluate(obs, prior, *, warn_samples=WARN_SAMPLES, coarse_samples=COARSE_SAMPLES,
              realert=REALERT_AFTER_SAMPLES):
     """Run both tiers. Returns (alerts, next_state) with coarse alerts relabelled."""
@@ -1471,6 +1557,7 @@ def main(argv=None) -> int:
     # swallow-then-throttle defect described above).
     # ORG-106 L4b: a declared pause / deep-sleep queues mail on purpose, same exclusion.
     held_inboxes = {name for name in obs if _inbox_held(name)}
+    writer_held = set(held_inboxes)  # T-6001: the drop writer logs these as suppressed
     obs = {k: v for k, v in obs.items() if k not in held_inboxes}
 
     alerts, next_state = evaluate(obs, prior)
@@ -1538,6 +1625,7 @@ def main(argv=None) -> int:
     deliver(alerts, obs=obs, dry_run=args.dry_run, coverage_warning=coverage_warning,
             hub=hub)
     if not args.dry_run:
+        feed_mail_delivery(obs, writer_held)  # T-6001: after deliver(); dark + fail-safe
         save_state(next_state)
         save_drain_clock(clock)
     return 0

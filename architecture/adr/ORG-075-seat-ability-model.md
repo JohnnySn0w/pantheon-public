@@ -23,6 +23,8 @@ elements:
 
 ORG-043 established the sub-orchestrator seats (Mason, Artisan) as subordinate daemon reports under the HO. It did not model their **ability** — what a seat can be trusted to do, and what it means to grow one into a full HO the operator can hand a project off to.
 
+> Read through (operator-ratified framing, not an ADR edit): the 2026-09-07 peer-orchestrator framing (the operator, TG 9294/9296/9298/9300; recorded in `pinned-rules/orchestrator.md` "Regular engineering orchestrators" and typed as role `engineering_orchestrator` in ORG-100): the seats are peer orchestrators with a chain position, handed arcs they own end to end; "subordinate daemon reports" above names the chain position only.
+
 In practice the HO drifted into a wrong-shaped mental model: treating the seats like junior hires who *earn* capability by *proving out*. The operator flagged this directly (TG 2026-08-11): the seats run the **same model** as the HO, so a competence-based trust ladder is the wrong frame. This ADR replaces it with the correct model and names the three mechanisms that follow.
 
 ## Context — what is already fixed (do not design over it)

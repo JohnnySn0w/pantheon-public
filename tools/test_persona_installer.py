@@ -33,6 +33,7 @@ from tools import persona_installer as _pim
 from tools import runtime_controller as rc
 from tools import t2611_recovery_persona_apply as persona_apply
 from tools.agent_role_map import instance_binding, resolve_instance_role
+from tools.test_codex_shell_box import fake_read_hooks
 from tools.persona_bringup import (
     load_binding,
     quota_check_supported,
@@ -149,6 +150,9 @@ def _is_periodic_seat_timer(unit: str) -> bool:
 class LocalHostStageBackend(LocalHostBackend):
     def __init__(self) -> None:
         super().__init__(command_timeout=1, timed_fire_timeout=1)
+        # T-5480: hermetic codex hooks/list (the default reader spawns the real codex
+        # app-server); the same stub the codex shell-box suites use.
+        self.codex_hooks_reader = fake_read_hooks
         self.commands: list[tuple[str, ...]] = []
         self.timeouts: list[tuple[tuple[str, ...], float | None]] = []
         self.stale_unit_show_sequence: list[str] = []
@@ -302,7 +306,25 @@ class LocalHostStageBackend(LocalHostBackend):
     def _controller_viability(self, operation):  # type: ignore[override]
         return {"initial_viability_selected": operation.desired["expect_selected"], "initial_viability_ok": "true"}
 
+    @staticmethod
+    def _plain_mkdir(operation):
+        """T-6118: the fixture accounts/groups do not exist and the test run is not root, so the
+        ownership-enforcing chronicle-export mkdir ops are exercised as plain mkdirs here; their
+        real behaviour is covered in test_persona_installer_chronicle_export.py."""
+        if _pim._mkdir_owned(operation):
+            desired = {k: v for k, v in operation.desired.items() if k not in {"owner", "group"}}
+            return dataclasses.replace(operation, desired=desired)
+        return operation
+
+    def _simple_mutation(self, operation):  # type: ignore[override]
+        owned = _pim._mkdir_owned(operation)
+        operation = self._plain_mkdir(operation)
+        if owned:  # only the ops stripped of owner/group; plain mkdirs keep real missing-parent behaviour
+            Path(operation.target).parent.mkdir(parents=True, exist_ok=True)
+        return super()._simple_mutation(operation)
+
     def preflight(self, operation) -> PreflightResult:  # type: ignore[override]
+        operation = self._plain_mkdir(operation)
         if operation.kind == "harness-check":
             return PreflightResult(True, "harness", f"{operation.target} test harness available")
         if operation.provenance.get("install_root") != "/":
@@ -504,11 +526,16 @@ class LegacyConvergedTimerBackend(LocalHostStageBackend):
 
 def _seed_shell_box(account_home: Path) -> None:
     """T-5454: the seat clone's shell-box wrapper, an operator prerequisite. The local
-    backend refuses to point CLAUDE_CODE_SHELL_PREFIX at a wrapper it cannot exec."""
-    script = account_home / "pantheon-config" / "tools" / "oom" / "pantheon-shell-box.sh"
-    script.parent.mkdir(parents=True, exist_ok=True)
-    script.write_text("#!/bin/sh\n", encoding="utf-8")
-    script.chmod(0o755)
+    backend refuses to point CLAUDE_CODE_SHELL_PREFIX at a wrapper it cannot exec.
+    T-5480: plus the codex PreToolUse hook script; a seat with a codex runtime (orchestrator's
+    codex fallback) also plans harness.codex-shell-box, whose local preflight fails closed
+    (missing-hook-target) unless both the hook and the box are executable."""
+    oom = account_home / "pantheon-config" / "tools" / "oom"
+    oom.mkdir(parents=True, exist_ok=True)
+    for name in ("pantheon-shell-box.sh", "pantheon-codex-shell-box-hook.py"):
+        script = oom / name
+        script.write_text("#!/bin/sh\n", encoding="utf-8")
+        script.chmod(0o755)
 
 
 def assert_sim_host_restored(case: unittest.TestCase, backend: Any) -> None:
@@ -4467,8 +4494,16 @@ approval_mode = "approve"
         plan = self.plan()
 
         class BoundaryEnabledBackend(SimulatedHostBackend):
-            def execute(self, operation, context):  # type: ignore[override]
-                if operation.operation_id == "connective.timer-enable" and context.workflow == "staged-activate":
+            def __init__(self) -> None:
+                super().__init__()
+                self.activation_executes: list[str] = []
+
+            def preflight(self, operation, context=None):  # type: ignore[override]
+                if (
+                    operation.operation_id == "connective.timer-enable"
+                    and context is not None
+                    and context.workflow == "staged-activate"
+                ):
                     link = operation.desired["enablement_link_path"]
                     canonical = operation.desired["canonical_template_path"]
                     self.timer_enabled = True
@@ -4477,6 +4512,11 @@ approval_mode = "approve"
                         "target": canonical,
                         "fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
                     }
+                return super().preflight(operation, context)
+
+            def execute(self, operation, context):  # type: ignore[override]
+                if context.workflow == "staged-activate":
+                    self.activation_executes.append(operation.operation_id)
                 return super().execute(operation, context)
 
         backend = BoundaryEnabledBackend()
@@ -4484,26 +4524,41 @@ approval_mode = "approve"
         self.assertEqual(staged.status, "applied", staged.errors)
         assert staged.receipt is not None
         report = self.installer.activate_staged(plan, plan.digest, staged.receipt, backend, self.actor(plan))
-        self.assertEqual(report.status, "failed")
-        self.assertIsNotNone(report.receipt)
-        assert report.receipt is not None
-        timer_mutations = [item for item in report.receipt.mutations if item.operation_id == "connective.timer-enable"]
-        self.assertTrue(all(not item.changed for item in timer_mutations), timer_mutations)
-        self.assertTrue(all(item.before.get("owned") != "true" for item in timer_mutations), timer_mutations)
-        self.assertTrue(
-            all(item.evidence.get("enable_command_issued") != "true" for item in report.receipt.evidence),
-            report.receipt.evidence,
+        self.assertEqual(report.status, "refused", report.errors)
+        self.assertEqual(report.changed, 0)
+        self.assertIsNone(report.receipt)
+        self.assertEqual(report.rollback, ())
+        self.assertEqual(backend.activation_executes, [])
+        self.assertEqual(
+            report.errors,
+            (f"connective.timer-enable: conflicting: {_pim.STAGED_ACTIVATE_TIMER_REFUSAL}",),
         )
-        link = self.operation(plan, "connective.timer-enable").desired["enablement_link_path"]
-        self.assertIn(link, backend.entries)
-        self.assertNotIn("rollback:connective.timer-enable", backend.events)
+        enable = self.operation(plan, "connective.timer-enable")
+        link = enable.desired["enablement_link_path"]
+        canonical = enable.desired["canonical_template_path"]
+        self.assertEqual(
+            backend.entries[link],
+            {
+                "state": "symlink",
+                "target": canonical,
+                "fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            },
+        )
 
     def test_activate_staged_refuses_timer_enable_boundary_wrong_link_without_rollback_authority(self) -> None:
         plan = self.plan()
 
         class BoundaryWrongLinkBackend(SimulatedHostBackend):
-            def execute(self, operation, context):  # type: ignore[override]
-                if operation.operation_id == "connective.timer-enable" and context.workflow == "staged-activate":
+            def __init__(self) -> None:
+                super().__init__()
+                self.activation_executes: list[str] = []
+
+            def preflight(self, operation, context=None):  # type: ignore[override]
+                if (
+                    operation.operation_id == "connective.timer-enable"
+                    and context is not None
+                    and context.workflow == "staged-activate"
+                ):
                     link = operation.desired["enablement_link_path"]
                     self.timer_enabled = True
                     self.entries[link] = {
@@ -4511,6 +4566,11 @@ approval_mode = "approve"
                         "target": "/tmp/wrong.timer",
                         "fingerprint": hashlib.sha256(b"/tmp/wrong.timer").hexdigest(),
                     }
+                return super().preflight(operation, context)
+
+            def execute(self, operation, context):  # type: ignore[override]
+                if context.workflow == "staged-activate":
+                    self.activation_executes.append(operation.operation_id)
                 return super().execute(operation, context)
 
         backend = BoundaryWrongLinkBackend()
@@ -4518,19 +4578,24 @@ approval_mode = "approve"
         self.assertEqual(staged.status, "applied", staged.errors)
         assert staged.receipt is not None
         report = self.installer.activate_staged(plan, plan.digest, staged.receipt, backend, self.actor(plan))
-        self.assertEqual(report.status, "failed")
-        self.assertIsNotNone(report.receipt)
-        assert report.receipt is not None
-        timer_mutations = [item for item in report.receipt.mutations if item.operation_id == "connective.timer-enable"]
-        self.assertTrue(all(not item.changed for item in timer_mutations), timer_mutations)
-        self.assertTrue(all(item.before.get("owned") != "true" for item in timer_mutations), timer_mutations)
-        self.assertTrue(
-            all(item.evidence.get("enable_command_issued") != "true" for item in report.receipt.evidence),
-            report.receipt.evidence,
+        self.assertEqual(report.status, "refused", report.errors)
+        self.assertEqual(report.changed, 0)
+        self.assertIsNone(report.receipt)
+        self.assertEqual(report.rollback, ())
+        self.assertEqual(backend.activation_executes, [])
+        self.assertEqual(
+            report.errors,
+            (f"connective.timer-enable: conflicting: {_pim.STAGED_ACTIVATE_TIMER_REFUSAL}",),
         )
         link = self.operation(plan, "connective.timer-enable").desired["enablement_link_path"]
-        self.assertEqual(backend.entries[link]["target"], "/tmp/wrong.timer")
-        self.assertNotIn("rollback:connective.timer-enable", backend.events)
+        self.assertEqual(
+            backend.entries[link],
+            {
+                "state": "symlink",
+                "target": "/tmp/wrong.timer",
+                "fingerprint": hashlib.sha256(b"/tmp/wrong.timer").hexdigest(),
+            },
+        )
 
     # -- T-3087: legacy-enabled consume timer convergence admit -------------
     #

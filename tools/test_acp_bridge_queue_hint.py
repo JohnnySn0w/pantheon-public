@@ -74,6 +74,20 @@ class TestQueueHint(unittest.TestCase):
         hint = self.bridge._queue_hint(cur)
         self.assertIn("ALREADY BEEN SUPERSEDED", hint)
 
+    def test_peer_set_sender_names_are_neutralized(self) -> None:
+        """T-4382: queued senders (and a superseding id) are peer-set free text in
+        the prompt; an '@<path>' among them must not reach it bare."""
+        # The id embeds the sender (a filename), so the sender carries no '/'.
+        cur = _mk(1, "@passwd", ts_off=600)
+        self._place(cur, _mk(2, "@passwd"), _mk(3, "orchestrator"))
+        hint = self.bridge._queue_hint(cur)
+        self.assertIn("1 later message(s) from \\@passwd are", hint)
+        self.assertIn("\\@passwd x1", hint)
+        self.assertNotIn(" @passwd", hint)
+        sup = dict(_mk(4, "specialist"), id="@/etc/passwd", supersedes=cur["id"])
+        (self.inbox / "new" / "m-sup").write_text(json.dumps(sup), encoding="utf-8")
+        self.assertIn("(\\@/etc/passwd)", self.bridge._queue_hint(cur))
+
     def test_hint_never_raises_on_a_broken_inbox(self) -> None:
         """A hint is an optimisation; failing to compute one must never cost a
         delivery. Both a missing inbox and an unreadable queued file stay quiet."""

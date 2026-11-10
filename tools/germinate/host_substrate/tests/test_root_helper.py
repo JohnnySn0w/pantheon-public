@@ -340,13 +340,45 @@ def test_an_unprivileged_seat_context_never_reaches_root_families(phase):
     assert h.port.calls == 0
 
 
-def test_a_scheduled_context_may_stage_but_never_activate():
+@pytest.mark.parametrize("phase", [Hp.STAGE, Hp.ACTIVATE])
+@pytest.mark.parametrize("family", sorted(F.FAMILIES))
+def test_a_scheduled_context_refuses_every_root_family_at_every_phase(family, phase):
     h = helper(Hp.SCHEDULED)
-    with pytest.raises(Hp.ScheduledActivationRefused, match="A-3"):
-        h.admit("account.ensure", {"account": "alice"}, Hp.ACTIVATE)
-    step = h.admit("account.ensure", {"account": "alice"}, Hp.STAGE)
-    h.apply(step)
-    assert set(h.port.snapshot()) == {"staged:passwd:alice"}  # nothing live changed
+    with pytest.raises(Hp.ScheduledRootRefused, match="A-3") as ei:
+        h.admit(family, {}, phase)  # malformed params: refusal precedes any parameter read
+    assert ei.value.code == "SCHEDULED_ROOT_REFUSED"
+    assert ei.value.payload() == {"code": "SCHEDULED_ROOT_REFUSED", "family": family,
+                                  "amendment": "ORG-080", "retry_context": Hp.BOOTSTRAP}
+    assert h.port.calls == 0 and h.port.snapshot() == {}
+
+
+def test_every_helper_family_is_root_so_scheduled_is_refused_everywhere():
+    """Tripwire (Recovery D15 condition). The blanket scheduled refusal is correct ONLY because every
+    helper family is root-privileged (ORG-080 A-3 lets a scheduled run execute none|seat ops only).
+    A future non-root family fails this test, forcing a revisit of the scheduled admission rule."""
+    import yaml
+
+    path = Path(__file__).resolve().parents[2] / "components" / "host-substrate.yaml"
+    root = yaml.safe_load(path.read_text())["component"]["privilege"]["bootstrap_root"]
+    assert set(F.FAMILIES) <= set(root)
+
+
+def test_a_scheduled_refusal_precedes_the_phase_check_only_for_known_inputs():
+    h = helper(Hp.SCHEDULED)
+    with pytest.raises(Hp.UnknownOperation):
+        h.admit("nope.ensure", {}, Hp.STAGE)
+    with pytest.raises(Hp.HelperRefusal, match="unknown phase"):
+        h.admit("account.ensure", {"account": "alice"}, "bogus")
+
+
+def test_other_contexts_are_unchanged_by_the_strict_scheduled_rule():
+    with pytest.raises(Hp.SubstrateFamilyNotExposed):
+        helper(Hp.DAEMON).admit("account.ensure", {"account": "alice"}, Hp.STAGE)
+    with pytest.raises(Hp.UnprivilegedContext):
+        helper(Hp.SEAT).admit("account.ensure", {"account": "alice"}, Hp.STAGE)
+    h = helper(Hp.BOOTSTRAP)
+    for phase in (Hp.STAGE, Hp.ACTIVATE):
+        assert h.admit("account.ensure", {"account": "alice"}, phase).phase == phase
 
 
 def test_bootstrap_converges_and_restores():

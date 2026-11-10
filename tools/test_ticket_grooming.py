@@ -3251,6 +3251,160 @@ class TestWipCapDriftCheck(unittest.TestCase):
         self.assertIn("T-0002", d)
 
 
+# Captured before setUpModule patches the module attribute (hermetic main() tests).
+_REAL_COLLECT = getattr(ticket_grooming, "_collect_stale_seat_states", None)
+
+
+class StaleSeatStateTests(unittest.TestCase):
+    """T-5591 / ORG-106 note 4: forgotten indefinite seat pauses in the digest."""
+
+    NOW = 1_800_000_000.0
+    UNAVAILABLE = ("Seat-state export unavailable (health_export not readable/fresh); "
+                   "forgotten-pause check skipped.")
+
+    def setUp(self) -> None:
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.dir = Path(self._td.name)
+
+    def _rec(self, persona, *, age=8 * 86400, indefinite=True, state="deep-sleep",
+             exported_age=10, owner="operator", reason="holiday", **kw):
+        d = {
+            "schema_version": 1, "persona": persona, "account": "acct-" + persona,
+            "exported_at": int(self.NOW) - exported_age, "runtime": None,
+            "controller_last_event": None, "controller_last_event_age_s": None,
+            "activity_age_s": None, "mail_unread": 0, "mail_oldest_unread_age_s": None,
+            "consume_unit": "unknown", "pane_state": "unknown",
+            "seat_state": state, "expected_down": state == "deep-sleep",
+            "seat_owner": owner, "seat_reason": reason, "seat_expires": None,
+            "seat_indefinite": indefinite, "seat_set_age_s": age,
+            "seat_indefinite_stale": False,
+        }
+        d.update(kw)
+        return d
+
+    def _write(self, persona, rec=None, **kw):
+        import json
+        (self.dir / f"{persona}.json").write_text(
+            json.dumps(rec if rec is not None else self._rec(persona, **kw)))
+
+    def _collect(self):
+        return _REAL_COLLECT(self.dir, now=self.NOW)
+
+    def test_stale_indefinite_listed(self) -> None:
+        self._write("artisan", reason="holiday")
+        found, unavailable = self._collect()
+        self.assertFalse(unavailable)
+        out = ticket_grooming._render_stale_seat_state_section(found)
+        self.assertIn("artisan", out)
+        self.assertIn("operator", out)
+        self.assertIn("holiday", out)
+        self.assertIn("8d", out)
+
+    def test_fresh_indefinite_timed_and_active_not_listed(self) -> None:
+        self._write("a", age=2 * 86400)
+        self._write("b", indefinite=False, age=30 * 86400, seat_expires="2026-12-01T00:00:00Z")
+        self._write("c", state="active", age=None, indefinite=False,
+                    owner=None, reason=None)
+        found, unavailable = self._collect()
+        self.assertEqual(found, [])
+        self.assertFalse(unavailable)
+
+    def test_healthy_zero_stale_has_no_unavailable_line(self) -> None:
+        self._write("a", age=2 * 86400)
+        found, unavailable = self._collect()
+        self.assertFalse(unavailable)
+        d = ticket_grooming.build_digest("now", [], {"active": 0},
+                                         seat_state_findings=found,
+                                         seat_state_unavailable=unavailable)
+        self.assertNotIn("Seat-state export unavailable", d)
+        self.assertEqual(d, ticket_grooming.build_digest("now", [], {"active": 0}))
+
+    def test_digest_byte_identical_when_empty(self) -> None:
+        base = ticket_grooming.build_digest("now", [], {"active": 1}, hermes_line="H")
+        self.assertEqual(base, ticket_grooming.build_digest(
+            "now", [], {"active": 1}, hermes_line="H",
+            seat_state_findings=[], seat_state_unavailable=False))
+        self.assertEqual(base, ticket_grooming.build_digest(
+            "now", [], {"active": 1}, hermes_line="H", seat_state_findings=None))
+
+    def test_section_appears_in_digest(self) -> None:
+        self._write("artisan")
+        found, _un = self._collect()
+        d = ticket_grooming.build_digest("now", [], {"active": 0}, seat_state_findings=found)
+        self.assertIn("Forgotten seat pauses (1", d)
+        self.assertIn("artisan", d)
+
+    def test_unavailable_line_exact_text_when_dir_missing(self) -> None:
+        found, un = _REAL_COLLECT(self.dir / "nope", now=self.NOW)
+        self.assertEqual((found, un), ([], True))
+        d = ticket_grooming.build_digest("now", [], {"active": 0},
+                                         seat_state_findings=found, seat_state_unavailable=un)
+        self.assertIn("\n" + self.UNAVAILABLE + "\n", d)
+        self.assertEqual(ticket_grooming.SEAT_STATE_UNAVAILABLE_LINE, self.UNAVAILABLE)
+
+    def test_all_stale_exports_is_unavailable(self) -> None:
+        self._write("a", exported_age=1000)
+        self._write("b", exported_age=-500)  # future exported_at is stale too
+        self.assertEqual(self._collect(), ([], True))
+
+    def test_empty_dir_is_unavailable(self) -> None:
+        self.assertEqual(self._collect(), ([], True))
+
+    def test_all_malformed_is_unavailable(self) -> None:
+        (self.dir / "a.json").write_text("{not json")
+        self._write("b", rec=self._rec("b", schema_version=9))
+        self._write("c", rec=["list"])
+        self.assertEqual(self._collect(), ([], True))
+
+    def test_unreadable_record_skipped(self) -> None:
+        self._write("good")
+        self._write("bad")
+        os.chmod(self.dir / "bad.json", 0)
+        if os.access(self.dir / "bad.json", os.R_OK):
+            self.skipTest("running as a user that ignores file modes")
+        found, un = self._collect()
+        self.assertEqual([f["persona"] for f in found], ["good"])
+        self.assertFalse(un)
+
+    def test_mixed_good_and_bad_lists_good(self) -> None:
+        self._write("good")
+        (self.dir / "junk.json").write_text("{")
+        self._write("old", exported_age=9999)
+        (self.dir / "_exporter.json").write_text("{}")
+        found, un = self._collect()
+        self.assertEqual([f["persona"] for f in found], ["good"])
+        self.assertFalse(un)
+
+    def test_reason_scrubbed_single_line_no_markdown(self) -> None:
+        self._write("artisan", reason="line1\nline2 **bold** `code` [x](y) #h | <b>" + "z" * 200)
+        found, _un = self._collect()
+        out = ticket_grooming._render_stale_seat_state_section(found)
+        self.assertEqual(len(out.splitlines()), 2)
+        for ch in "*`[]<>|#\\_":
+            self.assertNotIn(ch, out.split("\n", 1)[1])
+        self.assertLess(len(out.splitlines()[1]), 200)
+
+    def test_main_prints_section_and_never_reads_live_dir(self) -> None:
+        root = self.dir / "tk"
+        (root / "active").mkdir(parents=True)
+        for st in ("inbox", "done"):
+            (root / st).mkdir()
+        with patch.object(ticket_grooming, "_collect_stale_seat_states",
+                          return_value=([{"persona": "artisan", "seat_state": "deep-sleep",
+                                          "seat_owner": "operator", "seat_reason": "r",
+                                          "seat_set_age_s": 9 * 86400}], False)), \
+             patch.object(ticket_grooming, "TICKETS_ROOT", root), \
+             patch.object(ticket_grooming, "_with_worktree", lambda fn: fn(None)), \
+             patch.object(ticket_grooming, "git_commit_and_push", return_value=(True, "m")), \
+             patch.object(ticket_grooming, "_send_digest", return_value=True), \
+             patch.object(ticket_grooming, "run_history_audit", return_value="H"):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                ticket_grooming.main(["--commit-prod"])
+        self.assertIn("Forgotten seat pauses", buf.getvalue())
+
+
 # T-4940: isolate the seat's state dir for plain-unittest runs (pytest's conftest
 # _isolate_state_dir already does this per test). See tools/_seat_state_isolation.py.
 try:
@@ -3261,9 +3415,15 @@ except ImportError:  # pragma: no cover - run from tools/
 
 def setUpModule() -> None:
     _seat_state_isolation.start()
+    # T-5591: hermetic -- main() tests never read the live /run/pantheon-health.
+    global _SEAT_HEALTH_PATCH
+    _SEAT_HEALTH_PATCH = patch.object(
+        ticket_grooming, "_collect_stale_seat_states", return_value=([], False), create=True)
+    _SEAT_HEALTH_PATCH.start()
 
 
 def tearDownModule() -> None:
+    _SEAT_HEALTH_PATCH.stop()
     _seat_state_isolation.stop()
 
 

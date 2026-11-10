@@ -124,6 +124,7 @@ def converge(helper, ops=BOOTSTRAP_OPS, phase=Hp.ACTIVATE):
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_the_sandbox_is_a_private_userns_with_a_private_etc(sb):
     who = sb.call({"op": "whoami"})
     assert who["uid"] == 0
@@ -141,6 +142,7 @@ def test_the_sandbox_is_a_private_userns_with_a_private_etc(sb):
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_e17_forbidden_values_never_reach_the_sandbox(sb):
     helper, port = make(sb)
     before = state(sb)
@@ -163,6 +165,7 @@ def test_e17_forbidden_values_never_reach_the_sandbox(sb):
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_bootstrap_converges_every_family_and_the_invariants_hold(sb):
     helper, port = make(sb)
     converge(helper)
@@ -175,6 +178,7 @@ def test_bootstrap_converges_every_family_and_the_invariants_hold(sb):
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_restorable_families_roll_back_exactly(sb):
     helper, port = make(sb)
     converge(helper, BOOTSTRAP_OPS[:2])  # group + account are prerequisites
@@ -196,6 +200,7 @@ def test_restorable_families_roll_back_exactly(sb):
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_mailbox_and_group_removal_have_no_argv(sb):
     """Gate 34 / closed enum: there is no family that deletes a mailbox dir or a group."""
 
@@ -219,6 +224,7 @@ _BROKER_LOAD = (
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_e19_the_broker_loads_unprivileged_and_refuses_namespace_root(sb):
     code = _BROKER_LOAD.format(repo="/mnt/repo")  # the read-only repo view (enter.sh)
     # the broker's dedicated service account (dist unit: User=pantheon-hostbroker)
@@ -243,6 +249,7 @@ def test_e19_the_broker_loads_unprivileged_and_refuses_namespace_root(sb):
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_e19_the_root_helper_leaves_both_journals_untouched(sb):
     for name, uid in (("broker", 3201), ("approval", 3202)):
         sb.mkdir(f"/srv/journals/{name}")
@@ -258,6 +265,7 @@ def test_e19_the_root_helper_leaves_both_journals_untouched(sb):
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_e20_sudoers_apply_runs_the_exact_sequence_with_parser_derived_evidence(sb):
     helper, port = make(sb)
     converge(helper, BOOTSTRAP_OPS[:2])
@@ -283,6 +291,7 @@ def test_e20_sudoers_apply_runs_the_exact_sequence_with_parser_derived_evidence(
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_e20_real_visudo_errors_and_warnings_fail_closed(sb):
     helper, port = make(sb)
     converge(helper, BOOTSTRAP_OPS[:2])
@@ -316,6 +325,7 @@ def test_e20_malformed_and_overbroad_templates_are_refused_before_any_host():
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_e20_untracked_fragments_and_mode_drift_fail_closed(sb):
     helper, port = make(sb)
     converge(helper, BOOTSTRAP_OPS[:2])
@@ -333,6 +343,7 @@ def test_e20_untracked_fragments_and_mode_drift_fail_closed(sb):
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_e20_rollback_is_exact_for_an_absent_and_a_tracked_prior_fragment(sb):
     helper, port = make(sb)
     converge(helper, BOOTSTRAP_OPS[:2])
@@ -362,6 +373,7 @@ def test_e20_rollback_is_exact_for_an_absent_and_a_tracked_prior_fragment(sb):
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_e33_one_human_approved_fragment_applies_verifies_revokes_and_rolls_back(sb, tmp_path):
     approval = {"approved_by": "fixture-human", "template": "alice-probe", "sha256": SHA, "ticket": "T-2918",
                 "note": "FIXTURE approval record; the real Telegram/engine grant path is T-5236 / T-2924"}
@@ -407,6 +419,7 @@ def test_e33_one_human_approved_fragment_applies_verifies_revokes_and_rolls_back
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_e34_retirement_disables_the_seat_and_jobs_and_keeps_home_and_mailbox(sb):
     helper, port = make(sb)
     converge(helper, BOOTSTRAP_OPS[:7])
@@ -459,6 +472,7 @@ def test_e34_no_reachable_argv_deletes_an_account_home_or_mailbox():
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_e36_the_broker_daemon_context_is_refused_for_every_family_in_the_sandbox(sb):
     helper, port = make(sb, context=Hp.DAEMON)
     before = state(sb)
@@ -492,6 +506,7 @@ def test_f3_rollback_of_a_retire_is_the_exact_unlock_argv():
 
 
 @needs_sandbox
+@pytest.mark.nested_namespace
 def test_f3_rolling_back_a_retire_restores_the_account_in_the_sandbox(sb):
     helper, port = make(sb)
     converge(helper, BOOTSTRAP_OPS[:2])

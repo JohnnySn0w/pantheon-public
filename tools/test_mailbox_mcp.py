@@ -778,7 +778,9 @@ class ServerExitWaitT4230(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def _spawn(self, code: str) -> subprocess.Popen:
-        return subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE)
+        proc = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE)
+        self.addCleanup(proc.stdin.close)
+        return proc
 
     def test_returns_as_soon_as_the_process_exits(self):
         proc = self._spawn("import sys; sys.stdin.read()")

@@ -356,15 +356,53 @@ def containment_checks(
     *,
     env: Mapping[str, str] | None = None,
     which: Callable[[str], "str | None"] = shutil.which,
+    read_hooks: Callable[..., Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """T-5454: read-only. Runs as the seat account, so ``os.access`` is the seat's own
-    answer. Codex-only seats have no shell-box op and report not-applicable."""
+    """T-5454 / T-5480: read-only. Runs as the seat account, so ``os.access`` is the seat's own
+    answer. A seat with a claude runtime is checked on its settings.json prefix; a seat with a
+    codex runtime on its config.toml hook block (present, exact, trusted, scripts executable).
+    A plan with neither op is not-applicable. ``read_hooks`` (an injected codex hooks/list reader)
+    additionally gates on the stored trusted_hash equalling codex's own hash; without it the codex
+    trust check is presence-only (verify-seat stays hermetic and spawns no codex)."""
     env = os.environ if env is None else env
     op = next((o for o in plan.operations if o.kind == pim.SETTINGS_ENV_KIND), None)
-    if op is None:
+    codex_op = next((o for o in plan.operations if o.kind == pim.CODEX_HOOK_KIND), None)
+    if op is None and codex_op is None:
         note = plan.provenance.get(pim.SHELL_BOX_PROVENANCE_KEY, "not-applicable")
         return [_check("containment", "containment-applicable", True,
                        note if note.startswith("not-applicable") else f"not-applicable: {note}")]
+    checks: list[dict[str, Any]] = []
+    if op is not None:
+        checks.extend(_claude_containment_checks(op))
+    if codex_op is not None:
+        checks.extend(_codex_containment_checks(codex_op, read_hooks))
+    anchor = Path((op or codex_op).target)
+    runtime = env.get("XDG_RUNTIME_DIR", "")
+    missing = []
+    if not runtime:
+        missing.append("XDG_RUNTIME_DIR unset")
+    elif not (Path(runtime) / "systemd" / "private").exists():
+        missing.append(f"{runtime}/systemd/private absent")
+    if not which("systemd-run"):
+        missing.append("systemd-run not on PATH")
+    checks.append(_check("containment", "user-manager", not missing,
+                         "user manager reachable" if not missing else "; ".join(missing)))
+    log = anchor.parent.parent / FALLBACK_LOG_RELATIVE
+    try:
+        size = log.stat().st_size
+    except FileNotFoundError:
+        size = 0
+    except OSError as exc:
+        size = -1
+        checks.append(_check("containment", "fallback-log", False, f"unreadable: {exc}"))
+    if size >= 0:
+        checks.append(_check("containment", "fallback-log", size == 0,
+                             "no unboxed fallbacks logged" if size == 0
+                             else f"{log} is non-empty: the seat ran commands unboxed"))
+    return checks
+
+
+def _claude_containment_checks(op: Any) -> list[dict[str, Any]]:
     key, expected = op.desired["env_key"], op.desired["env_value"]
     settings = Path(op.target)
     try:
@@ -381,28 +419,41 @@ def containment_checks(
     runnable = target.is_file() and os.access(target, os.X_OK)
     checks.append(_check("containment", "prefix-executable", runnable,
                          str(target) if runnable else f"missing or not executable: {target}"))
-    runtime = env.get("XDG_RUNTIME_DIR", "")
-    missing = []
-    if not runtime:
-        missing.append("XDG_RUNTIME_DIR unset")
-    elif not (Path(runtime) / "systemd" / "private").exists():
-        missing.append(f"{runtime}/systemd/private absent")
-    if not which("systemd-run"):
-        missing.append("systemd-run not on PATH")
-    checks.append(_check("containment", "user-manager", not missing,
-                         "user manager reachable" if not missing else "; ".join(missing)))
-    log = settings.parent.parent / FALLBACK_LOG_RELATIVE
+    return checks
+
+
+def _codex_containment_checks(op: Any, read_hooks: Callable[..., Any] | None) -> list[dict[str, Any]]:
+    """T-5480: on-disk verdict for the codex shell-box hook block in the seat's config.toml."""
+    from tools.harness_adapter import codex_shell_box as csb
+
+    config = Path(op.target)
+    codex_home, account_home = config.parent, Path(op.desired["account_home"])
     try:
-        size = log.stat().st_size
-    except FileNotFoundError:
-        size = 0
-    except OSError as exc:
-        size = -1
-        checks.append(_check("containment", "fallback-log", False, f"unreadable: {exc}"))
-    if size >= 0:
-        checks.append(_check("containment", "fallback-log", size == 0,
-                             "no unboxed fallbacks logged" if size == 0
-                             else f"{log} is non-empty: the seat ran commands unboxed"))
+        text = config.read_text(encoding="utf-8") if config.exists() else ""
+    except (OSError, UnicodeDecodeError) as exc:
+        return [_check("containment", "codex-hook-block", False, f"{config} unreadable: {exc}")]
+    st = csb.status(text, codex_home, account_home)
+    block_ok = st["block_present"] and st["definition_ok"] and op.desired["hook_command"] == st["command"]
+    block_problem = next((p for p in st["problems"] if "trusted_hash" not in p
+                          and "script" not in p and "shell-box missing" not in p),
+                         "shell-box hook block absent or differs from the canonical definition")
+    checks = [
+        _check("containment", "codex-hook-block", block_ok,
+               f"{st['command']} (matcher Bash) in {config}" if block_ok else block_problem),
+        _check("containment", "codex-hook-trusted", bool(st["trusted_hash"]),
+               f"trusted_hash stored for {st['key']}" if st["trusted_hash"]
+               else f"no trusted_hash stored for the shell-box hook in {config}: codex would skip it"),
+        _check("containment", "codex-hook-targets", st["hook_executable"] and st["box_executable"],
+               "hook script and shell-box executable" if st["hook_executable"] and st["box_executable"]
+               else "; ".join(p for p in st["problems"] if "script" in p or "shell-box missing" in p)),
+    ]
+    if read_hooks is not None and st["trusted_hash"]:
+        digest = csb.precomputed_hash(text, codex_home, account_home,
+                                      executable=Path(op.desired["codex_executable"]), read_hooks=read_hooks)
+        checks.append(_check(
+            "containment", "codex-hook-hash", digest is not None and digest == st["trusted_hash"],
+            "stored trusted_hash equals codex's own hash" if digest and digest == st["trusted_hash"]
+            else f"stored {st['trusted_hash']} vs codex {digest or 'unreadable'}"))
     return checks
 
 
@@ -432,6 +483,7 @@ def verify_seat(
     uid_of: Callable[[str], int | None] = _account_uid,
     env: Mapping[str, str] | None = None,
     which: Callable[[str], "str | None"] = shutil.which,
+    read_hooks: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     manifest = pim.Manifest.load(manifest_path)
     plan = pim.PersonaInstaller(repo_root=repo_root).plan(manifest, persona, root=root)
@@ -444,7 +496,7 @@ def verify_seat(
         *viability_checks(plan),
         *attach_checks(plan, run),
         *comms_checks(manifest_path, persona, plan, run, root=root),
-        *containment_checks(plan, env=env, which=which),
+        *containment_checks(plan, env=env, which=which, read_hooks=read_hooks),
         *flip_checks(manifest_path, persona),
     ]
     failed = [c for c in checks if not c["ok"]]

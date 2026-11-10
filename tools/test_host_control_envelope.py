@@ -51,6 +51,8 @@ UNMAPPED_KINDS = (
     "seat-service-decommission",
     # T-5454: shell-box containment wiring in the seat's own settings.json, seat-local too
     "seat-claude-settings-env",
+    # T-5480: shell-box PreToolUse hook + trust in the seat's ~/.codex/config.toml, seat-local too
+    "seat-codex-hook-config",
     # T-5474: first-launch workspace trust, seat-local too (T-5473's residue
     # quarantine is admitted as files.seat_root since T-5608)
     "seat-claude-workspace-trust",
@@ -173,6 +175,35 @@ class ResidueQuarantineAdmissionTests(unittest.TestCase):
         ), self.assertRaises(op_registry.OpRegistryError):
             op_registry.load_op_registry()
 
+    def test_the_read_purpose_set_equals_user_systemd_read_purpose(self) -> None:
+        # T-5635 (4): op_registry cannot import tools.user_systemd (it would widen the
+        # pinned broker import closure), so the envelope carries the value set; pin it here
+        from tools.host_control.envelope import INSPECTION_READ_PURPOSES
+        from tools.user_systemd import ReadPurpose
+
+        self.assertEqual(INSPECTION_READ_PURPOSES, {purpose.value for purpose in ReadPurpose} | {""})
+
+    def test_a_malformed_declared_read_fails_the_registry_build(self) -> None:
+        # T-5635 (4): method, role and purpose are validated at build time (P1)
+        from types import MappingProxyType
+        from unittest import mock
+
+        from tools.germinate import op_registry
+
+        good = ("read_unit", "controller", "service-observe")
+        bad_reads = (
+            ("bad method", (("write_unit", "controller", "service-observe"),)),
+            ("bad role", (("read_unit", "operator", "service-observe"),)),
+            ("bad purpose", (("read_unit", "controller", "no-such-purpose"),)),
+            ("short triple", (("read_unit", "controller"),)),
+            ("non-string", (("read_unit", "controller", None),)),
+        )
+        for label, reads in bad_reads:
+            with self.subTest(label), mock.patch.object(
+                op_registry, "KIND_INSPECTION_READS", MappingProxyType({self.KIND: (good,) + reads})
+            ), self.assertRaises(op_registry.OpRegistryError):
+                op_registry.load_op_registry()
+
     def test_kinds_without_declared_reads_keep_their_registry_bytes(self) -> None:
         from tools.germinate import op_registry
 
@@ -285,7 +316,8 @@ class PlannerEnvelopeTests(unittest.TestCase):
                 self.assertEqual(
                     [
                         r for r in summary["seat_local_residue"]
-                        if not r["operation_id"].startswith(("periodic.", "service.")) and r["kind"] not in routed
+                        if not r["operation_id"].startswith(("periodic.", "service.", "harness.codex-shell-box"))  # T-5480: baseline op
+                        and r["kind"] not in routed
                     ],
                     [{"operation_id": f"injected.{kind}", "kind": kind, "status": "pending-seat-local"}],
                 )

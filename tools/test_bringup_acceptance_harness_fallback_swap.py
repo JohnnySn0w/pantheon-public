@@ -43,6 +43,10 @@ from unittest import mock
 from tools import mailbox
 from tools import persona_bringup
 from tools import runtime_controller as rc
+try:
+    from tools import _seat_state_isolation
+except ImportError:  # pragma: no cover
+    import _seat_state_isolation  # type: ignore[no-redef]
 from tools.bringup_acceptance import harness_fallback_swap
 from tools.bringup_acceptance.harness_fallback_swap import (
     COMPOSITE_ID,
@@ -130,6 +134,16 @@ def _load_bindings(root: Path, ctx: RunContext) -> tuple[Path, "persona_bringup.
 
 
 # --------------------------------------------------------------------- declare
+
+
+# T-6118: plain `python3 -m unittest` never loads tools/conftest.py; without this the controller
+# lifecycle tests wrote the REAL Chronicle / persona state. See tools/_seat_state_isolation.py.
+def setUpModule() -> None:
+    _seat_state_isolation.start()
+
+
+def tearDownModule() -> None:
+    _seat_state_isolation.stop()
 
 
 class DeclareTest(unittest.TestCase):

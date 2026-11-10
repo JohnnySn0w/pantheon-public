@@ -19,12 +19,13 @@ lives next to the walk so the two stay in step. It is not exhaustive: a
 deliberately obfuscated load (e.g. a ``getattr`` chain to a loader) is left to
 the reviewer of the pinned diff, which every handler change must carry.
 
-Scope of the guarantee: the digest is verified when ``discover`` runs. The
-entry module then executes from those exact bytes, but helpers are imported
-later through the normal import system (from disk, or a matching ``.pyc``), so
-a post-discover edit, ``.pyc`` shadowing, or a ``--repo-root`` checkout other
-than the one on ``sys.path`` is NOT covered for helpers. That residual is
-tracked by T-5506.
+Scope of the guarantee (T-5506): the digest is verified when ``discover`` runs,
+and the entry AND every helper then execute from those exact bytes
+(``HandlersDigest.sources``; ``components.py`` resolves component-local imports to
+them), so a post-discover edit, ``.pyc`` shadowing, or a ``--repo-root`` checkout
+other than the one on ``sys.path`` cannot substitute helper code. Shared ``tools.*``
+modules remain the accepted shared-module residual. The spelling
+``import tools.germinate.components.<x>`` is refused: it would bind the name ``tools``.
 
 Canonical form (``pantheon-handlers-digest/v1``): the raw bytes of each file (no
 newline normalization) are hashed; the lines ``<sha256 hex>  <path relative to the
@@ -39,8 +40,9 @@ from __future__ import annotations
 
 import ast
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
 VERSION = "pantheon-handlers-digest/v1"
 COMPONENT_PACKAGE = "tools.germinate.components"
@@ -61,6 +63,7 @@ class HandlersDigest:
     digest: str
     entry_source: bytes
     files: tuple[str, ...]
+    sources: Mapping[str, bytes] = field(default_factory=dict, compare=False)
 
 
 def _read(path: Path, label: str) -> bytes:
@@ -102,7 +105,9 @@ def _local_imports(data: bytes, label: str) -> set[str]:
                 if _is_package_or_ancestor(alias.name):
                     raise HandlersDigestError(_bare_package(label, node.lineno, alias.name))
                 if alias.name.startswith(prefix):
-                    found.add(alias.name[len(prefix):].split(".")[0])
+                    raise HandlersDigestError(
+                        f"{label}:{node.lineno}: `import {alias.name}` binds the name 'tools'; use `from {COMPONENT_PACKAGE} import <name>`"
+                    )
         elif isinstance(node, ast.ImportFrom):
             if node.level:
                 raise HandlersDigestError(f"{label}:{node.lineno}: relative import; use the absolute {COMPONENT_PACKAGE} path")
@@ -144,4 +149,4 @@ def compute(handlers_path: Path) -> HandlersDigest:
         pending.extend(sorted(_local_imports(data, rel) - {n.removesuffix('.py') for n in sources}))
     lines = [VERSION] + [f"{hashlib.sha256(sources[rel]).hexdigest()}  {rel}" for rel in sorted(sources)]
     digest = "sha256:" + hashlib.sha256(("\n".join(lines) + "\n").encode("utf-8")).hexdigest()
-    return HandlersDigest(digest=digest, entry_source=entry_source, files=tuple(sorted(sources)))
+    return HandlersDigest(digest=digest, entry_source=entry_source, files=tuple(sorted(sources)), sources=dict(sources))

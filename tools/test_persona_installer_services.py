@@ -146,7 +146,12 @@ class ServicePlanShapeTests(LegacyHoResumerCase):
         self.assertTrue({UNIT_ID, CONTROLLER_ID, RESUMER_ID} <= residue_ids)
         self.assertFalse({o.operation_id for o in broker.operations} & residue_ids)
         # T-5470 (HO ruling 2026-10-26): routed launches have their own bound; B8 counts the rest
-        self.assertLessEqual(len([o for o in residue if o.kind not in EXECUTOR_KIND_CLASSES]), SEAT_LOCAL_RESIDUE_LIMIT)
+        # T-5961 (orchestrator ruling on B8): the fleet-usage periodic-timer ops are a separate bucket
+        from tools.host_control.planner import residue_bucket_counts
+
+        self.assertLessEqual(residue_bucket_counts(
+            (o.kind, o.target) for o in residue if o.kind not in EXECUTOR_KIND_CLASSES)[0],
+            SEAT_LOCAL_RESIDUE_LIMIT)
 
     def test_controller_template_is_not_modified_by_the_installer_source(self) -> None:
         text = (SYSTEMD / "pantheon-runtime-controller@.service").read_text(encoding="utf-8")
@@ -697,10 +702,15 @@ class ResidueBudgetTests(PeriodicCase):
                 # bound; B8 cap unchanged. Count only the out-of-envelope residue (a residue op of
                 # an in-envelope kind is a routed launch or dependent).
                 from tools.host_control.envelope import EXECUTOR_KIND_CLASSES
+                from tools.host_control.planner import residue_bucket_counts
 
-                counts[persona] = len(
-                    [op for op in partition_installer_plan(plan)[1] if op.kind not in EXECUTOR_KIND_CLASSES]
-                )
+                # T-5961 (orchestrator ruling on B8): the general bucket; the fleet-usage
+                # periodic-timer ops have their own cap (test_persona_installer_periodics)
+                counts[persona] = residue_bucket_counts(
+                    (op.kind, op.target)
+                    for op in partition_installer_plan(plan)[1]
+                    if op.kind not in EXECUTOR_KIND_CLASSES
+                )[0]
         self.assertTrue(counts)
         self.assertLessEqual(max(counts.values()), SEAT_LOCAL_RESIDUE_LIMIT, counts)
         # PR-1 left orchestrator at 25; PR-2 adds exactly 3 (unit, enable-observe, decommission);
@@ -708,7 +718,8 @@ class ResidueBudgetTests(PeriodicCase):
         # T-5473/T-5474 add the residue quarantine and the workspace-trust op (orchestrator 31 of 32)
         # T-5608 admits the residue quarantine (files.seat_root): it leaves the residue (30 of 32)
         # T-5633: orchestrator's binding declares legacy_units: [ho-resumer], so it keeps the decommission (30)
-        self.assertEqual(counts["orchestrator"], 30, counts)
+        # T-5480: the codex shell-box hook op is residue on every seat with a codex runtime (orchestrator 31 of 32)
+        self.assertEqual(counts["orchestrator"], 31, counts)
 
 
 if __name__ == "__main__":

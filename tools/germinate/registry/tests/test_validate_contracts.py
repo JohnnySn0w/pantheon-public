@@ -202,7 +202,15 @@ def test_external_pinned_row_without_resolver_fails_closed(tmp_path):
     assert "no resolver is configured" in _msgs(findings)
 
 
+def _pin_repos_yaml(root: Path) -> None:
+    """T-5113: a resolver is only consulted for a repo whose repos.yaml row carries the ratified pin."""
+    (root / "repos.yaml").write_text(
+        yaml.safe_dump({"repos": [{"name": "echo-prismatic", "revision": F.REVISION}]}), encoding="utf-8"
+    )
+
+
 def test_external_pinned_row_resolves_and_is_checked(tmp_path):
+    _pin_repos_yaml(tmp_path)
     ext = tmp_path / "ext"
     ext.mkdir()
     path, digest = H.write_contract(ext, "comp-a")
@@ -213,6 +221,7 @@ def test_external_pinned_row_resolves_and_is_checked(tmp_path):
 
 
 def test_external_module_absent_at_revision_is_an_error(tmp_path):
+    _pin_repos_yaml(tmp_path)
     assert "has no pantheon-component.yaml" in _msgs(check_contracts(_external_doc("sha256:" + "a" * 64), tmp_path, _Resolver({})))
 
 

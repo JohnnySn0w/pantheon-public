@@ -18,7 +18,10 @@ Heuristic tradeoff: `is_decision_shaped` is deliberately loose. A false positive
 the HO a one-line dismissal; a missed ruling is a lost throughline datum and a future
 needless interruption of the operator. When in doubt, flag.
 
-Scope: the account running the sweep (orchestrator). Other seats' sessions are out of scope.
+Scope (T-5054): any Telegram-facing seat. `--seat` names the seat (default orchestrator) and
+`--harness` its session format (claude jsonl under ~/.claude/projects, or codex rollout
+jsonl under ~/.codex/sessions). Non-orchestrator ids are keyed `<seat>:<id>` so message ids from
+different bots never collide; orchestrator stays bare (existing register rows and state).
 """
 from __future__ import annotations
 
@@ -48,7 +51,16 @@ _VOCAB = re.compile(
 _LEADING = re.compile(r"^\W*(yes|yep|yeah|no|nope)\b", re.I)
 _ACKS = {"gotcha", "ok", "okay", "kk", "k", "thanks", "thank you", "thx", "ty", "nice", "lol",
          "cool", "got it", "great", "np", "haha", "lmao"}
-_COVER_RE = re.compile(r"TGs?\s*(\d+(?:\s*[/,&]\s*\d+)*)")
+_ID = r"(?:[A-Za-z][\w-]*:)?\d+"
+_COVER_RE = re.compile(rf"TGs?\s*({_ID}(?:\s*[/,&]\s*{_ID})*)")
+_COVER_ITEM = re.compile(_ID)
+_CODEX_HEADER = re.compile(
+    r"\[inbound Telegram DM from the operator \| chat_id=(\d+) \| message_id=(\d+)\][ \t]*(.*)", re.S)
+# Reply-instructions suffix the poller appends to every injection (poller.py wrap(), `suffix`).
+_CODEX_SUFFIX = re.compile(
+    r"\s*\(Reply via the telegram MCP `reply` tool with chat_id=\"\d+\"\. For attachments, call the "
+    r"telegram MCP `download_attachment` tool with attachment_file_id, then read the returned "
+    r"local path\.\)\s*$")
 
 
 def _is_pure_ack(text: str) -> bool:
@@ -72,14 +84,25 @@ def is_decision_shaped(text: str, prior_ask: str) -> tuple[bool, str]:
 
 
 def covered_ids(register_text: str) -> set[str]:
-    """Message ids cited in the register as `TG 1`, `TG1`, or `TG 1/2` lists."""
+    """Message ids cited in the register as `TG 1`, `TG1`, or `TG 1/2` lists.
+
+    Seat-keyed forms (`TG recovery:1`, `TGs recovery:1/recovery:2`) yield the keyed id only.
+    """
     out: set[str] = set()
     for m in _COVER_RE.finditer(register_text):
-        out.update(re.findall(r"\d+", m.group(1)))
+        out.update(_COVER_ITEM.findall(m.group(1)))
     return out
 
 
-def _scan_file(path: Path) -> list[dict]:
+def _key(seat: str, mid: str) -> str:
+    return mid if seat == "orchestrator" else f"{seat}:{mid}"
+
+
+def _id_sort(v: str) -> tuple:
+    return (0, int(v), "") if v.isdigit() else (1, 0, v)
+
+
+def _scan_file(path: Path, chat_id: str = OPERATOR_CHAT_ID) -> list[dict]:
     msgs: list[dict] = []
     prior_ask = ""
     with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -103,38 +126,97 @@ def _scan_file(path: Path) -> list[dict]:
                 continue
             for parsed in tin.inbound_messages_from_obj(obj):
                 a = parsed["attrs"]
-                if a.get("chat_id") != OPERATOR_CHAT_ID or not a.get("message_id"):
+                if a.get("chat_id") != chat_id or not a.get("message_id"):
                     continue
                 msgs.append({"id": a["message_id"], "ts": a.get("ts", ""),
                              "text": parsed["body"], "prior_ask": prior_ask})
     return msgs
 
 
-def extract_messages(projects_root: Path, since: float, now: float) -> list[dict]:
-    """the operator's inbound messages with ts in [since, now+skew], deduped by id.
+def _codex_text(payload: dict, kind: str) -> str:
+    parts = [b.get("text") for b in payload.get("content") or []
+             if isinstance(b, dict) and b.get("type") == kind and isinstance(b.get("text"), str)]
+    return "\n".join(parts)
 
-    Raises OSError if projects_root is unreadable; single unreadable files are skipped.
-    """
-    ceiling = now + tin.MAX_FUTURE_SKEW_SECONDS
-    seen: dict[str, dict] = {}
-    for project in sorted(projects_root.iterdir()):
+
+def _scan_codex_file(path: Path, chat_id: str = OPERATOR_CHAT_ID) -> list[dict]:
+    """Codex rollout: poller header at the START of a user input_text (poller.py)."""
+    msgs: list[dict] = []
+    prior_ask = ""
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if "message" not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            payload = obj.get("payload") if isinstance(obj, dict) else None
+            if (obj.get("type") != "response_item" or not isinstance(payload, dict)
+                    or payload.get("type") != "message"):
+                continue
+            if payload.get("role") == "assistant":
+                text = _codex_text(payload, "output_text")
+                if text:
+                    prior_ask = text[:PRIOR_ASK_MAX]
+                continue
+            if payload.get("role") != "user":
+                continue
+            for block in payload.get("content") or []:
+                text = block.get("text") if isinstance(block, dict) else None
+                m = _CODEX_HEADER.match(text) if isinstance(text, str) else None
+                if m and m.group(1) == chat_id:
+                    msgs.append({"id": m.group(2), "ts": obj.get("timestamp", ""),
+                                 "text": _CODEX_SUFFIX.sub("", m.group(3)).strip(), "prior_ask": prior_ask})
+    return msgs
+
+
+def _session_files(root: Path, harness: str, since: float) -> list[Path]:
+    """Candidate session files with mtime >= since. Raises OSError if root is unreadable."""
+    if harness == "codex":
+        if not root.is_dir():
+            raise NotADirectoryError(str(root))
+        found = []
+        for p in sorted(root.rglob("rollout-*.jsonl")):
+            try:
+                if p.stat().st_mtime >= since:
+                    found.append(p)
+            except OSError:
+                continue
+        return found
+    found = []
+    for project in sorted(root.iterdir()):
         try:
             if not project.is_dir():
                 continue
-            files = [p for p in project.glob("*.jsonl") if p.stat().st_mtime >= since]
+            found.extend(sorted(p for p in project.glob("*.jsonl") if p.stat().st_mtime >= since))
         except OSError:
             continue
-        for path in sorted(files):
-            try:
-                found = _scan_file(path)
-            except OSError:
+    return found
+
+
+def extract_messages(projects_root: Path, since: float, now: float, *, harness: str = "claude",
+                     seat: str = "orchestrator", chat_id: str = OPERATOR_CHAT_ID) -> list[dict]:
+    """the operator's inbound messages with ts in [since, now+skew], deduped by id.
+
+    Ids are seat-keyed (see `_key`). Raises OSError if projects_root is unreadable;
+    single unreadable files are skipped.
+    """
+    ceiling = now + tin.MAX_FUTURE_SKEW_SECONDS
+    scan = _scan_codex_file if harness == "codex" else _scan_file
+    seen: dict[str, dict] = {}
+    for path in _session_files(projects_root, harness, since):
+        try:
+            found = scan(path, chat_id)
+        except OSError:
+            continue
+        for m in found:
+            ts = tin._iso_to_unix(m["ts"])
+            m["id"] = _key(seat, m["id"])
+            if ts is None or ts < since or ts > ceiling or m["id"] in seen:
                 continue
-            for m in found:
-                ts = tin._iso_to_unix(m["ts"])
-                if ts is None or ts < since or ts > ceiling or m["id"] in seen:
-                    continue
-                m["unix"] = ts
-                seen[m["id"]] = m
+            m["unix"] = ts
+            seen[m["id"]] = m
     return sorted(seen.values(), key=lambda m: m["unix"])
 
 
@@ -150,7 +232,7 @@ def _save_state(path: Path, state: dict) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".state-")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump({k: sorted(v, key=int) for k, v in state.items()}, f)
+            json.dump({k: sorted(v, key=_id_sort) for k, v in state.items()}, f)
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except BaseException:
@@ -180,16 +262,18 @@ def _write_digest(state_dir: Path, date: str, cands: list[dict]) -> Path:
     return path
 
 
-def _file_ticket(cands: list[dict], digest: Path, date: str) -> None:
+def _file_ticket(cands: list[dict], digest: Path, date: str, seat: str = "orchestrator") -> None:
     ids = "\n".join(f"- TG {c['id']} ({_utc(c['unix'])})" for c in cands)
     ask = (f"{len(cands)} the operator message(s) look like rulings with no row in "
            f"notes/operator-decision-register.md:\n{ids}\n\n"
            f"Full text is in the local digest (not in git): {digest}\n\n"
            "Triage: for each id, either add a register row (cite `TG <id>`) or dismiss it "
            "as not a ruling; then resolve this ticket.")
-    cmd = [sys.executable, str(REPO / "tools" / "ticket.py"), "file", "--automated-filer", "operator_decision_sweep", "--requester", "orchestrator",
-           "--target", "role:engineering_orchestrator", "--title",
-           f"decision-register sweep {date}: {len(cands)} uncovered the operator rulings",
+    cmd = [sys.executable, str(REPO / "tools" / "ticket.py"), "file", "--automated-filer", "operator_decision_sweep", "--requester", seat,
+           "--target", "role:engineering_orchestrator" if seat == "orchestrator" else "role:head_engineering_orchestrator",
+           "--title",
+           f"decision-register sweep {date}: {len(cands)} uncovered the operator rulings"
+           + ("" if seat == "orchestrator" else f" ({seat})"),
            "--labels", "decision-register,sweep", "--stale-after", "14d",
            "--project-id", "null",
            "--nearest-intent-ref", "maintenance:decision-register",
@@ -203,7 +287,11 @@ def _file_ticket(cands: list[dict], digest: Path, date: str) -> None:
 def main(argv: list[str] | None = None, now: float | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--since-hours", type=float, default=26)
-    ap.add_argument("--projects-root", type=Path, default=Path.home() / ".claude" / "projects")
+    ap.add_argument("--projects-root", "--sessions-root", dest="projects_root", type=Path, default=None,
+                    help="session dir (default: ~/.claude/projects, or ~/.codex/sessions for codex)")
+    ap.add_argument("--seat", default="orchestrator", help="seat whose sessions are swept (default orchestrator)")
+    ap.add_argument("--harness", choices=("claude", "codex"), default="claude")
+    ap.add_argument("--chat-id", default=OPERATOR_CHAT_ID)
     ap.add_argument("--state-dir", type=Path,
                     default=Path.home() / ".local" / "state" / "pantheon" / "decision-sweep")
     ap.add_argument("--register", type=Path, default=REPO / "notes" / "operator-decision-register.md")
@@ -212,8 +300,10 @@ def main(argv: list[str] | None = None, now: float | None = None) -> int:
     args = ap.parse_args(argv)
 
     now = time.time() if now is None else now
+    root = args.projects_root or (Path.home() / (".codex/sessions" if args.harness == "codex" else ".claude/projects"))
     try:
-        msgs = extract_messages(args.projects_root, now - args.since_hours * 3600, now)
+        msgs = extract_messages(root, now - args.since_hours * 3600, now, harness=args.harness,
+                                seat=args.seat, chat_id=args.chat_id)
         covered_text = args.register.read_text(encoding="utf-8")
     except OSError as e:
         print(f"decision-sweep: error: {e}", file=sys.stderr)
@@ -246,7 +336,7 @@ def main(argv: list[str] | None = None, now: float | None = None) -> int:
         digest = _write_digest(args.state_dir, date, cands)
         if not args.no_file:
             try:
-                _file_ticket(cands, digest, date)
+                _file_ticket(cands, digest, date, args.seat)
             except (RuntimeError, OSError) as e:
                 print(f"decision-sweep: error: {e}", file=sys.stderr)
                 return 1

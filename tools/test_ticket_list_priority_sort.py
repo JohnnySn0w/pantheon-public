@@ -48,6 +48,7 @@ def _write_ticket(
     labels: list[str] | None = None,
     depends_on: list[str] | None = None,
     retargeted_at: str | None = None,
+    tier_rank: int | str | None = None,
 ) -> None:
     """Write a well-formed ticket file for tests."""
     fm_lines = [
@@ -66,6 +67,8 @@ def _write_ticket(
     )
     if labels:
         fm_lines.append(f"labels: [{', '.join(labels)}]")
+    if tier_rank is not None:
+        fm_lines.append(f"tier_rank: {tier_rank}")
     fm_lines.append("---")
 
     body_lines = [
@@ -170,6 +173,78 @@ class TestSecondarySort(_PriorityListTestBase):
         # T-0002 retargeted EARLIER -> sorts first despite the higher ticket id.
         self.assertLess(self._line_index(out, "T-0002"), self._line_index(out, "T-0001"))
 
+
+class TestTierRank(_PriorityListTestBase):
+    def test_explicit_rank_sorts_before_unranked_peer_then_fifo(self) -> None:
+        self._set_priority_list("priority-2:\n  - echo\n")
+        self._seed(
+            tid="T-0001", labels=["echo"], tier_rank=10,
+            created="2026-08-20T00:00:00Z",
+        )
+        self._seed(
+            tid="T-0002", labels=["echo"],
+            created="2026-08-10T00:00:00Z",
+        )
+        self._seed(
+            tid="T-0003", labels=["echo"], tier_rank=20,
+            created="2026-08-01T00:00:00Z",
+        )
+
+        rc, out, err = self._run_list()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        self.assertLess(self._line_index(out, "T-0001"), self._line_index(out, "T-0003"))
+        self.assertLess(self._line_index(out, "T-0003"), self._line_index(out, "T-0002"))
+
+    def test_label_tier_remains_authoritative_over_extreme_ticket_rank(self) -> None:
+        self._set_priority_list("priority-1:\n  - p1\npriority-2:\n  - p2\n")
+        self._seed(tid="T-0001", labels=["p1"], created="2026-08-20T00:00:00Z")
+        self._seed(
+            tid="T-0002", labels=["p2"], tier_rank=-999999,
+            created="2026-08-10T00:00:00Z",
+        )
+
+        rc, out, _ = self._run_list()
+
+        self.assertEqual(rc, 0)
+        self.assertLess(self._line_index(out, "T-0001"), self._line_index(out, "T-0002"))
+
+    def test_absent_or_invalid_rank_is_inert_and_fifo_still_breaks_tie(self) -> None:
+        self._set_priority_list("priority-1:\n  - alpha\n")
+        self._seed(
+            tid="T-0001", labels=["alpha"], tier_rank="not-an-int",
+            created="2026-08-20T00:00:00Z",
+        )
+        self._seed(
+            tid="T-0002", labels=["alpha"],
+            created="2026-08-10T00:00:00Z",
+        )
+        self._seed(
+            tid="T-0003", labels=["alpha"], tier_rank="9" * 4301,
+            created="2026-08-01T00:00:00Z",
+        )
+
+        rc, out, err = self._run_list()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        self.assertLess(self._line_index(out, "T-0003"), self._line_index(out, "T-0002"))
+        self.assertLess(self._line_index(out, "T-0002"), self._line_index(out, "T-0001"))
+
+    def test_explain_reports_ticket_rank_and_complete_sort_key(self) -> None:
+        self._set_priority_list("priority-2:\n  - echo\n")
+        self._seed(tid="T-0001", labels=["echo"], tier_rank=10)
+
+        rc, out, err = self._run_list(explain_priority="T-0001")
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(err, "")
+        self.assertIn("tier_rank: 10", out)
+        self.assertIn(
+            "(effective_rank, tier_rank, effective_queue_ts, ticket_id)", out
+        )
+
     def test_created_fallback_when_never_retargeted(self) -> None:
         self._set_priority_list("priority-1:\n  - alpha\n")
         self._seed(tid="T-0001", labels=["alpha"], created="2026-08-20T00:00:00Z")
@@ -271,6 +346,23 @@ class TestSortBypass(_PriorityListTestBase):
         self._seed(tid="T-0001", labels=["alpha"], retargeted_at="2026-08-20T00:00:00Z")
         self._seed(tid="T-0002", retargeted_at="2026-08-10T00:00:00Z")
         rc, out, _ = self._run_list(sort="retargeted")
+        self.assertEqual(rc, 0)
+        self.assertLess(self._line_index(out, "T-0002"), self._line_index(out, "T-0001"))
+        self.assertEqual(self._health_lines(), [])
+
+    def test_sort_created_ignores_tier_rank(self) -> None:
+        self._set_priority_list("priority-1:\n  - alpha\n")
+        self._seed(
+            tid="T-0001", labels=["alpha"], tier_rank=-100,
+            created="2026-08-20T00:00:00Z",
+        )
+        self._seed(
+            tid="T-0002", labels=["alpha"],
+            created="2026-08-10T00:00:00Z",
+        )
+
+        rc, out, _ = self._run_list(sort="created")
+
         self.assertEqual(rc, 0)
         self.assertLess(self._line_index(out, "T-0002"), self._line_index(out, "T-0001"))
         self.assertEqual(self._health_lines(), [])

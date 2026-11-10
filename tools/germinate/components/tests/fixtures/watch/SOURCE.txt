@@ -1,0 +1,7 @@
+Byte copies of committed repo files at c193871a38b48452939631f5b0eb84415e79e483 (T-5964 base sha); git blob ids equal:
+  systemd/<stem>.{timer,service}  <- tools/systemd/<stem>.{timer,service} (pantheon-watch, pantheon-knowledge-sweep, pantheon-watch-digest)
+  topics.md                       <- knowledge/watch/topics.md (blob 8a1a2e3c13092c47016c41f02c8c949222a88ee1)
+  reports/2026-11-02/day-index.md <- knowledge/watch/reports/2026-11-02/README.md (blob 6c12763404165980d0a0fbb227dbe764fcba449b; renamed: README paths are worker-guarded)
+                                     (reports/ is also the tree the W6 byte-sequence scan reads in tests)
+  landing-commit.tsv              <- git log -1 --format='%H%x09%an%x09%s' c193871a38 -- knowledge/watch/reports/2026-11-02 (captured metadata, not a file copy)
+Tests read these files only; nothing reads a seat home or /tmp.

@@ -1,0 +1,31 @@
+{
+  "agent": "<seat>",
+  "cause": "start-reconcile",
+  "ended_at": "2026-11-03T17:16:01.533572Z",
+  "handoff_file": "/home/<seat>/HANDOFF.md",
+  "handoff_fresh": true,
+  "handoff_mtime": "2026-11-03T17:15:55.963663Z",
+  "harness": "claude",
+  "model": "claude-opus-5-5",
+  "native_transcript": {
+    "bytes": 10586048,
+    "candidates": 1,
+    "path": "/home/<seat>/.claude/projects/-home-<seat>-pantheon-config/979b57ff-9f3b-4291-aed8-4526b6423330.jsonl",
+    "session_id": "979b57ff-9f3b-4291-aed8-4526b6423330",
+    "sha256": "f0849b365a059d702cb94bf2d135e0b9b226ec312d750701d40ea14ed544de79"
+  },
+  "paired_with_swap_entry": false,
+  "pane_first_stamp": null,
+  "pane_log": "absent",
+  "persona": "<seat>",
+  "profile": "interactive-subscription",
+  "rt_started_at": "2026-11-03T01:16:24.050065Z",
+  "schema": "pantheon-session-chronicle/v1",
+  "session_key": "6cc51311c3b852b7728866e9",
+  "session_started_at": "2026-11-03T01:16:24.050065Z",
+  "tmux_target": "<seat>-main:harness.0",
+  "writer": {
+    "entrypoint": "runtime_controller:start",
+    "pid": 1903127
+  }
+}

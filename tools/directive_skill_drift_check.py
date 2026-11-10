@@ -13,8 +13,10 @@ Exit 0 = in sync; exit 1 = drift (skill missing one or more directive ids).
 
 Since ORG-091 (T-4750) the canonical skill lives in this repo's harness/claude/; a
 fork may carry it in a separate harness-config repo instead. Skill path resolves in
-order: --skill arg, $ORG_SKILL_PATH, then the known fallbacks, in-repo harness/claude
-first (T-4763: the old ~/claude-config clone is frozen and can go stale).
+order: --skill arg, else $ORG_SKILL_PATH, else the known fallbacks (in-repo harness/claude,
+then ~/.claude/skills). A configured path is never overridden: if it is missing the check
+SKIPs, it does not fall through to a fallback (T-4842). The old ~/claude-config clone is
+not consulted (frozen, goes stale: T-4763; retired: T-4750).
 
 Decoupling contract (ORG-039 §4): a fork of pantheon-config WITHOUT a harness-config
 repo configured must not half-break. So:
@@ -35,9 +37,7 @@ DIRECTIVES = os.path.join(REPO, "rulebook", "directives.md")
 
 SKILL_FALLBACKS = [
     os.path.join(REPO, "harness", "claude", "skills", "pantheon-org-discipline", "SKILL.md"),
-    os.path.expanduser("~/claude-config/skills/pantheon-org-discipline/SKILL.md"),
     os.path.expanduser("~/.claude/skills/pantheon-org-discipline/SKILL.md"),
-    os.path.join(REPO, "claude-config", "skills", "pantheon-org-discipline", "SKILL.md"),
 ]
 
 DID = re.compile(r"\bD(\d+)\b")
@@ -68,10 +68,14 @@ def resolve_skill(arg):
     can distinguish "configured but missing" (actionable) from "not configured" (clean fork).
     """
     configured = arg or os.environ.get("ORG_SKILL_PATH")
-    for cand in [arg, os.environ.get("ORG_SKILL_PATH"), *SKILL_FALLBACKS]:
-        if cand and os.path.exists(cand):
-            return cand, configured
-    return None, configured
+    if configured:
+        # Configured wins outright. Missing => no path (caller SKIPs); never fall through to a
+        # fallback, which would report OK for a skill file the seat does not actually load.
+        return (configured if os.path.exists(configured) else None), configured
+    for cand in SKILL_FALLBACKS:
+        if os.path.exists(cand):
+            return cand, None
+    return None, None
 
 
 def main():
@@ -88,8 +92,10 @@ def main():
         if configured:
             # A harness skill path WAS configured but the file is absent — actionable.
             print(f"[directive-skill-drift] SKIP: configured harness skill path not found: "
-                  f"{configured}\n  The drift check is decoupled (ORG-039 §4) — it only runs "
-                  f"when the harness-config skill is present. Fix the path or unset it.")
+                  f"{configured}\n  Set via --skill or $ORG_SKILL_PATH; fallbacks are NOT used "
+                  f"when a path is configured. Fix the path, or unset both to use the in-repo "
+                  f"harness/claude skill. (Decoupled per ORG-039 §4: the check only runs when the "
+                  f"skill is present.)")
         else:
             # No harness configured — a clean fork without claude-code-config. Skip cleanly.
             print("[directive-skill-drift] SKIP: no harness-config repo configured "

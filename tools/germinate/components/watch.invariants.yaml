@@ -1,0 +1,27 @@
+# watch verify invariant list (T-5964).
+#
+# CURRENT: specialist (steward) + Recovery D15 sign-offs complete 2026-11-02 (T-5964; specialist mail 01793645704340924287, Recovery mail 01793644443095461953); flipped by T-5984.
+# Evaluated by watch_handlers.VERIFY through the engine verify leg (T-5135 S1),
+# over repo-side evidence only (watch_evidence.collect): no seat but
+# claude-research can read the pipeline's units, state or journal. Bound to the
+# contract's legs.verify by invariant_list_id + invariant_list_digest. There is
+# no Health1 emitter (ORG-081 D-11 a/c, T-5102); this is the vocabulary it will
+# report. The digest is list_digest() over {id, invariants}.
+schema: pantheon-invariant-list/v0
+id: org.pantheon.watch/v1
+status: CURRENT
+co_author: specialist (steward) + recovery, D15
+signoff: complete 2026-11-02
+invariants:
+  - id: W1-templates-present
+    check: all six unit templates (pantheon-watch, pantheon-knowledge-sweep, pantheon-watch-digest; .timer + .service) exist under tools/systemd/
+  - id: W2-landed-run-fresh
+    check: the newest committed day index under knowledge/watch/reports/ (a real-date directory matching its header) is at most 2 days old; more than 2 days is degraded, more than 8 days is failed (observed landing cadence, watch.py FRESH_DEGRADED_DAYS / FRESH_FAILED_DAYS)
+  - id: W3-landed-by-pipeline-account
+    check: the commit that landed the newest day index is authored by claude-research and the index has an ok row
+  - id: W4-topics-parse
+    check: watch_runner.parse_topics reads knowledge/watch/topics.md with no warnings and at least one active topic
+  - id: W5-latest-day-no-fail
+    check: every topic row in the newest day index is ok (a non-ok row reports degraded, not unhealthy)
+  - id: W6-reports-byte-sequence-clean
+    check: no bare form of the forbidden byte sequence anywhere in the checked-out tree under knowledge/watch/reports/** (tools._git_utils._hermes_scan_dir per directory; HEAD-tree scan is T-5972); failing is failed

@@ -1,7 +1,7 @@
 ---
 aliases: [ORG-005]
 title: "MCP channel reliability: diagnosis-first fix path"
-status: Ratified 2026-05-04
+status: "Ratified 2026-05-04 by the operator (Telegram msg_448, Path A); Retired since 2026-05-05 (Path A reversed by the operator's strategic-pivot directive, Telegram msg_654-656, T-0091; T-0073 closed-as-abandoned; bridge decommissioned 2026-06-04, T-0767, Telegram msg 3257)"
 date: 2026-05-04
 # re_evaluate: machine-checkable mirror of this ADR's inline re-eval prose,
 # consumed by tools/adr_reeval_walk.py (T-2527). Backfilled per T-2530.
@@ -15,7 +15,7 @@ build_disposition: built
 ---
 # ORG-005 — MCP channel reliability: diagnosis-first fix path
 
-**Status:** Ratified v2 2026-05-04 by the operator (Telegram, msg_448 — "Path A"). v1 superseded in-place post-Recovery-correction.
+**Status:** Ratified v2 2026-05-04 by the operator (Telegram, msg_448 — "Path A"); Retired since 2026-05-05 (Path A reversed by the operator's strategic-pivot directive, Telegram msg_654-656, T-0091; T-0073 closed-as-abandoned; bridge decommissioned 2026-06-04, T-0767, Telegram msg 3257). v1 superseded in-place post-Recovery-correction.
 **HITL:** Ratified.
 **Date:** 2026-05-04.
 **Justifies via:** P1 (architecture over policy — fix root cause, not symptom), P3 (decisions justify upward), P4 (traceability — record why we chose what we chose, per msg_442).

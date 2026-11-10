@@ -54,6 +54,38 @@ persona's LATER files this cycle so order is preserved); a malformed/unknown-sch
 to ``<drop>/rejected/`` and paged (never silently deleted, never wedges the queue); a missing drop
 dir is a clean no-op; hidden writer temp files older than an hour are reaped.
 
+Drop records: TWO accepted shapes, side by side (T-5999, ORG-076 BT5.0).
+  * schema 1, kind ``quota-probe-sample`` (``tools/quota_probe_detector.py``): the BT2/BT3a/BT3b path,
+    byte-for-byte unchanged -- persona enrollment ``personas``/``seen``, ``not-measured`` freshness-only
+    records, ``qpd.spec_for`` routing. It is not migrated.
+  * schema 2, kind ``org076-detector-sample``: the generic envelope. Body JSON: schema, kind, detector,
+    domain_key, persona, account, verdict (healthy|broken|unknown), fault_id (null iff healthy), detail
+    (<= 1000 chars), run_id|null, sample_id, sampled_at. Same file-name, writer (tmp -> fsync -> link,
+    no-clobber) and dedupe-key (run_id, else sample_id) contract as schema 1. The runner TRUSTS NOTHING
+    the writer names for routing: ``detector`` must be in the runner-side ``REGISTRY`` (detector ->
+    ``DropDetector``, whose ``spec_for`` builds the ``episode_store.DetectorSpec``); ``domain_key`` must
+    equal the entry's ``domain_key(persona)``; ``fault_id`` must be ``<kind>:<persona>`` with ``kind`` in
+    the entry's ``fault_kinds``; the domain's store slug must not truncate. Anything else -> ``rejected/``
+    + page. Schema-2 records never touch the quota enrollment (``personas``/``seen``); they enroll under
+    ``detectors[<detector>][<persona>] = account`` (reconciled + swept each cycle) and, ONLY if the entry
+    sets ``freshness_unit`` (opt-in), refresh ``detector_seen[<detector>][<persona>]`` for
+    ``org076_sample_freshness.feed_detector``. Registry specs route through
+    ``repair_evidence.REPAIR_CANDIDATES`` (watchman@codex, then recovery@claude: a codex-faulted episode routes
+    other_harness to Recovery, RFC-004 s5 codex row); the harness is fixed per entry. The ingest hold key is
+    still the persona: a held file (busy domain, observe error, unreadable) holds that seat's later files of
+    BOTH shapes this cycle.
+  ROLLOUT ORDER (Recovery steward rule): this runner must be live in the dedicated clone BEFORE any writer emits
+  schema 2 -- an older runner quarantines + pages every schema-2 file. ``REGISTRY`` ships with the mail-delivery
+  (T-6001) and telegram-inbound (T-6000) entries; each further BT5 detector ticket adds its entry, runner-first.
+  KNOWN LIMIT (stated, not fixed): the drop dir is group ``pantheon-shared`` and the accounts ``codex`` and
+  ``codex-fallback`` are NOT in that group, so a detector hosted on a codex account CANNOT write drop files.
+  Such a detector needs a group grant (an operator-gate privilege change) or must report through the ORG-080
+  health collector instead.
+  Rollback of the schema-2 layer: revert it; with an empty registry nothing else changes. If schema-2
+  detectors were enrolled, ``--forget-persona`` each seat FIRST (closes its schema-2 + schema-2 freshness
+  domains), then optionally delete those ``<state_dir>/episode-store/<detector>-*.json`` files and the
+  ``detectors`` / ``detector_seen`` keys of ``org076-runner/state.json`` (an older runner ignores them).
+
 Exit codes: 0 ok; 2 clone/REPO_ROOT mismatch (or a bad ``--forget-persona`` name); 3 guard refusal
 (unit fails -> OnFailure alert, ``unit_failure_alert.py`` cooldown 6h, so a wedged store is a
 persistently failed unit); 4 partial failure (fetch failed, unreadable file, observe/sweep/meta error).
@@ -90,7 +122,8 @@ Seams (BT3b): ``Config.journal`` (a ``org076_sample_freshness.JournalPort``; def
 needs the running account in group ``systemd-journal``) and ``Config.uid_of`` (account -> uid) are the
 only injected ports besides ``es.Ports``; sweeps/meta take everything from ``Ports``/``Config``.
 
-Tests: python3 -m pytest tools/test_org076_store_runner.py tools/test_org076_sample_drop.py
+Tests: python3 -m pytest tools/test_org076_store_runner.py tools/test_org076_sample_drop.py \
+    tools/test_org076_drop_envelope.py
 """
 from __future__ import annotations
 
@@ -116,8 +149,11 @@ if __package__ in (None, ""):
 
 from tools import _episode_corpus, _git_utils  # noqa: E402
 from tools import episode_store as es  # noqa: E402
-from tools import org076_meta, org076_reconciler, org076_sample_freshness  # noqa: E402
+from tools import org076_meta, org076_ports, org076_reconciler, org076_sample_freshness  # noqa: E402
+from tools import org076_mail_delivery as omd  # noqa: E402
+from tools import org076_telegram_inbound as tgi  # noqa: E402
 from tools import quota_probe_detector as qpd  # noqa: E402
+from tools import repair_evidence  # noqa: E402
 
 EXIT_OK, EXIT_MISMATCH, EXIT_REFUSED, EXIT_PARTIAL = 0, 2, 3, 4
 MAX_SAMPLE_BYTES = 64 * 1024
@@ -127,6 +163,14 @@ ACCOUNT_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _KINDS = frozenset((qpd.READ, qpd.CAPPED, qpd.PROBE_ERROR, qpd.CACHED_FAILURE,
                     qpd.PROBE_INVALID, qpd.EVIDENCE_MISMATCH, qpd.NOT_MEASURED))
 _INFLIGHT_SHA_PHASES = (es.LOCAL_COMMIT, es.PUSH_INFLIGHT, es.PUSHED)
+ENVELOPE_SCHEMA = 2
+ENVELOPE_KIND = "org076-detector-sample"
+VERDICTS = ("healthy", "broken", "unknown")
+DETAIL_LIMIT = qpd.DETAIL_LIMIT
+STORE_SLUG_LIMIT = 64          # episode_store.store_path truncates the domain slug here
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")   # detector / fault-kind names: no ':' (keys stay unambiguous)
+_RESERVED_DETECTORS = frozenset((qpd.DETECTOR, org076_sample_freshness.DETECTOR, *org076_meta.DETECTORS))
+_RESERVED_PREFIXES = tuple(sorted(_RESERVED_DETECTORS | {org076_sample_freshness.DOMAIN_PREFIX, org076_meta.DOMAIN}))
 
 
 def _log(msg: str) -> None:
@@ -155,6 +199,7 @@ class Config:
     journal: object = None              # org076_sample_freshness.JournalPort (None => JournalctlPort)
     uid_of: object = None               # account -> uid (None => pwd lookup)
     account: str | None = None          # OS account of THIS runner (meta-detector redactor); None => getpass
+    registry: "dict | None" = None      # detector -> DropDetector (None => module REGISTRY); tests inject
 
 
 @dataclasses.dataclass
@@ -176,6 +221,73 @@ class Report:
         if self.refused:
             return EXIT_REFUSED
         return EXIT_PARTIAL if (self.errors or not self.fetch_ok) else EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# Generic drop-detector registry (T-5999, BT5.0)
+# --------------------------------------------------------------------------- #
+@dataclasses.dataclass(frozen=True)
+class DropDetector:
+    """Runner-side description of one schema-2 drop detector. The runner builds the episode-store
+    ``DetectorSpec`` from this, never from the record."""
+    detector: str
+    subsystem: str
+    harness: str                         # the harness whose fault this detector measures (routing)
+    fault_kinds: frozenset               # fault_id must be "<kind>:<persona>", kind in this set
+    n: int = es.DEFAULT_N
+    m: int = es.DEFAULT_M
+    attempts_budget: int = es.DEFAULT_ATTEMPTS_BUDGET
+    freshness_unit: "str | None" = None  # opt-in: systemd user-unit template containing "{persona}"
+    # T-6001 (BT5a): optional RUNNER-SIDE per-persona seat lookup, persona -> (harness, account) or None.
+    # When set, the harness of the spec is ``seat_for(persona)[0]`` (``harness`` above is only the fallback),
+    # and a record whose persona has no seat, or whose account differs from the seat's, is rejected. The
+    # record never supplies either value. LIMIT: the lookup is static (a seat running its fallback harness
+    # is routed as its primary one); a misclassification only reorders the repair candidates.
+    seat_for: "Callable[[str], tuple | None] | None" = dataclasses.field(default=None, compare=False)
+
+    def __post_init__(self):
+        if not NAME_RE.match(self.detector) or self.detector in _RESERVED_DETECTORS:
+            raise ValueError(f"bad or reserved drop detector name {self.detector!r}")
+        if self.harness not in ("claude", "codex"):
+            raise ValueError(f"{self.detector}: harness must be claude|codex, not {self.harness!r}")
+        if not self.fault_kinds or not all(isinstance(k, str) and NAME_RE.match(k) for k in self.fault_kinds):
+            raise ValueError(f"{self.detector}: fault_kinds must be non-empty names without ':'")
+        if self.freshness_unit is not None and "{persona}" not in self.freshness_unit:
+            raise ValueError(f"{self.detector}: freshness_unit must contain {{persona}}")
+        for r in _RESERVED_PREFIXES:  # T-5999 review: no hyphen-prefix alias of a store-owned domain prefix
+            if r.startswith(self.detector + "-") or self.detector.startswith(r + "-"):
+                raise ValueError(f"{self.detector}: aliases the reserved domain prefix {r!r}")
+
+    def domain_key(self, persona: str) -> str:
+        return f"{self.detector}:{persona}"
+
+    def harness_of(self, persona: str) -> str:
+        seat = self.seat_for(persona) if self.seat_for else None
+        return seat[0] if seat else self.harness
+
+    def spec_for(self, persona: str, account: str) -> es.DetectorSpec:
+        return es.DetectorSpec(
+            detector=self.detector, domain_key=self.domain_key(persona), subsystem=self.subsystem,
+            requester=persona, n=self.n, m=self.m, harness=self.harness_of(persona), account=account,
+            candidates=repair_evidence.REPAIR_CANDIDATES,
+            redactor=repair_evidence.make_default_redactor(account), attempts_budget=self.attempts_budget)
+
+
+# BT5 detector tickets add entries here (runner-first rollout, see the module docstring). T-6001: the
+# mail-delivery staleness detector (writer: tools/org076_mail_delivery.py, dark by default).
+REGISTRY: "dict[str, DropDetector]" = {
+    omd.DETECTOR: DropDetector(
+        detector=omd.DETECTOR, subsystem=omd.SUBSYSTEM, harness="claude", fault_kinds=omd.FAULT_KINDS,
+        n=omd.N, m=omd.M, seat_for=omd.seat_for),
+    # T-6000: Telegram inbound liveness (writer: tools/org076_telegram_inbound.py, dark by default).
+    tgi.DETECTOR: DropDetector(
+        detector=tgi.DETECTOR, subsystem=tgi.SUBSYSTEM, harness="claude", fault_kinds=tgi.FAULT_KINDS,
+        n=tgi.N, m=tgi.M, seat_for=tgi.seat_for),
+}
+
+
+def _registry(cfg: "Config") -> "dict[str, DropDetector]":
+    return REGISTRY if cfg.registry is None else cfg.registry
 
 
 # --------------------------------------------------------------------------- #
@@ -337,7 +449,65 @@ def guard(cfg: Config, repo: Path, git=_git_utils) -> "tuple[str | None, bool]":
 # --------------------------------------------------------------------------- #
 # Drop-dir ingest
 # --------------------------------------------------------------------------- #
-def parse_sample(raw: bytes) -> dict:
+def _slug_truncates(domain_key: str) -> bool:
+    return len(re.sub(r"[^a-z0-9]+", "-", domain_key.lower()).strip("-")) > STORE_SLUG_LIMIT
+
+
+def _parse_envelope(d: dict, registry: dict) -> dict:
+    """Schema 2 (T-5999). Every routing-relevant field is checked against the registry entry."""
+    entry = registry.get(d.get("detector")) if isinstance(d.get("detector"), str) else None
+    if entry is None:
+        raise SampleError(f"unknown detector {d.get('detector')!r}")
+    persona = d.get("persona")
+    if not isinstance(persona, str) or not qpd.PERSONA_RE.match(persona):
+        raise SampleError("bad persona")
+    if not isinstance(d.get("account"), str) or not ACCOUNT_RE.match(d["account"]):
+        raise SampleError("bad account")
+    if entry.seat_for is not None:  # T-6001: harness + account are the runner's own knowledge, not the record's
+        seat = entry.seat_for(persona)
+        if seat is None:
+            raise SampleError(f"no seat for persona {persona!r} on this runner")
+        if d["account"] != seat[1]:
+            raise SampleError(f"account {d['account']!r} is not this runner's account {seat[1]!r} for {persona!r}")
+    if d.get("domain_key") != entry.domain_key(persona):
+        raise SampleError(f"domain_key {d.get('domain_key')!r} is not {entry.domain_key(persona)!r}")
+    if _slug_truncates(entry.domain_key(persona)) or (
+            entry.freshness_unit and _slug_truncates(org076_sample_freshness.domain_key(persona, entry.detector))):
+        raise SampleError("domain key too long for the store (slug would truncate)")
+    verdict, fid = d.get("verdict"), d.get("fault_id")
+    if verdict not in VERDICTS:
+        raise SampleError(f"bad verdict {verdict!r}")
+    if verdict == "healthy":
+        if fid is not None:
+            raise SampleError("healthy verdict carries a fault_id")
+    else:
+        kind, sep, who = fid.rpartition(":") if isinstance(fid, str) else ("", "", "")
+        if not sep or who != persona or kind not in entry.fault_kinds:
+            raise SampleError(f"bad fault_id {fid!r} for {entry.detector}/{persona}")
+    detail = d.get("detail", "")
+    if not isinstance(detail, str) or len(detail) > DETAIL_LIMIT:
+        raise SampleError("bad detail")
+    rid = d.get("run_id")
+    if rid is not None and (not isinstance(rid, str) or not rid or len(rid) > 128):
+        raise SampleError("bad run_id")
+    sid = d.get("sample_id")
+    if not isinstance(sid, str) or not sid or len(sid) > 64:
+        raise SampleError("bad sample_id")
+    if not isinstance(d.get("sampled_at"), str):
+        raise SampleError("bad sampled_at")
+    return d
+
+
+def _envelope_verdict(d: dict):
+    if d["verdict"] == "healthy":
+        return es.Healthy()
+    evidence = (f"detector: {d['detector']}\nverdict: {d['verdict']}\nrun_id: {d.get('run_id')}\n"
+                f"persona: {d['persona']}\nsampled_at: {d['sampled_at']}\ndetail: {d.get('detail', '')}\n")
+    return (es.Broken if d["verdict"] == "broken" else es.Unknown)(d["fault_id"], evidence)
+
+
+def parse_sample(raw: bytes, registry: "dict | None" = None) -> dict:
+    """Schema 1 (quota probe, unchanged) or schema 2 (generic envelope; ``registry`` None => REGISTRY)."""
     if len(raw) > MAX_SAMPLE_BYTES:
         raise SampleError("sample larger than 64KB")
     try:
@@ -346,6 +516,8 @@ def parse_sample(raw: bytes) -> dict:
         raise SampleError(f"not JSON: {exc}") from exc
     if not isinstance(d, dict):
         raise SampleError("not a JSON object")
+    if d.get("schema") == ENVELOPE_SCHEMA and d.get("kind") == ENVELOPE_KIND:
+        return _parse_envelope(d, REGISTRY if registry is None else registry)
     if d.get("schema") != qpd.SAMPLE_SCHEMA or d.get("kind") != qpd.SAMPLE_KIND:
         raise SampleError(f"unknown schema/kind: {d.get('schema')!r}/{d.get('kind')!r}")
     if d.get("detector") != qpd.DETECTOR:
@@ -430,15 +602,35 @@ def ingest(cfg: Config, ports: es.Ports, state: dict, report: Report,
                        f"{path.name}: {exc}")
             continue
         try:
-            sample = parse_sample(raw)
+            sample = parse_sample(raw, _registry(cfg))
         except SampleError as exc:
             who = _persona_from_name(path.name)
-            if who in state["personas"]:
+            if who in state["personas"] and not _identifiably_not_schema1(raw):
                 state["seen"][who] = seen_now
                 dirty = True
             _reject(cfg, state, ports, path, str(exc), report)
             continue
         persona = sample["persona"]
+        if sample["schema"] == ENVELOPE_SCHEMA:  # T-5999: never touches the quota personas/seen maps
+            entry = _registry(cfg)[sample["detector"]]
+            alias = _alias_conflict(cfg, entry, persona)
+            if alias:
+                _reject(cfg, state, ports, path, alias, report)
+                continue
+            enrolled = state.setdefault("detectors", {}).setdefault(entry.detector, {})
+            if entry.freshness_unit:
+                state.setdefault("detector_seen", {}).setdefault(entry.detector, {})[persona] = seen_now
+                dirty = True
+            if persona in held:
+                report.kept += 1
+                continue
+            if enrolled.get(persona) != sample["account"]:
+                enrolled[persona] = sample["account"]
+                _save_state(cfg, state)
+            _observe_and_unlink(cfg, ports, state, report, path, persona, held, kill_hook,
+                                lambda e=entry, s=sample: e.spec_for(s["persona"], s["account"]),
+                                lambda s=sample: _envelope_verdict(s), sample.get("run_id") or sample["sample_id"])
+            continue
         state["seen"][persona] = seen_now  # freshness: a drop record of ANY kind arrived (BT3b)
         dirty = True
         if sample["outcome_kind"] == qpd.NOT_MEASURED:
@@ -457,30 +649,106 @@ def ingest(cfg: Config, ports: es.Ports, state: dict, report: Report,
             state["personas"][persona] = sample["account"]
             _save_state(cfg, state)
         outcome = qpd.ProbeOutcome(sample["outcome_kind"], sample.get("run_id"), sample.get("detail", ""))
-        try:
-            result = es.observe(qpd.spec_for(binding), qpd.outcome_to_verdict(outcome, persona), ports=ports,
-                                state_dir=cfg.state_dir, sample_key=sample.get("run_id") or sample["sample_id"])
-        except Exception as exc:  # noqa: BLE001 -- keep the file; one bad domain must not stop the rest
-            held.add(persona)
-            report.kept += 1
-            report.errors.append(f"observe {path.name}: {type(exc).__name__}: {exc}")
-            _page_once(cfg, state, ports, f"observe:{persona}", "ORG-076 store ingest failed",
-                       f"{persona}: {type(exc).__name__}: {exc}")
-            continue
-        if result.status == "busy_suppressed":
-            held.add(persona)
-            report.kept += 1
-            continue
-        kill_hook("after_observe_before_unlink")  # tests: os._exit here == the crash window
-        path.unlink()
-        if result.status == "deduped":
-            report.deduped += 1
-        else:
-            report.ingested += 1
+        _observe_and_unlink(cfg, ports, state, report, path, persona, held, kill_hook,
+                            lambda b=binding: qpd.spec_for(b),
+                            lambda o=outcome, p=persona: qpd.outcome_to_verdict(o, p),
+                            sample.get("run_id") or sample["sample_id"])
     if dirty:
         _save_state(cfg, state)
     if not held:
         _clear_paged(cfg, state, "observe:")
+
+
+def _identifiably_not_schema1(raw: bytes) -> bool:
+    """T-5999 review (LOW): a REJECTED file refreshes the quota ``seen`` time only if it may be a quota
+    (schema-1) record. A JSON object carrying any other ``schema`` (a schema-2 writer's bad file) must
+    not mask a silent quota writer. Unparseable bytes keep the BT3b behaviour (a present file proves the
+    seat's drop writes work; ``test_a_rejected_file_from_an_enrolled_seat_still_proves_its_writes_work``)."""
+    try:
+        d = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return isinstance(d, dict) and "schema" in d and d["schema"] != qpd.SAMPLE_SCHEMA
+
+
+def _alias_conflict(cfg: Config, entry: "DropDetector", persona: str) -> "str | None":
+    """T-5999 review (MED), runner pre-check: the store file a schema-2 record would write (its domain and,
+    if opted in, its freshness domain) already holds a DIFFERENT domain => reject. ``episode_store._load``
+    fails closed on the same condition store-wide; this keeps the bad record out of the queue (quarantine +
+    page) instead of failing observe every cycle. An unreadable existing file is left to observe."""
+    keys = [entry.domain_key(persona)]
+    if entry.freshness_unit:
+        keys.append(org076_sample_freshness.domain_key(persona, entry.detector))
+    for key in keys:
+        p = es.store_path(key, cfg.state_dir)
+        try:
+            held = json.loads(p.read_text(encoding="utf-8")).get("domain_key")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if held != key:
+            return f"domain {key!r} aliases the existing store file {p.name} (holds {held!r})"
+    return None
+
+
+def _observe_and_unlink(cfg: Config, ports: es.Ports, state: dict, report: Report, path: Path, persona: str,
+                        held: set, kill_hook: Callable[[str], None], make_spec: Callable, make_verdict: Callable,
+                        sample_key: str) -> None:
+    """observe -> (durable) -> unlink, shared by both record shapes. Spec and verdict are built INSIDE the
+    try, so a failure there keeps the file and holds the persona exactly like an observe exception."""
+    try:
+        result = es.observe(make_spec(), make_verdict(), ports=ports, state_dir=cfg.state_dir,
+                            sample_key=sample_key)
+    except Exception as exc:  # noqa: BLE001 -- keep the file; one bad domain must not stop the rest
+        held.add(persona)
+        report.kept += 1
+        report.errors.append(f"observe {path.name}: {type(exc).__name__}: {exc}")
+        _page_once(cfg, state, ports, f"observe:{persona}", "ORG-076 store ingest failed",
+                   f"{persona}: {type(exc).__name__}: {exc}")
+        return
+    if result.status == "busy_suppressed":
+        held.add(persona)
+        report.kept += 1
+        return
+    kill_hook("after_observe_before_unlink")  # tests: os._exit here == the crash window
+    path.unlink()
+    if result.status == "deduped":
+        report.deduped += 1
+    else:
+        report.ingested += 1
+
+
+def _registry_specs(cfg: Config, state: dict, me: str) -> list:
+    """Episode specs of every ENROLLED schema-2 (detector, persona) whose detector is still registered,
+    plus the opted-in freshness specs (reconcile + sweeps)."""
+    reg, out = _registry(cfg), []
+    for det, enrolled in sorted((state.get("detectors") or {}).items()):
+        entry = reg.get(det)
+        if entry is None:
+            continue  # de-registered: its domains stop reconciling; --forget-persona closes them
+        for persona, account in sorted(enrolled.items()):
+            out.append(entry.spec_for(persona, account))
+            if entry.freshness_unit:
+                out.append(org076_sample_freshness.spec_for(persona, me, detector=det))
+    return out
+
+
+def _feed_registry_freshness(cfg: Config, ports: es.Ports, state: dict, report: Report, me: str) -> None:
+    """Per-detector, OPT-IN freshness (T-5999): only entries with ``freshness_unit``."""
+    reg = _registry(cfg)
+    for det, enrolled in sorted((state.get("detectors") or {}).items()):
+        entry = reg.get(det)
+        if entry is None or not entry.freshness_unit or not enrolled:
+            continue
+        try:
+            got = org076_sample_freshness.feed_detector(
+                det, entry.freshness_unit, enrolled, state.setdefault("detector_seen", {}).setdefault(det, {}),
+                ports=ports, state_dir=cfg.state_dir, now_epoch=ports.clock().timestamp(), runner_account=me,
+                journal=cfg.journal or org076_sample_freshness.JournalctlPort(),
+                uid_of=cfg.uid_of or org076_sample_freshness.resolve_uid, errors=report.errors)
+            report.freshness += [(f"{det}/{p}", st) for p, st in got]
+            _save_state(cfg, state)
+        except Exception as exc:  # noqa: BLE001
+            report.errors.append(f"freshness {det}: {type(exc).__name__}: {exc}")
 
 
 # --------------------------------------------------------------------------- #
@@ -519,6 +787,7 @@ def run_cycle(cfg: Config, ports: es.Ports, *, kill_hook: Callable[[str], None] 
     meta_specs = org076_meta.specs(me)
     specs = [qpd.spec_for(SimpleNamespace(persona=p, account=a)) for p, a in sorted(state["personas"].items())]
     specs += [org076_sample_freshness.spec_for(p, me) for p in sorted(state["personas"])]
+    specs += _registry_specs(cfg, state, me)
     specs += meta_specs
     try:  # per-seat freshness (BT3b); a failure here is a partial failure, never a crash
         report.freshness = org076_sample_freshness.feed_all(
@@ -528,7 +797,11 @@ def run_cycle(cfg: Config, ports: es.Ports, *, kill_hook: Callable[[str], None] 
         _save_state(cfg, state)
     except Exception as exc:  # noqa: BLE001
         report.errors.append(f"freshness: {type(exc).__name__}: {exc}")
-    es.reconcile(specs, ports=ports, state_dir=cfg.state_dir)
+    _feed_registry_freshness(cfg, ports, state, report, me)
+    rec = es.reconcile(specs, ports=ports, state_dir=cfg.state_dir)
+    for domain, why in getattr(rec, "corrupt", None) or []:  # T-5999: skipped, not a crash; page once per domain
+        report.errors.append(f"reconcile {domain}: {why}")
+        _page_once(cfg, state, ports, f"corrupt:{domain}", "ORG-076 store domain corrupt or aliased", f"{domain}: {why}")
     if report.fetch_ok:  # sweeps judge origin/main: never on a stale view (fail closed)
         report.sweeps = org076_reconciler.run_sweeps(specs, ports=ports, state_dir=cfg.state_dir)
         report.errors.extend(report.sweeps.errors)
@@ -545,10 +818,14 @@ def run_cycle(cfg: Config, ports: es.Ports, *, kill_hook: Callable[[str], None] 
     return report
 
 
-def build_ports(cfg: Config, page=es._default_page) -> es.Ports:
+def build_ports(cfg: Config, page=None, liveness=None) -> es.Ports:
+    """Production ports (T-5998): the real page route (``org076_ports.make_page``) and the real seat
+    liveness (``org076_ports.make_liveness``, health export; fails toward not-live). Tests inject fakes."""
+    page = org076_ports.make_page() if page is None else page
+    liveness = org076_ports.make_liveness() if liveness is None else liveness
     edge = es.make_rebase_edge(repo=cfg.clone, state_dir=cfg.state_dir, page=page)
     return es.Ports(repo=cfg.clone, on_nonff=edge.on_nonff, on_recover=edge.on_recover, page=page,
-                    heartbeat_path=cfg.heartbeat)
+                    liveness=liveness, heartbeat_path=cfg.heartbeat)
 
 
 class RunnerBusy(Exception):
@@ -585,14 +862,25 @@ def forget_persona(cfg: Config, ports: es.Ports, persona: str) -> int:
     known = persona in state["personas"] or persona in state["seen"]
     state["personas"].pop(persona, None)
     state["seen"].pop(persona, None)
+    v2_domains = []  # T-5999: the persona's schema-2 enrollments (registered or not) + their freshness domains
+    for det, enrolled in sorted((state.get("detectors") or {}).items()):
+        if enrolled.pop(persona, None) is not None:
+            known = True
+            v2_domains += [f"{det}:{persona}", org076_sample_freshness.domain_key(persona, det)]
+        (state.get("detector_seen") or {}).get(det, {}).pop(persona, None)
     for k in [k for k in state["paged"] if persona in k]:
         del state["paged"][k]
     _save_state(cfg, state)
     closed = []
-    for dom in (f"{qpd.DETECTOR}:{persona}", org076_sample_freshness.domain_key(persona)):
-        closed += es.close_domain_episodes(dom, "persona-forgotten", ports=ports, state_dir=cfg.state_dir)
+    failed = []
+    for dom in (f"{qpd.DETECTOR}:{persona}", org076_sample_freshness.domain_key(persona), *v2_domains):
+        try:
+            closed += es.close_domain_episodes(dom, "persona-forgotten", ports=ports, state_dir=cfg.state_dir)
+        except es.StoreCorruptionError as exc:  # T-5999: an aliased/corrupt file must not stop the others
+            failed.append(dom)
+            _log(f"cannot close {dom}: {exc}")
     _log(f"forgot {persona}: {'was enrolled' if known else 'was not enrolled'}; closed episodes {closed}")
-    return EXIT_OK
+    return EXIT_PARTIAL if failed else EXIT_OK
 
 
 def main(argv: "list[str] | None" = None) -> int:

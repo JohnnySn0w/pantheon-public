@@ -1,0 +1,27 @@
+# ORG-083 adapter coverage config, adapter id pantheon-config.coveragepy-ctrace-arc.v1 (T-5971).
+# Deliberately NOT named .coveragerc / setup.cfg / tox.ini / pyproject.toml: coverage.py
+# auto-discovers those, and plain pytest / CI runs must stay unaffected. Passed with --rcfile.
+# Any change here changes config_digest, so a new adapter id (proposal section 1).
+[run]
+branch = True
+core = ctrace
+patch = subprocess
+parallel = True
+relative_files = False
+source = tools
+omit =
+    */tools/test_*.py
+    */tools/**/test_*.py
+    */tools/**/tests/*
+    */tools/conftest.py
+    */tools/**/conftest.py
+    */tools/fixtures/*
+    */tools/testdata/*
+
+[report]
+precision = 2
+skip_empty = True
+# Q3 (T-5971): this is a REPORT-section option in coverage 7.17.0. Under [run] it is silently
+# ignored (coverage warns "Unrecognized option"). With it on, unexecuted-file discovery also
+# finds files in directories without __init__.py and hyphenated names (the F4 files).
+include_namespace_packages = True

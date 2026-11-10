@@ -5,9 +5,12 @@ the 2026-07-28 knowledge sweep, T-2186). Generalises
 `incidents/2026-07-28-mail-layer-three-silent-delivery-failures.md`, which is a **permanent
 terminal** tier and therefore cannot carry a generalisation forward itself.
 
-**Re-evaluate when:** a fourth instance appears outside the comms/delivery layer (would argue this
-is a property of *queue-shaped* systems generally, not of Pantheon's mail layer); when T-2157's
-staleness detector lands and produces its first real alert or first false positive.
+**Re-evaluated 2026-11-02 (T-4558, sweep 2026-10-04 item A9):** the original trigger, "a fourth instance
+appears outside the comms/delivery layer", fired three times. The claim is generalised below from delivery
+layers to any gate, guard or probe keyed on a target. **Re-evaluate when:** a gate keyed on a moved target
+is found failing CLOSED (loudly) rather than open, which would show the failure direction is design-dependent
+rather than structural; or when the decommission reverse-dependency sweep (T-5936) catches an instance before
+it ships; or when T-2157's staleness detector produces its first real alert or first false positive.
 
 ---
 
@@ -67,6 +70,27 @@ agent doing long work. That single constraint is what shaped T-2157:
   while mail was unread and did not drain". Unambiguous, fires within samples, and *cannot* fire on
   a genuinely continuously-busy agent — so it needs neither suppression nor a ceiling.
 
+## Generalisation (2026-11-02): gates keyed on a moved or retired target fail open as absence
+
+The delivery-layer claim was a special case. Three later instances, none in comms, share the shape: a
+mechanism keyed on a TARGET (a branch it pushes to, a service it gates on, a path it guards) keeps "running"
+after the target moves or retires, and its failure is indistinguishable from "nothing to do".
+
+| # | Mechanism | Target that moved | How it was found |
+|---|---|---|---|
+| 4 | cascade-on-merge GitHub Action, pushing `cascade:` commits (ORG-013) | main became protected, so its `GITHUB_TOKEN` could never push | someone noticed zero `cascade:` commits had ever landed |
+| 5 | Orchestrator-health auto-resolve (`rulebook/policies/autonomy.md`, T-0201) | gated on pantheon-bridge, which was decommissioned | silent since 2026-06-03; found in the 2026-10-04 sweep |
+| 6 | worker-guard ADR protection (T-4545) | its regexes still anchored on `pantheon-config/adr/` after the ORG-094 move | found in the 2026-10-04 sweep |
+
+The general claim: **a gate, guard or health probe keyed on a target that has moved or retired fails OPEN,
+and fails as ABSENCE.** A guard that matches nothing blocks nothing; a probe of a removed service reports
+nothing; an action that can never push produces no commits. None of these raise an error. All of them look
+exactly like "quiet, nothing to do". Instances 4 to 6 were again all found incidentally (sweeps, a count of
+zero), which per point 5 below is itself the finding.
+
+The evaluation-side face of the same property is T-4559: a check that cannot ask returns a value that reads
+as a healthy "no" ("unknown must not stand in for no").
+
 ## The transferable shape
 
 1. **Ask what the failure looks like from outside.** If the answer is "nothing", you have this
@@ -80,6 +104,13 @@ agent doing long work. That single constraint is what shaped T-2157:
    has re-created the failure mode.
 5. **Discovery-by-coincidence is a measurable signal.** If every instance in a component was found
    incidentally, the detection gap is the finding — not the individual bugs.
+6. **When you move or retire a target, the things KEYED on it are the risk, not the things it calls.**
+   Forward dependencies break loudly (an import fails). Reverse dependencies, the things that point AT the
+   target, break silently. Sweep them: guards, gates, allowlists, health probes, actions and monitors that
+   name the target (the decommission SOP step this feeds is T-5936).
+7. **Give every gate a positive canary.** A gate whose healthy state is "matched nothing" needs a periodic
+   positive test that it CAN match: a planted request it must block, a probe it must see succeed. Without
+   one, "blocked nothing" and "can no longer block anything" are the same observation.
 
 ## Cross-references
 
@@ -90,5 +121,8 @@ agent doing long work. That single constraint is what shaped T-2157:
   failure*; this is *a system whose failure has no observable at all*. Face 1's remedy is "read the
   defining surface instead"; here you must first **create** one.
 - `bugs/library-invoked-as-script-exits-0-and-does-nothing.md` — instance 3's symptom-first entry.
+- **T-4558** — the 2026-11-02 generalisation (sweep A9; drafted by mason, adopted by Orchestrator). **T-4559** — the
+  "unknown must not stand in for no" sibling. **T-5936** — the reverse-dependency and positive-canary steps
+  for the decommission SOP.
 
 **Authoring discipline:** hand-curated per D2. HO authors `lessons/` per ORG-012.

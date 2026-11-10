@@ -59,11 +59,17 @@ EXIT CODES (recovery W6; the unit sets SuccessExitStatus=10 13 so every other co
   Across pairs the most severe wins, ranked 4 > 2 > 13 > 10 > 0: a code the unit
   treats as failure (4, 2) always beats one it treats as success (13, 10), so a
   drift week never masks a config fault. A ratify-gated pair (detect-only)
-  contributes no 10/13. The per-fire digest is sent on every exit path.
+  contributes no 10/13. The per-fire digest is delivered on every exit path.
 
 Filing is OFF by default (ship-dark). Pass --commit-prod to actually file
-tickets. The Telegram digest is sent every run as proof-of-life (silence != a
-healthy no-drift week) unless --no-digest.
+tickets. The full digest goes to the owner's mailbox (DIGEST_OWNER, default
+recovery) every run as proof-of-life (silence != a healthy no-drift week) unless
+--no-digest; a dry run (no --commit-prod) prints it but delivers nothing
+durable. The operator gets a Telegram ONLY when something needs him (a leak
+alert or an SLA breach), as a short alert pointing at the mailbox digest
+(the operator TG 6039-6040, 2026-11-09: the weekly wall-of-text digest to his chat
+was egregious; routine drift is already owned by the filed refresh tickets).
+Run failures still page the owner through the non-zero exit + OnFailure.
 
 CADENCE-FIRED REMEDIATION CONFORMANCE (sop/standard/cadence-fired-remediation-
 design.md — this weekly timer files a remediation ticket while a trigger holds,
@@ -84,7 +90,7 @@ so the four required checks are designed in, mapped here for review legibility):
 CLI:
     python3 tools/mirror_drift_sweep.py                 # dry-run: evaluate + digest, file nothing
     python3 tools/mirror_drift_sweep.py --commit-prod   # evaluate + file refresh tickets + digest
-    python3 tools/mirror_drift_sweep.py --no-digest      # skip the Telegram send
+    python3 tools/mirror_drift_sweep.py --no-digest      # skip the mailbox digest and any Telegram alert
     python3 tools/mirror_drift_sweep.py --json           # machine-readable result dump
     python3 tools/mirror_drift_sweep.py --no-fetch       # skip `git fetch` before the behind-origin check
     python3 tools/mirror_drift_sweep.py --rebase-anchor <slug> [--published-tree <tree>] [--write]
@@ -189,6 +195,10 @@ def _default_telegram_env() -> Path:
 TELEGRAM_ENV = Path(
     os.environ.get("PANTHEON_TELEGRAM_ENV", str(_default_telegram_env()))
 )
+
+# The full digest's recipient (mailbox persona). The operator's Telegram is reserved
+# for operator_reasons() — see the module docstring.
+DIGEST_OWNER = os.environ.get("PANTHEON_MIRROR_DIGEST_OWNER", "recovery")
 
 GIT_TIMEOUT = 60  # seconds per git subprocess (ls-remote / fetch / rev-list)
 
@@ -374,7 +384,7 @@ def count_commits_behind(
     # Local source: count directly in the working repo.
     if src.get("local_repo") is not None:
         repo_path = (REPO_ROOT / src["local_repo"]).resolve()
-        return _rev_list_count(repo_path, anchor, current_head)
+        return _rev_list_count(repo_path, anchor, current_head, paths=_count_paths(pair))
 
     url = _source_cache_url(pair)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -394,8 +404,28 @@ def count_commits_behind(
     return _rev_list_count(clone, anchor, current_head)
 
 
-def _rev_list_count(repo: Path, anchor: str, current_head: str) -> int | None:
-    res = _run_git(["rev-list", "--count", f"{anchor}..{current_head}"], cwd=repo)
+def _count_paths(pair: dict[str, Any]) -> list[str] | None:
+    """Optional pathspec filter for the commits-behind count (local sources).
+    `count_paths: seed` counts only commits that touch what the public seed
+    ships (neutralize_seed.seed_pathspecs), so ticket/ledger churn in
+    pantheon-config no longer reads as thousands of commits of drift."""
+    spec = (pair.get("source") or {}).get("count_paths")
+    if spec is None:
+        return None
+    if spec == "seed":
+        from tools.neutralize_seed import seed_pathspecs
+        return seed_pathspecs()
+    if isinstance(spec, list) and all(isinstance(x, str) for x in spec):
+        return list(spec)
+    raise ValueError(f"{pair.get('slug')}: count_paths must be 'seed' or a list of paths")
+
+
+def _rev_list_count(repo: Path, anchor: str, current_head: str,
+                    paths: list[str] | None = None) -> int | None:
+    argv = ["rev-list", "--count", f"{anchor}..{current_head}"]
+    if paths:
+        argv += ["--", *paths]
+    res = _run_git(argv, cwd=repo)
     if res.returncode != 0:
         return None  # anchor not reachable (rewrite) or object absent
     try:
@@ -479,7 +509,15 @@ def evaluate_pair(
             if anchor is not None else None
         )
         n = result.commits_behind
+        if n == 0 and _count_paths(pair) and not built_unpushed:
+            # HEAD moved, but no commit touches the mirrored paths: nothing to
+            # publish (recovery review of cc26b9c947, item b).
+            result.status = "no_drift"
+            result.detail = "current: no commits touching the mirrored paths since the last publish"
+            return result
         behind = f"{n} commit(s) behind" if n is not None else "moved past anchor (exact count unavailable)"
+        if _count_paths(pair):
+            behind += " (commits touching the mirrored paths)"
         result.detail = f"source is {behind}; a refresh build is needed"
         if built_unpushed:
             result.detail += (
@@ -487,7 +525,8 @@ def evaluate_pair(
             )
         # Gating suppresses filing but not detection.
         if gated:
-            result.detail += f" — GATED on {', '.join(gate_tickets)}; detect-only, not filing"
+            result.detail += (f" — GATED: refresh owned by {', '.join(gate_tickets)}; "
+                              "detect-only, not filing")
         return result
 
     # BUILT-BUT-UNPUSHED: latest source is already built (staged) but not published.
@@ -957,6 +996,48 @@ def build_digest(
     lines.append("")
     lines.append("Auto-sent by tools/mirror_drift_sweep.py (T-1994, Recovery unattended, weekly).")
     return "\n".join(lines)
+
+
+def operator_reasons(results: list[PairResult], *,
+                     sla_threshold: int = SLA_STALE_DAYS) -> list[str]:
+    """What, if anything, needs OPERATOR (not the owner) this fire. Empty => no
+    Telegram. A leak is a possible secret in an outward-facing mirror; an SLA
+    breach is the T-3638 loud escalation (a mirror serving stale content past
+    the threshold). Routine drift / stale shadows are owned by their filed
+    refresh tickets, and run failures page the owner via OnFailure."""
+    reasons = []
+    leaking = [r.slug for r in results if r.status == "leak"]
+    if leaking:
+        reasons.append(f"possible leak in {', '.join(leaking)} (alert only, nothing filed)")
+    for r in results:
+        if sla_breached(r, sla_threshold):
+            owner = f", ticket {r.filed_ticket}" if r.filed_ticket else ""
+            reasons.append(f"{r.slug} serving stale content {r.stale_days}d "
+                           f"(SLA {sla_threshold}d{owner})")
+    return reasons
+
+
+def build_operator_alert(reasons: list[str]) -> str:
+    """The short Telegram for the operator: what needs him, one line each."""
+    lines = ["Mirror drift: needs you"] + [f"- {x}" for x in reasons]
+    lines.append(f"Full digest in {DIGEST_OWNER}'s mailbox.")
+    return "\n".join(lines)
+
+
+def _send_owner_digest(text: str) -> bool:
+    """Deliver the full digest to DIGEST_OWNER's mailbox (proof-of-life).
+    Suppressed under the test-suite guards so a suite run never touches the
+    live hub (the 2026-10-12 ticket_grooming leak)."""
+    if os.environ.get("PANTHEON_DISABLE_LIVE_TELEGRAM") or \
+            os.environ.get("PANTHEON_DISABLE_LIVE_MAILBOX"):
+        print("[mailbox digest suppressed: test guard]", file=sys.stderr)
+        return True
+    from tools import mailbox as _mailbox
+    from tools.agent_role_map import mailbox_hub
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _mailbox.send(str(Path(mailbox_hub()) / DIGEST_OWNER), text, sender="mirror-drift",
+                  subject=f"mirror-drift digest {stamp}", dedupe_pending=False)
+    return True
 
 
 def _send_telegram(text: str) -> bool:
@@ -1488,6 +1569,7 @@ def _main(argv: list[str] | None) -> int:
 
     # recovery W6: the per-fire digest is unconditional (every exit path). A failure
     # to build, print or send it (incl. the token read) is itself exit 2 (recovery B1).
+    owner_send_failed = False
     try:
         digest = build_digest(results, committed=args.commit_prod,
                               sla_threshold=args.sla_stale_days, warnings=warnings)
@@ -1496,13 +1578,25 @@ def _main(argv: list[str] | None) -> int:
         else:
             print(digest)
         if not args.no_digest:
-            _send_telegram(digest)
+            # INVARIANT (recovery review of cc26b9c947): the operator's leak/SLA alert goes FIRST
+            # and can never be lost to an owner-mailbox failure.
+            reasons = operator_reasons(results, sla_threshold=args.sla_stale_days)
+            if reasons:
+                _send_telegram(build_operator_alert(reasons))
+            # The durable owner digest is a side effect, so dry-run stays
+            # report-only (auto-commit-cron contract): --commit-prod only.
+            if args.commit_prod:
+                try:
+                    _send_owner_digest(digest)
+                except Exception:  # noqa: BLE001  (isolated: never masks the alert)
+                    traceback.print_exc(file=sys.stderr)
+                    owner_send_failed = True
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc(file=sys.stderr)
-        if not args.no_digest:
+        if not args.no_digest and args.commit_prod:
             try:  # best-effort proof-of-life; the type only (no finding text)
-                _send_telegram(f"Mirror drift-sweep — DIGEST FAILED ({type(exc).__name__}); "
-                               "exit 2, see the unit journal")
+                _send_owner_digest(f"Mirror drift-sweep — DIGEST FAILED ({type(exc).__name__}); "
+                                   "exit 2, see the unit journal")
             except Exception:  # noqa: BLE001
                 traceback.print_exc(file=sys.stderr)
         return EXIT_CONFIG
@@ -1510,7 +1604,10 @@ def _main(argv: list[str] | None) -> int:
     # Exit table in the module docstring. The unit sets SuccessExitStatus=10 13, so
     # 1 (a Python crash), 2 (config / run / filing / digest failure) and 4 (leak)
     # fire OnFailure -> recovery.
-    return failed if failed is not None else sweep_exit_code(results)
+    rc = failed if failed is not None else sweep_exit_code(results)
+    if owner_send_failed and rc != EXIT_LEAK:
+        rc = EXIT_CONFIG  # 4 > 2: a leak's exit code always survives
+    return rc
 
 
 if __name__ == "__main__":

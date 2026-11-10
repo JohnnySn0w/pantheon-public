@@ -1,0 +1,52 @@
+# health-collector component contract (ORG-080 §2 / §6; ORG-076 §5.5 / RFC-004 §5.5; T-5102).
+#
+# WRAPS the running fleet health collector without changing it (ORG-080 D-I, A-5):
+# tools/health_collector.py (poll leg, T-5395) and tools/health_watcher.py (the
+# PropertiesChanged subscribing leg, T-5409), run on Recovery's account (claude-fallback)
+# from three tools/systemd/ units: pantheon-health-collector.{service,timer} and
+# pantheon-health-watcher.service (hand-installed by Recovery 2026-10-25).
+# * install: observe-and-attest (T-5947 shape) for the running collector;
+#   greenfield unit-install ops otherwise. The out dir /run/pantheon-health is
+#   root tmpfiles: observed and refused when absent, never installed (T-5982 source; engine install T-6011).
+# * configure: attests the collector's subscription set, which is data derived from the
+#   registry's emitter declarations plus the roster (tools/health_subscriptions.py and
+#   health-collector.subscriptions.yaml, T-5980); refuses only an unsubscribable
+#   declaration (e.g. a Health1 emitter with no endpoints).
+# * update: converges each unit to its full spec (bytes, enabled, active) and re-attests
+#   only when the converged evidence is healthy; code currency rides the
+#   pantheon-config component's update leg.
+# * remove: retires the units and the engine attestations behind the operator gate
+#   health-collector-retire; never the out dir (kino and the recovery watcher read it).
+# * repair is not declared.
+# Only the SIMULATED handler is registered; the Recovery-run live handler is T-5981.
+# verify is bound to org.pantheon.health-collector/v1 (HC-1..HC-8,
+# health-collector.invariants.yaml). status: DRAFT, signoff pending (D15; recovery
+# co-author), tracked on T-5102; Recovery signed DRAFT 2026-11-02, mail 01793645670714493278.
+# No emitter block (D5 option (i), Recovery-confirmed): the collector does not subscribe
+# to itself; its self-health is the fleet-health.json heartbeat (HC-5..HC-7, through
+# tools/health_collector_check.py) plus the out-of-domain witness (T-5978).
+component:
+  id: health-collector
+  steward: recovery
+  version: 1
+  planner_kind: python
+  contract_digest: sha256:2053be8a0d1e9d9c262c7215d4a04dda826f90e5ad3138a03338ba3445dd6f18
+  handlers_digest: sha256:341de3698bb4cae89b69034ad3d194a04e56317de10d05e1bfd33a45e9f7d22a
+  depends_on: [host-substrate]
+  scopes: [system]
+  invariant_list_id: org.pantheon.health-collector/v1
+  invariant_list_digest: sha256:0d1266fd6fca59ec19ac5d84f46fe6b4732681f955d213cd9f967847d7a0d041
+  privilege:
+    seat: [health-collector.unit-install, health-collector.unit-retire, health-collector.adopt-attest,
+           health-collector.subscription-attest, health-collector.attest-retire]
+  legs:
+    install: plan_install
+    configure: plan_configure
+    update: plan_update
+    remove: plan_remove
+    verify:
+      invariant_list_ref: org.pantheon.health-collector/v1@sha256:0d1266fd6fca59ec19ac5d84f46fe6b4732681f955d213cd9f967847d7a0d041
+  gates:
+    - {id: health-collector-retire, irreversible: false, note: "retires the collector and watcher units and the engine attestations; blinds the health plane until reinstalled; never the out dir", approval: {class: operator}}
+  receipts:
+    schema: pantheon-receipt/v1

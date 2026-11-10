@@ -7,8 +7,12 @@ Cron entrypoint for the lessons→hooks promotion pipeline. Per fire:
   2. Auto-commit + push the surface (candidate files + the ledger), scoped
      STRICTLY to `promotion-candidates/`, HERMES-guarded — the same discipline as
      `ticket_grooming.py`.
-  3. Send a plain-text proof-of-life digest to Telegram (pending count + how many
-     new this run), regardless of count — a silent week is still visible.
+  3. Send a plain-text proof-of-life digest (pending count + how many new this
+     run), regardless of count, so a silent week is still visible, to the OWNER's
+     mailbox (tools/owner_digest.py, default recovery). Never Telegram: the candidates
+     go to recovery's review gate, so nothing here needs the operator (T-6370, the T-6369
+     pattern). A failed delivery exits EXIT_DIGEST_FAILED; a commit failure (8)
+     takes precedence.
 
 Recovery-unattended. It NEVER auto-commits a hook — only the review SURFACE; landing
 a guard stays behind the recovery review gate (`--land`/`--decline`). No force, no
@@ -16,7 +20,7 @@ a guard stays behind the recovery review gate (`--land`/`--decline`). No force, 
 exits non-zero and is reported, never silently swallowed.
 
     python3 tools/promote_lessons_cron.py               # file + commit + push + digest
-    python3 tools/promote_lessons_cron.py --no-digest   # skip Telegram
+    python3 tools/promote_lessons_cron.py --no-digest   # print the digest; deliver nothing
     python3 tools/promote_lessons_cron.py --no-commit   # file to the surface only
     python3 tools/promote_lessons_cron.py --dry-run     # report what WOULD file; touch nothing
 """
@@ -24,7 +28,6 @@ exits non-zero and is reported, never silently swallowed.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -35,15 +38,11 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools import promote_lessons as pl  # noqa: E402
 from tools._git_utils import commit_scoped  # noqa: E402
-from tools.watch_digest import read_telegram_token, send_telegram  # noqa: E402
+from tools.owner_digest import send_owner_digest  # noqa: E402
 
 SURFACE_REL = "promotion-candidates"
 DEFAULT_LEDGER = pl.DEFAULT_CANDIDATES_DIR / "ledger.json"
-DEFAULT_CHAT_ID = os.environ.get("PANTHEON_TELEGRAM_CHAT_ID", "424242424")  # the operator
-
-
-def _default_telegram_env() -> Path:
-    return Path.home() / ".claude" / "channels" / "telegram" / ".env"
+EXIT_DIGEST_FAILED = 9  # the owner-mailbox digest could not be delivered
 
 
 # --------------------------------------------------------------------------- #
@@ -53,7 +52,7 @@ def _default_telegram_env() -> Path:
 def build_digest(n_pending: int, n_new: int, pending: list[dict],
                  *, committed: bool, commit_note: str = "") -> str:
     """Plain-text proof-of-life. First words are sender-identifiable (watch_digest
-    convention) so the operator can pattern-match it. Always emitted, even at 0."""
+    convention) so the owner can pattern-match it. Always emitted, even at 0."""
     head = (f"promote_lessons (weekly): {n_pending} promotion candidate(s) "
             f"awaiting recovery review — {n_new} new this run.")
     lines = [head]
@@ -138,15 +137,15 @@ def run(args, *, do_commit=commit_surface, do_send=None) -> int:
                           committed=committed, commit_note=commit_note)
     if args.no_digest:
         print(digest)
-    else:
-        token = read_telegram_token(args.telegram_env)
-        if not token:
-            print(f"[promote_cron] no telegram token at {args.telegram_env}; "
-                  f"digest not sent:\n{digest}", file=sys.stderr)
-            return rc or 0
-        sender = do_send or send_telegram
-        if not sender(token, args.chat_id, digest):
-            print("[promote_cron] telegram send failed", file=sys.stderr)
+        return rc
+    sender = do_send or (lambda text: send_owner_digest(
+        text, sender="promote-lessons", subject="promote_lessons digest"))
+    try:
+        sender(digest)
+    except Exception as exc:  # noqa: BLE001 — any delivery failure is loud
+        print(f"[promote_cron] owner digest not delivered ({type(exc).__name__}: {exc}):\n"
+              f"{digest}", file=sys.stderr)
+        return rc or EXIT_DIGEST_FAILED
     return rc
 
 
@@ -189,10 +188,9 @@ def main(argv=None) -> int:
                     help="real run: file + commit + push to prod (the cron path; required to write prod)")
     ap.add_argument("--no-commit", action="store_true", help="file to the surface but do not git")
     ap.add_argument("--no-push", action="store_true", help="commit locally but do not push")
-    ap.add_argument("--no-digest", action="store_true", help="print the digest instead of Telegram")
+    ap.add_argument("--no-digest", action="store_true",
+                    help="print the digest instead of delivering it to the owner's mailbox")
     ap.add_argument("--dry-run", action="store_true", help="report what would file; touch nothing")
-    ap.add_argument("--telegram-env", type=Path, default=_default_telegram_env())
-    ap.add_argument("--chat-id", default=DEFAULT_CHAT_ID)
     args = ap.parse_args(argv)
     refusal = _enforce_default_safe(args)
     if refusal is not None:

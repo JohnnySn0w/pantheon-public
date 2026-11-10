@@ -1434,6 +1434,33 @@ class TestLedgerWrite(unittest.TestCase):
         self.assertEqual(len(written.read_text().strip().splitlines()), 1)
 
 
+class TestActuationValidatesBeforeFilingTickets(unittest.TestCase):
+    """T-4739 (orchestrator requirement 2): under ORG-001 ENFORCE a refusable ledger entry means
+    NO ticket is filed (never tickets filed but unrecorded)."""
+
+    def _run(self, agent: str):
+        with patch.object(watch_runner, "_LEDGER_AGENT", agent), \
+             patch("tools.watch_runner.extract_findings", return_value=[]) as ext, \
+             patch("tools.watch_runner.file_finding") as filed, \
+             patch("tools.watch_runner.file_followup") as followup, \
+             patch("tools.watch_runner.write_actuation_ledger") as written, \
+             patch("tools.watch_runner._append_runner_log") as log:
+            watch_runner.actuate_phase(date(2026, 5, 4), [], {})
+        return ext, filed, followup, written, log
+
+    def test_refusable_entry_files_no_ticket_and_reads_no_findings(self) -> None:
+        ext, filed, followup, written, log = self._run("artisan")  # persona names are history-only
+        ext.assert_not_called()
+        filed.assert_not_called()
+        followup.assert_not_called()
+        written.assert_not_called()
+        self.assertIn("SKIPPED, no tickets filed", log.call_args[0][0])
+
+    def test_conforming_entry_proceeds_to_actuation(self) -> None:
+        ext, *_ = self._run("head_research_orchestrator")
+        ext.assert_called_once()
+
+
 class TestLedgerCommitScopeReadback(unittest.TestCase):
     """T-0148 Phase 2: git_commit_ledger_entry stages + scope-asserts the
     DYNAMIC write target, accepting a shard path post-migration."""
@@ -1971,10 +1998,8 @@ class TestClearCorrection(unittest.TestCase):
         self.assertFalse(watch_runner.clear_correction(state, "nope", "id"))
 
 
-class TestLandReports(unittest.TestCase):
-    """ORG-025/T-0855 in-session land path: derive status from disk, append
-    day-index rows, update state, commit, actuate.
-    """
+class _LandHarness:
+    """Shared TestLandReports fixture/helpers (no tests of its own)."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -2012,6 +2037,32 @@ class TestLandReports(unittest.TestCase):
     def _write_report(self, slug: str, headline: str) -> None:
         # Must be landed-ok (exists+size+structure, T-1581), not just present.
         _write_landed_report(self.date_dir / f"{slug}.md", headline=headline)
+
+    # T-5500: an above-bar report that skipped the T-5213 readback step gets a
+    # stderr WARN and a day-index marker, but still lands (warn, never refuse).
+    def _write_fm_report(self, slug: str, fm_lines: str) -> None:
+        (self.date_dir / f"{slug}.md").write_text(
+            "---\n" + fm_lines + "headline: Alpha line.\n---\n\n# Test report\n\n## Findings\n\n"
+            + ("Filler body text to cross the substantive-report size floor. " * 10)
+            + "\n\n## Sources\n\n- (test)\n",
+            encoding="utf-8",
+        )
+
+    def _land_capturing_stderr(self) -> tuple[int, str, str]:
+        stderr = io.StringIO()
+        with patch.object(watch_runner, "git_commit_and_push",
+                          return_value=(True, "ok")), \
+             patch.object(watch_runner, "actuate_phase"), \
+             patch("sys.stderr", stderr):
+            rc = watch_runner.land_reports(date(2026, 6, 5), force=True)
+        index = (self.date_dir / "README.md").read_text(encoding="utf-8")
+        return rc, stderr.getvalue(), index
+
+
+class TestLandReports(_LandHarness, unittest.TestCase):
+    """ORG-025/T-0855 in-session land path: derive status from disk, append
+    day-index rows, update state, commit, actuate.
+    """
 
     def test_landed_report_ok_appends_row_updates_state_commits(self) -> None:
         self._write_report("alpha", "Alpha state-of-world line.")
@@ -2082,26 +2133,6 @@ class TestLandReports(unittest.TestCase):
         with patch("sys.stderr", new_callable=io.StringIO):
             rc = watch_runner.land_reports(date(2026, 6, 5), topic_filter="ghost")
         self.assertEqual(rc, 2)
-
-    # T-5500: an above-bar report that skipped the T-5213 readback step gets a
-    # stderr WARN and a day-index marker, but still lands (warn, never refuse).
-    def _write_fm_report(self, slug: str, fm_lines: str) -> None:
-        (self.date_dir / f"{slug}.md").write_text(
-            "---\n" + fm_lines + "headline: Alpha line.\n---\n\n# Test report\n\n## Findings\n\n"
-            + ("Filler body text to cross the substantive-report size floor. " * 10)
-            + "\n\n## Sources\n\n- (test)\n",
-            encoding="utf-8",
-        )
-
-    def _land_capturing_stderr(self) -> tuple[int, str, str]:
-        stderr = io.StringIO()
-        with patch.object(watch_runner, "git_commit_and_push",
-                          return_value=(True, "ok")), \
-             patch.object(watch_runner, "actuate_phase"), \
-             patch("sys.stderr", stderr):
-            rc = watch_runner.land_reports(date(2026, 6, 5), force=True)
-        index = (self.date_dir / "README.md").read_text(encoding="utf-8")
-        return rc, stderr.getvalue(), index
 
     def test_above_bar_without_readback_warns_and_marks_but_lands(self) -> None:
         self._write_fm_report("alpha", "surface: above-bar\n")
@@ -4511,6 +4542,238 @@ class TestTopicProbes(unittest.TestCase):
                 self.assertTrue(spec["url"].startswith("https://"))
         finally:
             self._patches[-1].start()
+
+
+# ---------------------------------------------------------------------------
+# T-4877: spot-check (independent re-check of a sample of claims per fire)
+# ---------------------------------------------------------------------------
+
+_SPOT_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "watch_spot_check"
+_SPOT_LINE = "spot_check: sampled=4 supported=2 refinement=1 over_broad=1 unsupported=0 verifier=explore\n"
+
+
+def _spot_fixture_text(name: str, with_spot: bool = False) -> str:
+    """Real-report bytes (copied from knowledge/watch/reports/) as a fixture."""
+    text = (_SPOT_FIXTURES / name).read_text(encoding="utf-8")
+    if with_spot:
+        head, sep, rest = text.partition("\n---\n")
+        text = head + "\n" + _SPOT_LINE.rstrip("\n") + sep + rest
+    return text
+
+
+class TestParseSpotCheck(unittest.TestCase):
+    def test_well_formed(self) -> None:
+        got = watch_runner.parse_spot_check({"spot_check": _SPOT_LINE.split(": ", 1)[1].strip()})
+        self.assertEqual(got, {"sampled": 4, "supported": 2, "refinement": 1,
+                               "over_broad": 1, "unsupported": 0, "verifier": "explore"})
+
+    def test_empty_and_absent_are_none(self) -> None:
+        self.assertIsNone(watch_runner.parse_spot_check({}))
+        self.assertIsNone(watch_runner.parse_spot_check({"spot_check": ""}))
+        self.assertIsNone(watch_runner.parse_spot_check(None))  # type: ignore[arg-type]
+
+    def test_partial_is_none(self) -> None:
+        self.assertIsNone(watch_runner.parse_spot_check(
+            {"spot_check": "sampled=3 supported=3"}))
+
+    def test_malformed_never_raises(self) -> None:
+        for bad in ("garbage", "sampled=x supported=1 refinement=0 over_broad=0 unsupported=0",
+                    "sampled=-1 supported=0 refinement=0 over_broad=0 unsupported=0",
+                    "sampled=3 supported=1 refinement=0 over_broad=0 unsupported=0",  # sum mismatch
+                    "=== ===", "sampled=1=2", 7, ["a"]):
+            self.assertIsNone(watch_runner.parse_spot_check({"spot_check": bad}), bad)  # type: ignore[arg-type]
+
+    def test_real_fixture_frontmatter_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "r.md"
+            p.write_text(_spot_fixture_text("above_bar_with_followups.md", True), encoding="utf-8")
+            got = watch_runner.parse_spot_check(watch_runner._parse_report_frontmatter(p))
+        self.assertEqual(got["sampled"], 4)
+        self.assertEqual(got["verifier"], "explore")
+
+
+class TestSpotCheckPolicy(unittest.TestCase):
+    def test_every_risk_tagged_key_names_an_existing_topic(self) -> None:
+        topics = {t.slug for t in watch_runner.parse_topics(watch_runner.TOPICS_FILE)}
+        tagged = {s for s, pol in watch_runner.TOPIC_POLICY.items() if "spot_check" in pol}
+        self.assertTrue(tagged)
+        self.assertEqual(tagged - topics, set())
+
+    def test_exact_risk_tagged_set(self) -> None:
+        tagged = {s for s, pol in watch_runner.TOPIC_POLICY.items()
+                  if pol.get("spot_check") == "always"}
+        self.assertEqual(tagged, {
+            "anthropic-policy-and-billing", "mcp-supply-chain",
+            "echo-stack-vendor-changes", "flipper-one-launch-watch",
+            "anthropic-claude-code-changelog", "anthropic-quota-interface"})
+
+    def test_build_brief_does_not_mention_spot_check(self) -> None:
+        brief = watch_runner.build_brief(_topic("due-weekly"), Path("/tmp/out.md"))
+        self.assertNotIn("spot_check", brief)
+        self.assertNotIn("spot-check", brief)
+
+
+class TestSpotCheckQualifies(unittest.TestCase):
+    def _q(self, slug: str, fixture: str) -> bool:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / f"{slug}.md"
+            p.write_text(_spot_fixture_text(fixture), encoding="utf-8")
+            return watch_runner.spot_check_qualifies(slug, p)
+
+    def test_above_bar_arm(self) -> None:
+        self.assertTrue(self._q("some-other-topic", "above_bar_with_followups.md"))
+
+    def test_above_bar_only_arm(self) -> None:
+        # Real above-bar report with NO follow-ups and an untagged slug: only the
+        # above-bar arm can qualify it (the other fixtures mask this arm).
+        self.assertTrue(self._q("compositional-independence-vs-pantheon", "above_bar_only.md"))
+
+    def test_followups_arm(self) -> None:
+        self.assertTrue(self._q("voice-as-interface", "routine_with_followups.md"))
+
+    def test_risk_tag_arm(self) -> None:
+        self.assertTrue(self._q("flipper-one-launch-watch", "routine_risk_tagged.md"))
+
+    def test_routine_without_followups_does_not_qualify(self) -> None:
+        self.assertFalse(self._q("glop-it-blog", "routine_no_followups.md"))
+
+    def test_cadence_alone_does_not_qualify(self) -> None:
+        # a daily-cadence topic with no tag is still routine
+        self.assertFalse(self._q("not-tagged-daily", "routine_no_followups.md"))
+
+    def test_missing_report_is_false(self) -> None:
+        self.assertFalse(watch_runner.spot_check_qualifies("x", Path("/nonexistent/x.md")))
+
+
+class TestSpotCheckLand(_LandHarness, unittest.TestCase):
+    """Reuses the shared land harness without re-running TestLandReports tests."""
+
+    def _put(self, fixture: str, with_spot: bool) -> None:
+        (self.date_dir / "alpha.md").write_text(
+            _spot_fixture_text(fixture, with_spot), encoding="utf-8")
+
+    def _land(self) -> tuple[int, str, str]:
+        return self._land_capturing_stderr()
+
+    def test_qualifying_without_spot_check_warns_logs_and_lands(self) -> None:
+        self._put("above_bar_with_followups.md", False)
+        # ensure readback present so only the spot-check WARN is under test
+        rc, err, index = self._land()
+        self.assertEqual(rc, 0)
+        self.assertIn("WARN [spot_check]", err)
+        self.assertIn("alpha.md", err)
+        log = watch_runner.RUNNER_LOG.read_text(encoding="utf-8")
+        self.assertIn("spot_check", log)
+        self.assertIn("alpha", log)
+        self.assertEqual(self._saved_state["topics"]["alpha"]["last_outcome"], "ok")
+
+    def test_qualifying_with_spot_check_is_silent(self) -> None:
+        self._put("above_bar_with_followups.md", True)
+        _rc, err, _index = self._land()
+        self.assertNotIn("WARN [spot_check]", err)
+
+    def test_routine_is_silent(self) -> None:
+        self._put("routine_no_followups.md", False)
+        _rc, err, _index = self._land()
+        self.assertNotIn("spot_check", err)
+
+    def test_no_day_index_suffix_mark(self) -> None:
+        self._put("above_bar_with_followups.md", False)
+        _rc, _err, index = self._land()
+        row = [ln for ln in index.splitlines() if ln.startswith("| [alpha]")][0]
+        self.assertNotIn("spot", row.lower())
+
+    def test_extract_findings_unchanged_by_spot_check(self) -> None:
+        # Same day-index + report, with/without spot_check: identical titles.
+        def findings(with_spot: bool):
+            self._put("above_bar_with_followups.md", with_spot)
+            (self.date_dir / "README.md").unlink(missing_ok=True)
+            self._land()
+            return [(f.slug, f.tldr) for f in
+                    watch_runner.extract_findings(self.date_dir, {"alpha": "ok"})]
+        a = findings(False)
+        b = findings(True)
+        self.assertEqual(a, b)
+        self.assertNotIn("spot", a[0][1].lower())
+
+    def test_readme_tally_line_present_with_data_absent_without(self) -> None:
+        self._put("above_bar_with_followups.md", True)
+        _rc, _err, index = self._land()
+        self.assertIn("Spot-check (8 weeks): sampled=4 supported=2 refinement=1 over_broad=1 unsupported=0", index)
+        # no data -> omitted
+        (self.date_dir / "README.md").unlink()
+        self._put("routine_no_followups.md", False)
+        _rc, _err, index = self._land()
+        self.assertNotIn("Spot-check", index)
+
+
+class TestSpotCheckIndexLine(unittest.TestCase):
+    _TALLY = {"samples": 4, "supported": 2, "refinement": 1, "over_broad": 1,
+              "unsupported": 0, "weeks": 1}
+
+    def _mk_index(self) -> tuple[tempfile.TemporaryDirectory, Path]:
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        d = Path(td.name) / "2026-11-03"
+        d.mkdir()
+        watch_runner.append_day_index_entry(d, "alpha", "ok", "TL;DR: x")
+        return td, d
+
+    def test_rewrite_is_idempotent(self) -> None:
+        _td, d = self._mk_index()
+        watch_runner._write_spot_check_index_line(d, self._TALLY)
+        once = (d / "README.md").read_bytes()
+        for _ in range(4):
+            watch_runner._write_spot_check_index_line(d, self._TALLY)
+        self.assertEqual((d / "README.md").read_bytes(), once)
+        self.assertIn(b"Spot-check (8 weeks)", once)
+
+    def test_data_to_no_data_restores_header_exactly(self) -> None:
+        _td, d = self._mk_index()
+        before = (d / "README.md").read_bytes()
+        watch_runner._write_spot_check_index_line(d, self._TALLY)
+        self.assertNotEqual((d / "README.md").read_bytes(), before)
+        watch_runner._write_spot_check_index_line(d, None)
+        self.assertEqual((d / "README.md").read_bytes(), before)
+
+    def test_row_appended_after_tally_stays_last(self) -> None:
+        _td, d = self._mk_index()
+        watch_runner._write_spot_check_index_line(d, self._TALLY)
+        watch_runner.append_day_index_entry(d, "beta", "ok", "TL;DR: y")
+        self.assertTrue((d / "README.md").read_text().rstrip().endswith("TL;DR: y |"))
+
+
+class TestSpotCheckTally(unittest.TestCase):
+    def _mk(self, root: Path, day: str, n: int, sup: int, slug: str = "t") -> None:
+        d = root / day
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{slug}.md").write_text(
+            f"---\nsurface: routine\nspot_check: sampled={n} supported={sup} "
+            f"refinement={n - sup} over_broad=0 unsupported=0 verifier=v\n---\n\n# x\n",
+            encoding="utf-8")
+
+    def test_no_data_is_none(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            self.assertIsNone(watch_runner.spot_check_tally(Path(td), date(2026, 11, 3)))
+
+    def test_sums_and_weeks_and_window(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            r = Path(td)
+            self._mk(r, "2026-11-03", 4, 3)
+            self._mk(r, "2026-10-27", 3, 3)
+            self._mk(r, "2026-08-01", 5, 0)  # outside 8 weeks
+            (r / "2026-11-02").mkdir()
+            (r / "2026-11-02" / "bad.md").write_text("---\nspot_check: junk\n---\n", encoding="utf-8")
+            t = watch_runner.spot_check_tally(r, date(2026, 11, 3))
+        self.assertEqual((t["samples"], t["supported"], t["weeks"]), (7, 6, 2))
+
+    def test_lines_the_same_in_digest_module_threshold_inputs(self) -> None:
+        # tally keys consumed by watch_digest.spot_check_alert
+        with tempfile.TemporaryDirectory() as td:
+            self._mk(Path(td), "2026-11-03", 2, 1)
+            t = watch_runner.spot_check_tally(Path(td), date(2026, 11, 3))
+        for k in ("samples", "supported", "refinement", "over_broad", "unsupported", "weeks"):
+            self.assertIn(k, t)
 
 
 if __name__ == "__main__":

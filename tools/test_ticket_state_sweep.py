@@ -29,6 +29,7 @@ from unittest.mock import patch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from tools._test_fixtures import copy_tools_import_closure  # noqa: E402
 from tools.ticket_state_sweep import (  # noqa: E402
     OPERATOR_MOOT_RECENCY_DAYS,
     ForwardMismatch,
@@ -415,22 +416,13 @@ class TestBriefNamedSweep(unittest.TestCase):
             # any modules ticket.py imports into the synthetic repo's
             # tools/ dir so subprocess invocation works.
             real_tools = REPO_ROOT / "tools"
-            for fname in ("ticket.py", "_git_utils.py", "agent_role_map.py",
-                          "__init__.py",
-                          "_md_table.py",  # T-1936: ticket.py's README-row emitter imports it
-                          "_security_gate.py",  # T-5678: ticket.py imports it
-                          "_frontmatter_block.py",  # T-5689: ticket.py + ticket_purpose import it
-                          # T-2842: resolve's closure gate imports ticket_lint,
-                          # whose module-level imports pull the next two:
-                          "ticket_lint.py",
-                          "adr_reeval_walk.py",
-                          # T-2426: ticket_lint's owned ORG-061 index evaluator.
-                          "grand_project_program.py",
-                          "watch_digest.py",
-                          "priority_list_parse.py"):  # T-3020 BT3: ticket.py imports it at module scope
-                src = real_tools / fname
-                if src.is_file():
-                    (clone / "tools" / fname).write_bytes(src.read_bytes())
+            # resolve lazily imports ticket_lint, so make it a second entry
+            # point; each entry's import-time dependencies are derived.
+            copy_tools_import_closure(
+                clone / "tools",
+                source_tools=real_tools,
+                entry_modules=("ticket.py", "ticket_lint.py"),
+            )
 
             _write_ticket(clone, "inbox", "T-0141")
             _write_ledger_entry(

@@ -1,0 +1,28 @@
+[Unit]
+Description=Pantheon watch-loop digest — summarizes the day's reports to Telegram
+Documentation=file:///home/%u/pantheon-config/knowledge/watch/README.md
+After=network-online.target pantheon-watch.service
+Wants=network-online.target
+
+# Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# %h, not a hard-coded /home/claude (fixed 2026-08-03, T-2444 recon). This unit is installed on
+# ONE account — claude-research — and every other path in this file already templates (%h/%u).
+# The literal /home/claude survived from when the digest ran on orchestrator's seat; specialist's INSTALLED
+# copy had been hand-corrected to its own home, so the repo was the wrong copy, not the seat.
+# That inverts the drift lint's own remediation advice: "installed differs from repo, sync
+# deliberately" would have pointed specialist's digest at a path inside orchestrator's 700-mode home, which
+# specialist cannot read and which is a different bot anyway. Worth remembering before any sweep
+# auto-syncs anything — the repo is canonical for CONTENT, not automatically correct.
+# No PANTHEON_TELEGRAM_ENV here (T-4131): watch_digest resolves the token itself —
+# %h/.claude/channels/telegram/pantheon.env if present (specialist's per-bot file), else .env.
+# An explicit pointer defeats that fallback and silently skips sends when the file is absent.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/watch_digest.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

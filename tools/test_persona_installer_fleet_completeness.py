@@ -97,6 +97,27 @@ class FleetCompletenessTests(unittest.TestCase):
                 for operation_id in PERIODIC_UNITS:
                     self.assertIn(operation_id, ops)
 
+    def test_every_seat_gets_fleet_usage_retention_and_codex_seats_the_export(self) -> None:
+        # T-5961: retention is installer-owned on every seat (no hand step); codex seats
+        # (harness codex) also get the Codex usage export. Named by the fleet-usage seat.
+        expected_seat = {"codex": "consultant"}
+        for persona in self.personas:
+            with self.subTest(persona=persona):
+                ops = self.ops(persona)
+                seat = expected_seat.get(persona, persona)
+                codex = self.manifest.binding(persona).configured_harness == "codex"
+                names = ["fleet-usage-prune"] + (["fleet-usage-codex-export"] if codex else [])
+                for name in names:
+                    for suffix in ("service-unit", "timer-unit"):
+                        self.assertEqual(ops[f"periodic.{name}.{suffix}"].kind, "seat-periodic-unit-install")
+                    timer = f"pantheon-{name}@{seat}.timer"
+                    self.assertEqual(ops[f"periodic.{name}.timer-enable"].target, timer)
+                    self.assertEqual(ops[f"periodic.{name}.timer-observe"].target, timer)
+                if not codex:
+                    self.assertNotIn("periodic.fleet-usage-codex-export.timer-enable", ops)
+        self.assertIn("codex", self.personas)
+        self.assertIn("watchman", self.personas)
+
     def test_keep_going_is_planned_exactly_for_the_personas_keep_going_maps(self) -> None:
         # T-5748: only Archivist remains deliberately exempt; both Codex seats
         # receive the shared harness-aware cadence.

@@ -68,6 +68,7 @@ from ledger_shard import (  # noqa: E402
     entry_ts,
     segment_for_ts,
 )
+import ledger_shard as _ledger_shard  # noqa: E402  (T-4739: ORG-001 rules + ENFORCE)
 from tools.hermes_diff_scan import iter_added_lines  # noqa: E402  (shared framing, T-4202)
 
 # A shard segment id is `<ISO-year>-W<NN>` (e.g. 2026-W31).
@@ -160,6 +161,41 @@ def _is_ledger_jsonl_path(rel: str) -> bool:
     return True
 
 
+def _staged_added_ledger_lines(repo_root: str | Path | None) -> list[tuple[str, bytes]]:
+    """(path, raw line) for every line ADDED to a ledger/**/*.jsonl in the staged diff.
+    Fail-open: a failing git call yields []. Shared by the validity and ORG-001 scans."""
+    if repo_root is None:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=False,
+        )
+        repo_root = r.stdout.strip() or "."
+    out: list[tuple[str, bytes]] = []
+    # `--src-prefix=a/ --dst-prefix=b/` are pinned, like `-M`: the attribution below
+    # reads the `+++ b/<path>` header, and a seat's diff.mnemonicPrefix (`i/`),
+    # diff.noprefix or diff.dstPrefix would otherwise hand it a path that is not
+    # `ledger/...` -- the line is silently skipped, turning the guard off. The explicit
+    # flags override all three config keys. `--no-ext-diff --no-textconv` (T-4487) are
+    # pinned for the same reason: this parses the patch BODY, and a seat's
+    # `diff.external` or a `.gitattributes` textconv driver would replace it with a body
+    # holding no added lines, so an invalid line would never be judged.
+    d = subprocess.run(
+        ["git", "-C", str(repo_root), "diff", "--cached", "-M", "--text",
+         "--no-ext-diff", "--no-textconv",
+         "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--unified=0",
+         "--diff-filter=ACMR", "--", "ledger"],
+        capture_output=True, check=False,
+    )
+    if d.returncode != 0:
+        return out
+    for ev in iter_added_lines(d.stdout):
+        rel = ev.path
+        if rel is None or not _is_ledger_jsonl_path(rel):
+            continue
+        out.append((rel, ev.text))
+    return out
+
+
 def lint_staged_validity(repo_root: str | Path | None = None) -> list[dict]:
     """Validate JSON-parseability of ledger lines ADDED in the STAGED diff.
 
@@ -186,35 +222,8 @@ def lint_staged_validity(repo_root: str | Path | None = None) -> list[dict]:
     detached/corrupt state) yields `[]` for that step rather than raising --
     a validity guard must never brick a commit on its own account.
     """
-    if repo_root is None:
-        r = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, check=False,
-        )
-        repo_root = r.stdout.strip() or "."
     out: list[dict] = []
-    # `--src-prefix=a/ --dst-prefix=b/` are pinned, like `-M`: the attribution below
-    # reads the `+++ b/<path>` header, and a seat's diff.mnemonicPrefix (`i/`),
-    # diff.noprefix or diff.dstPrefix would otherwise hand it a path that is not
-    # `ledger/...` -- the line is silently skipped, turning the guard off. The explicit
-    # flags override all three config keys. `--no-ext-diff --no-textconv` (T-4487) are
-    # pinned for the same reason: this parses the patch BODY, and a seat's
-    # `diff.external` or a `.gitattributes` textconv driver would replace it with a body
-    # holding no added lines, so an invalid line would never be judged.
-    d = subprocess.run(
-        ["git", "-C", str(repo_root), "diff", "--cached", "-M", "--text",
-         "--no-ext-diff", "--no-textconv",
-         "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--unified=0",
-         "--diff-filter=ACMR", "--", "ledger"],
-        capture_output=True, check=False,
-    )
-    if d.returncode != 0:
-        return out
-    for ev in iter_added_lines(d.stdout):
-        rel = ev.path
-        if rel is None or not _is_ledger_jsonl_path(rel):
-            continue
-        raw = ev.text
+    for rel, raw in _staged_added_ledger_lines(repo_root):
         try:
             v = check_entry_validity(raw.decode("utf-8"))
         except UnicodeDecodeError:
@@ -225,6 +234,59 @@ def lint_staged_validity(repo_root: str | Path | None = None) -> list[dict]:
         if v:
             v["path"] = rel
             out.append(v)
+    return out
+
+
+# Decision-ledger shards only: what ledger_shard writes. ORG-001's per-entry rules
+# govern decision entries; sub-ledgers under ledger/ (ledger/appetite/<week>.jsonl,
+# written by ticket.py resolve) have their own shapes and are out of scope
+# (T-4739 hotfix: the unscoped check refused every ticket resolve).
+_DECISION_SHARD_RE = re.compile(r"^ledger/\d{4}-W\d{2}/\d{4}-W\d{2}\.jsonl$")
+
+
+def _is_decision_shard(rel: str) -> bool:
+    return bool(_DECISION_SHARD_RE.match(rel)) or rel == f"ledger/{_ledger_shard.LEGACY_LEDGER_FILENAME}"
+
+
+def lint_staged_org001(repo_root: str | Path | None = None) -> list[dict]:
+    """ORG-001 rule failures (T-4739) on ledger lines ADDED in the STAGED diff.
+
+    Same added-lines-only scope as `lint_staged_validity`, so every pre-existing
+    row is grandfathered. Uses `ledger_shard.validate_entry`, the write path's own
+    rule set, and honours `VOCAB_LOAD_FAIL_OPEN`. `now` is the entry's own ts: the
+    write path already enforces the ts-vs-clock rule when the line is appended, and
+    a commit may legitimately come later than the append. Returns [] while
+    `ENFORCE` is off. Unparseable lines are left to `lint_staged_validity`.
+    """
+    if not _ledger_shard.ENFORCE:
+        return []
+    out: list[dict] = []
+    for rel, raw in _staged_added_ledger_lines(repo_root):
+        if not _is_decision_shard(rel):
+            continue  # T-4739 hotfix: sub-ledgers (e.g. ledger/appetite/) are not ORG-001 decision entries
+        try:
+            entry = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        ts_raw = entry.get("ts")
+        now = None
+        if isinstance(ts_raw, str):
+            try:
+                now = datetime.strptime(ts_raw, _ledger_shard.TS_FORMAT).replace(tzinfo=timezone.utc)
+            except ValueError:
+                now = None
+        problems, _warn = _ledger_shard.split_fail_open_problems(
+            _ledger_shard.validate_entry(entry, now)
+        )
+        if problems:
+            label = entry.get("id") or "<no id>"
+            out.append({
+                "line": raw.decode("utf-8", "replace"),
+                "error": f"ORG-001 entry {label}: " + "; ".join(problems),
+                "path": rel,
+            })
     return out
 
 

@@ -149,6 +149,26 @@ class TestMainHonoursSeatMaintenance(unittest.TestCase):
             self.assertEqual(prem.main([]), 0)
         return applied
 
+    def test_halted_seat_is_vetoed_with_the_halted_reason_T5868(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from tools.seat_state_testkit import eff
+        reports = [_report("specialist", [(AX, "HARD", "FAIL")]), _report("mason", [(AX, "HARD", "FAIL")])]
+        seats = [SimpleNamespace(persona="specialist", account="claude-research"),
+                 SimpleNamespace(persona="mason", account="suborch1")]
+        applied, logs = [], []
+        res = prem.RepairResult(seat="mason", axis_id=AX, unit="u", applied=True, verified=True, detail="ok")
+        with mock.patch.object(prem.par, "run_fleet_audit", return_value=(reports, None)), \
+             mock.patch.object(prem.pr, "load_seats", return_value=seats), \
+             mock.patch.object(prem, "apply_repair", side_effect=lambda r, a, run=None: applied.append(r.seat) or res), \
+             mock.patch.object(prem, "_seat_in_maintenance", return_value=False), \
+             mock.patch("tools.seat_state.safe_effective_for",
+                        side_effect=lambda p, **kw: eff("halted") if p == "specialist" else None), \
+             mock.patch.object(prem, "_log", side_effect=logs.append):
+            self.assertEqual(prem.main([]), 0)
+        self.assertEqual(applied, ["mason"])
+        self.assertTrue(any("specialist" in l and "HALTED mid-pause" in l and "vetoes repair" in l for l in logs), logs)
+
     def test_held_seat_is_skipped_others_repaired(self):
         self.assertEqual(self._run_main(held={"specialist"}), ["mason"])
 
@@ -177,6 +197,135 @@ class TestMainHonoursSeatMaintenance(unittest.TestCase):
 
     def test_no_maintenance_repairs_all(self):
         self.assertEqual(self._run_main(held=set()), ["specialist", "mason"])
+
+
+
+class TestRunStatePauseVetoesRepairEndToEnd(unittest.TestCase):
+    """T-5918: a harness-manager run_state pause (U5) disables the seat's wake timers,
+    inbox-consumer included, and records a paused-intake seat-state record carrying
+    pause_id. pantheon-parity-remediate must not re-enable them: no repair, and no
+    "DRY-RUN would repair" line, for the paused seat, through the REAL seat-state reader
+    over a real record on disk; the other seat is still repaired."""
+
+    NOW = "2026-11-02T12:00:00Z"
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "state"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _record(self, halted=False):
+        rec = {
+            "schema": "pantheon-seat-state/v1", "persona": "artisan", "state": "paused-intake",
+            "phase": "set", "phase_ts": "2026-11-02T11:00:00Z", "set_ts": "2026-11-02T11:00:00Z",
+            "set_by": "germinate:harness-manager run_state", "owner": "operator",
+            "reason": "fleet bringdown: harness-manager run_state=paused (rs-artisan-20261102T110000Z)",
+            "ticket": None, "expires": None, "indefinite": True, "telegram_dark_ack": False,
+            "pre_expiry_notified": False, "ledger_entry": None,
+            "pause_id": "rs-artisan-20261102T110000Z", "anchor": "operator:TG-12733", "plan_revision": "b" * 40,
+        }
+        if halted:  # Recovery D15 (T-5858) (r1): the record is kept and annotated
+            rec["run_state_halt"] = {"run_id": "r1", "op_id": "rs-drain", "at": "2026-11-02T11:05:00Z",
+                                     "rollback": "python3 -m tools.germinate rollback --run r1"}
+        return rec
+
+    def _put(self, rec):
+        import json
+        from tools import harness_state as hs
+        path = hs.seat_state_path("artisan", root=self.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(rec))
+        return path
+
+    def _main(self, argv):
+        from datetime import datetime, timezone
+        from types import SimpleNamespace
+        from unittest import mock
+        from tools import seat_state
+
+        real = seat_state.effective_for
+        now = datetime.strptime(self.NOW, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+        def reader(persona, **kw):
+            """safe_effective_for over the REAL effective_for (tools/conftest.py stubs the
+            safe helper to None for hermeticity); only the roots point at the tmp dir.
+            Fail-open exactly like the real helper (any raise reads None)."""
+            try:
+                return real(persona, now=now, state_root=self.root,
+                            maintenance_registry=str(Path(self._tmp.name) / "maint.json"),
+                            oom_holds_path=Path(self._tmp.name) / "oom.json")
+            except Exception:  # noqa: BLE001
+                return None
+
+        reports = [_report("artisan", [(AX, "HARD", "FAIL")]), _report("mason", [(AX, "HARD", "FAIL")])]
+        seats = [SimpleNamespace(persona="artisan", account="artisan"),
+                 SimpleNamespace(persona="mason", account="suborch1")]
+        applied, logs = [], []
+
+        def fake_apply(repair, account, run=None):
+            applied.append(repair.seat)
+            return prem.RepairResult(seat=repair.seat, axis_id=repair.axis_id, unit="u",
+                                     applied=True, verified=True, detail="ok")
+
+        with mock.patch.object(prem.par, "run_fleet_audit", return_value=(reports, None)), \
+             mock.patch.object(prem.pr, "load_seats", return_value=seats), \
+             mock.patch.object(prem, "apply_repair", side_effect=fake_apply), \
+             mock.patch.object(prem, "_seat_in_maintenance", return_value=False), \
+             mock.patch.object(seat_state, "safe_effective_for", side_effect=reader), \
+             mock.patch("tools.seat_state.getpass.getuser", return_value="artisan"), \
+             mock.patch("tools.seat_state.agent_role_map.instance_binding",
+                        return_value={"account": "artisan"}), \
+             mock.patch.object(prem, "_log", side_effect=logs.append):
+            self.assertEqual(prem.main(argv), 0)
+        return applied, logs
+
+    def _assert_vetoed(self, applied, logs):
+        self.assertNotIn("artisan", applied, logs)
+        self.assertFalse([m for m in logs if "would repair artisan" in m], logs)
+        self.assertTrue([m for m in logs if m.startswith("SKIP artisan/") and "repair_vetoed" in m], logs)
+
+    def test_dry_run_on_a_paused_seat_makes_no_repair(self):
+        self._put(self._record())
+        applied, logs = self._main(["--dry-run"])
+        self._assert_vetoed(applied, logs)
+        self.assertEqual(applied, [])
+        self.assertTrue([m for m in logs if "DRY-RUN would repair mason" in m], logs)
+
+    def test_live_pass_on_a_paused_seat_makes_no_repair(self):
+        self._put(self._record())
+        applied, logs = self._main([])
+        self._assert_vetoed(applied, logs)
+        self.assertEqual(applied, ["mason"])
+
+    def test_halted_pause_keeps_vetoing(self):
+        self._put(self._record(halted=True))
+        applied, logs = self._main([])
+        self._assert_vetoed(applied, logs)
+        self.assertEqual(applied, ["mason"])
+
+    def test_after_restore_the_seat_is_repaired_again(self):
+        self._put(self._record()).unlink()  # restore clears the record LAST (Recovery (p))
+        applied, logs = self._main(["--dry-run"])
+        self.assertTrue([m for m in logs if "DRY-RUN would repair artisan" in m], logs)
+        applied, _logs = self._main([])
+        self.assertEqual(applied, ["artisan", "mason"])
+
+    def test_an_operator_pause_without_pause_id_is_still_repaired(self):
+        rec = self._record()
+        del rec["pause_id"]
+        self._put(rec)
+        applied, _logs = self._main([])
+        self.assertEqual(applied, ["artisan", "mason"])
+
+    def test_testkit_run_state_pause_is_skipped(self):
+        from tools.seat_state_testkit import eff
+        from unittest import mock
+        with mock.patch("tools.seat_state.safe_effective_for",
+                        side_effect=lambda p, **kw: eff("paused-intake", run_state_pause=True) if p == "specialist" else None):
+            self.assertEqual(TestMainHonoursSeatMaintenance._run_main(self, held=set()), ["mason"])
 
 
 if __name__ == "__main__":

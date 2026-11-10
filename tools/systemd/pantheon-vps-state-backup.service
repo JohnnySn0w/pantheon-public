@@ -25,7 +25,20 @@ Wants=network-online.target
 # pantheon-backup-staleness.service (daily, user unit) fails and alerts while the
 # copy is missing, differs, or is not a root-owned, owner-only-writable regular
 # file, so it can't drift past the next daily check.
+# T-5993 ORG-101 mirror leg: the script imports _git_utils only from a root-owned
+# lib (inert and logged as 'skipped' while it is absent). After a merge that
+# changes tools/_git_utils.py, tools/remote_resolve.py or repos.yaml, reinstall:
+#   sudo install -d -o root -g root -m 0755 /usr/local/lib/pantheon-vps-backup/tools
+#   for f in tools/_git_utils.py tools/remote_resolve.py repos.yaml; do
+#     sudo install -o root -g root -m 0644 /home/claude/pantheon-config/$f \
+#       /usr/local/lib/pantheon-vps-backup/$f; done
+# then re-pin root's /root/.local/state/pantheon/repos.yaml.pin (tools/manifest_pin.py).
+# The staleness check fails the same way on lib drift once the lib exists.
 Type=oneshot
+# T-5993: a system unit with no User= runs with HOME unset, so git never reads
+# /root/.gitconfig and the ORG-101 mirror leg's credential helper is invisible
+# ("could not read Password"). Pin HOME so root's global git config applies.
+Environment=HOME=/root
 ExecStart=/usr/bin/bash /usr/local/sbin/pantheon-vps-state-backup
 StandardOutput=journal
 StandardError=journal

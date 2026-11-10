@@ -93,7 +93,7 @@ def registry_doc() -> dict:
 
 
 def manifest_doc() -> dict:
-    return T.with_approver(T.manifest_doc())
+    return T.with_protocol_test_seats(T.with_approver(T.manifest_doc()))
 
 
 def build_plan(manifest: dict | None = None, registry: dict | None = None, closure: H.Closure | None = None):
@@ -132,8 +132,10 @@ def make_root(tmp: Path) -> Path:
         os.chmod(d, 0o755)  # base OS dirs are 0755 whatever the test umask is
     (root / "etc/passwd").write_text("root:x:0:0:root:/root:/bin/bash\n"
                                      "claude-fallback:x:1002:1002::/home/claude-fallback:/bin/bash\n"
-                                     "codex-fallback:x:1011:1011::/home/codex-fallback:/bin/bash\n")
-    (root / "etc/group").write_text("root:x:0:\nclaude-fallback:x:1002:\ncodex-fallback:x:1011:\n")
+                                     "codex-fallback:x:1011:1011::/home/codex-fallback:/bin/bash\n"
+                                     "fixture-recovery:x:2001:2001::/home/fixture-recovery:/bin/bash\n"
+                                     "fixture-watchman:x:2002:2002::/home/fixture-watchman:/bin/bash\n")
+    (root / "etc/group").write_text("root:x:0:\nclaude-fallback:x:1002:\ncodex-fallback:x:1011:\nfixture-recovery:x:2001:\nfixture-watchman:x:2002:\n")
     (root / "etc/shadow").write_text("root:*:20000:0:99999:7:::\n")
     (root / "srv/inputs/bot-token").write_bytes(TOKEN)
     os.chmod(root / "srv/inputs/bot-token", 0o600)
@@ -439,7 +441,7 @@ class RefusalTest(_Base):
 
     def test_inputs_no_longer_produce_the_plan(self) -> None:
         registry = registry_doc()
-        registry["seats"] = registry["seats"][:1]
+        registry["seats"][0]["uid"] = 2003  # a still-valid registry that no longer renders the plan's units
         self.assert_refused("plan_sha256 mismatch", registry=registry)
 
     def test_stale_registry_framework_digest(self) -> None:
@@ -594,7 +596,7 @@ class ApplyTest(_Base):
         calls = [list(c) for c in holder["runner"].calls if c[0] == H.SETPRIV]
         self.assertEqual(calls, argvs)  # exactly the reviewed argv, in plan order
         registry = json.loads((self.root / "etc/pantheon/host-broker/seat-registry.json").read_bytes())
-        self.assertEqual([p["seat_id"] for p in registry["plans"]], ["watchman", "recovery"])
+        self.assertEqual([p["seat_id"] for p in registry["plans"]], ["watchman"])
         for p in registry["plans"]:
             data = (self.root / p["path"].lstrip("/")).read_bytes()
             self.assertEqual(hashlib.sha256(data).hexdigest(), p["sha256"])
@@ -1491,7 +1493,7 @@ class ReviewLowTest(_Base):
         self.assertEqual(outcome.rc, 0)
         fw = self.plan["framework"]["root"]
         cwds = [cwd for argv, cwd in holder["runner"].call_cwds if argv[0] == H.SETPRIV]
-        self.assertEqual(cwds, [fw, fw])
+        self.assertEqual(cwds, [fw])  # one protocol-test seat, one producer run
         for r in outcome.receipt["entries"]:
             if r["kind"] == "plan_registration":
                 self.assertEqual(r["observations"]["cwd"], fw)
@@ -1765,6 +1767,40 @@ class U4bSeamTest(unittest.TestCase):
         tree = ast.parse(Path(A.__file__).read_text(encoding="utf-8"))
         main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
         self.assertNotIn("rehearsal", ast.dump(main))
+
+
+class ProductionPlanApplyTest(_Base):
+    """ORG-052 section 8 clarification (#1665): a production plan (no protocol-test
+    seat) applies, verifies and reruns with no plan registration at all."""
+
+    def production(self):
+        return build_plan(manifest=T.with_approver(T.manifest_doc()))
+
+    def test_a_production_plan_applies_and_verifies_with_no_registered_plan(self) -> None:
+        plan, _ = self.production()
+        self.assertFalse([e for e in plan["entries"] if e["kind"] in ("plan_registration", "registry_post_registration")])
+        outcome, holder = self.apply(plan=plan, manifest=T.with_approver(T.manifest_doc()))
+        self.assertEqual(outcome.rc, 0, outcome.receipt["failed_entry"])
+        self.assertEqual([c for c in holder["runner"].calls if c[0] == H.SETPRIV], [])  # the producer never runs
+        registry = json.loads((self.root / "etc/pantheon/host-broker/seat-registry.json").read_bytes())
+        self.assertNotIn("plans", registry)
+        self.assertFalse((self.root / "run/pantheon-host-install").exists())
+        self.assertEqual(os.listdir(self.root / "etc/pantheon/host-broker/plans"), [])
+        rc, report = self.verify(plan=plan)
+        self.assertEqual(rc, 0, [r for r in report if not r["ok"]])
+        self.assertFalse([r for r in report if "plans not registered" in json.dumps(r)])
+
+    def test_a_production_rerun_is_idempotent_and_still_registers_nothing(self) -> None:
+        plan, _ = self.production()
+        manifest = T.with_approver(T.manifest_doc())
+        first, _ = self.apply(plan=plan, manifest=manifest)
+        self.assertEqual(first.rc, 0, first.receipt["failed_entry"])
+        before = snapshot(self.root)
+        second, holder = self.apply(plan=plan, manifest=manifest, receipt="/var/lib/pantheon-install-receipts/r2.json")
+        self.assertEqual(second.rc, 0, second.receipt["failed_entry"])
+        self.assertEqual([c for c in holder["runner"].calls if c[0] == H.SETPRIV], [])
+        self.assertEqual(without(snapshot(self.root), ["/var/lib/pantheon-install-receipts"]),
+                         without(before, ["/var/lib/pantheon-install-receipts"]))
 
 
 if __name__ == "__main__":

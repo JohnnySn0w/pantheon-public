@@ -1,5 +1,5 @@
 {
   "name": "pantheon-fleet-usage",
-  "version": "0.1.0",
-  "description": "Pantheon fleet usage producer (T-4510): on session.measure, records the shared weekly Max usage to the per-seat file the fleet usage gate reads. Observes only; touches no prompt."
+  "version": "0.2.0",
+  "description": "Pantheon fleet usage producer (T-4510, T-4536): on session.measure, records the shared weekly Max usage to the per-seat file the fleet usage gate reads; on turn.complete, appends one token-count row per turn to the seat's daily usage ledger. Observes only; touches no prompt and records no content."
 }

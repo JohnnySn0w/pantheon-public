@@ -86,22 +86,27 @@ Should show one `applying svc:<name> → http://127.0.0.1:<port>` line per entry
 kino:8443
 dashboard:4820
 echo-recorder:8447
+echo-recorder:/updates:/var/lib/pantheon/echo-updates
 ```
 
-Comments start with `#`; blank lines OK. Adding a new service = appending one line + running `tailscale serve --service=...` once (the unit re-applies on every boot from then on).
+Comments start with `#`; blank lines OK. A `<name>:/<path>:/<abs-dir>` line mounts a directory at a sub-path of an existing service (T-6033); put it after that service's root line. Remove a mount with `tailscale serve --service=svc:<name> --https=443 --set-path=<path> off` and delete its line. Adding a new service = appending one line + running `tailscale serve --service=...` once (the unit re-applies on every boot from then on).
 
 ### `/usr/local/sbin/tailscale-serve-restore` — re-apply script
 
 ```bash
 #!/usr/bin/env bash
 # Re-apply Pantheon's Tailscale Serve service-scope mappings on boot.
-# Source-of-truth list lives in /etc/tailscale/services.conf (one line per
-# service: <name>:<backend-port>). Each invocation is idempotent — tailscale
-# treats re-applying an existing mapping as a no-op.
+# Source-of-truth list lives in /etc/tailscale/services.conf. Two line forms:
+#   <name>:<backend-port>        proxy the service root to http://127.0.0.1:<port>
+#   <name>:/<path>:/<abs-dir>    mount a directory at a sub-path (T-6033), e.g.
+#                                echo-recorder:/updates:/var/lib/pantheon/echo-updates
+# List a service's root line before its path mounts. Each invocation is
+# idempotent: tailscale treats re-applying an existing mapping as a no-op.
 
 set -euo pipefail
 
 CONF="${1:-/etc/tailscale/services.conf}"
+TS="${TAILSCALE_BIN:-/usr/bin/tailscale}"  # override for tests only
 
 if [[ ! -r "$CONF" ]]; then
   echo "missing config: $CONF" >&2
@@ -115,16 +120,31 @@ fi
 # 60s for BackendState=Running, then proceed best-effort. pipefail-safe via
 # '|| true' so a transient status failure during NoState doesn't abort the script.
 for _ in $(seq 1 30); do
-  state="$(/usr/bin/tailscale status --json 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true)"
+  state="$("$TS" status --json 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true)"
   [[ "$state" == "Running" ]] && break
   sleep 2
 done
 
-while IFS=: read -r name port; do
+rc=0
+while IFS=: read -r name target dir extra; do
   [[ -z "$name" || "$name" =~ ^# ]] && continue
-  echo "applying svc:$name → http://127.0.0.1:$port"
-  /usr/bin/tailscale serve --service="svc:$name" --bg --https=443 "http://127.0.0.1:$port"
+  if [[ -n "$extra" ]]; then
+    echo "skipping malformed line for $name (too many fields)" >&2; rc=1; continue
+  fi
+  if [[ "$target" =~ ^[0-9]+$ && -z "$dir" ]]; then
+    echo "applying svc:$name → http://127.0.0.1:$target"
+    "$TS" serve --service="svc:$name" --bg --https=443 "http://127.0.0.1:$target" || rc=1
+  elif [[ "$target" == /* && "$dir" == /* ]]; then
+    if [[ ! -d "$dir" ]]; then
+      echo "skipping svc:$name $target: $dir is not a directory" >&2; rc=1; continue
+    fi
+    echo "applying svc:$name $target → $dir"
+    "$TS" serve --service="svc:$name" --bg --https=443 --set-path="$target" "$dir" || rc=1
+  else
+    echo "skipping malformed line for $name" >&2; rc=1
+  fi
 done < "$CONF"
+exit "$rc"
 ```
 
 This is the copy installed on the VPS (T-0902) and, since 2026-10-22, CT201 (T-5003). CT201 had been built from an older copy of this block that lacked the wait loop, and its unit failed at every boot with `unexpected state: NoState`.

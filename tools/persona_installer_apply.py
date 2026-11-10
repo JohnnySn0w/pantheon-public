@@ -34,6 +34,7 @@ import dataclasses
 import os
 import pwd
 import re
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -72,6 +73,21 @@ DEFAULT_MANIFEST = REPO_ROOT / "instance.yaml"
 WORKFLOWS = ("all-in-one", "stage-prefix", "staged-activate", "reconcile-keep-going")
 _RECEIPT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 PLAN_SIDECAR_SCHEMA = "pantheon-persona-install-plan-sidecar/v1"
+
+
+# T-6167 PR-6: hand-run apply is a labelled fallback. The germinate engine is the default
+# seat-install path; converging a live seat (--only / staged) stays here until T-5930.
+# Nothing is refused: the label is JSON + stderr only.
+FALLBACK_DRIVER = "hand-run-fallback"
+FALLBACK_NOTICE = (
+    "persona_installer_apply: hand-run fallback driver; the default seat-install path is the "
+    "germinate engine (germinate install --seat <account> --live, T-6167). Converging a live "
+    "seat (--only/staged) stays here until T-5930."
+)
+
+
+def _emit_fallback_notice() -> None:
+    print(FALLBACK_NOTICE, file=sys.stderr)
 
 
 class ApplyRefused(InstallerError):
@@ -183,6 +199,67 @@ def preflight_verdicts(
     return verdicts
 
 
+# desired keys naming another operation this one relies on having run (T-6099 review).
+_CROSS_OP_KEYS = ("residue_cleared_by", "trust_set_by")
+
+
+def _prerequisites(operation: Any) -> set[str]:
+    """Ids/events an operation relies on: its desired/precondition ``after`` lists plus the
+    cross-op ``residue_cleared_by`` / ``trust_set_by`` references. Event names (e.g.
+    ``direct-fire``) are not op ids, so --only refuses them too (fail-closed)."""
+    out: set[str] = set()
+    for source in (operation.desired, operation.precondition):
+        out.update(item.strip() for item in str(source.get("after", "")).split(",") if item.strip())
+    out.update(str(operation.desired[key]) for key in _CROSS_OP_KEYS if operation.desired.get(key))
+    return out
+
+
+def select_only(plan: InstallPlan, only: Sequence[str]) -> InstallPlan:
+    """T-6099: the digest-bound sub-plan of exactly the named operations, in plan order.
+
+    Fail-closed: refuses an empty selection, an id not in the full plan, and a named
+    operation with any prerequisite (see ``_prerequisites``) that is not itself named (a
+    prerequisite outside the subset cannot be shown satisfied by this plan). The full
+    plan's operator actions are not carried: they belong to the operations left out.
+    Drift on operations outside the subset does not block, because they are not in the
+    plan. The digest is the ordinary plan digest of the sub-plan, so --execute must name
+    the same subset.
+    """
+    wanted = [item.strip() for item in only if item.strip()]
+    if not wanted:
+        raise ApplyRefused("--only names no operation")
+    ids = [operation.operation_id for operation in plan.operations]
+    unknown = sorted(set(wanted) - set(ids))
+    if unknown:
+        raise ApplyRefused(f"--only: not in the {plan.persona!r} plan: {', '.join(unknown)}")
+    selected = tuple(operation for operation in plan.operations if operation.operation_id in set(wanted))
+    missing = sorted(
+        f"{operation.operation_id} needs {need}"
+        for operation in selected
+        for need in _prerequisites(operation)
+        if need not in set(wanted)
+    )
+    if missing:
+        raise ApplyRefused(
+            "--only: prerequisite not in the subset (name it too, or apply the full plan): "
+            + "; ".join(missing)
+        )
+    return InstallPlan.create(
+        schema=plan.schema,
+        manifest_version=plan.manifest_version,
+        instance=plan.instance,
+        role=plan.role,
+        persona=plan.persona,
+        account=plan.account,
+        configured_harness=plan.configured_harness,
+        selected_harness=plan.selected_harness,
+        root=plan.root,
+        operations=selected,
+        operator_actions=(),
+        provenance=plan.provenance,
+    )
+
+
 def build_plan(
     manifest_path: Path,
     persona: str,
@@ -192,12 +269,26 @@ def build_plan(
     root: Path = Path("/"),
     maintenance_bypass: bool = False,
     workflow: str = "all-in-one",
+    only: Sequence[str] | None = None,
+    live_probe: Callable[[str], bool] | None = None,
 ) -> tuple[PersonaInstaller, InstallPlan, Manifest]:
+    if only is not None and workflow != "all-in-one":
+        raise ApplyRefused("--only applies to the all-in-one workflow only")
     manifest = Manifest.load(manifest_path)
     installer = PersonaInstaller(repo_root=repo_root)
     # T-5475: the flag is a plan input (digest-bound); only passed when set so every default
     # call is the exact pre-T-5475 call
-    extra = {"maintenance_bypass": True} if maintenance_bypass else {}
+    extra: dict[str, bool] = {"maintenance_bypass": True} if maintenance_bypass else {}
+    # T-6140: --only plans on an already-live seat drop the periodic enables' bootstrap edges.
+    # Probed only for --only (full plans/digests stay byte-identical); a probe error or no
+    # probe means fresh edges. The bool is digest-bound through the enables' `after`.
+    if only is not None and live_probe is not None:
+        try:
+            live = bool(live_probe(f"pantheon-persona-consume@{persona}.timer"))
+        except Exception:  # unknown is not live: keep the full edges
+            live = False
+        if live:
+            extra["consume_timer_live"] = True
     plan = installer.plan(manifest, persona, harness_override=harness, root=root, **extra)
     if workflow == "reconcile-keep-going":
         keep_ids = {
@@ -248,7 +339,14 @@ def build_plan(
             operator_actions=(),
             provenance=plan.provenance,
         )
+    if only is not None:
+        plan = select_only(plan, only)
     return installer, plan, manifest
+
+
+def _live_probe(backend: Any) -> Callable[[str], bool] | None:
+    """T-6140: the backend's already-live read (None for a backend that has none)."""
+    return getattr(backend, "consume_timer_live", None)
 
 
 def _account_uid(account: str) -> int | None:
@@ -309,41 +407,56 @@ def dry_run(
     euid: int | None = None,
     uid_of: Callable[[str], int | None] = _account_uid,
     maintenance_bypass: bool = False,
+    only: Sequence[str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Plan + full preflight. Never mutates (see the module docstring and
     test_persona_installer_apply_cli.DryRunIsReadOnlyTests). Operations whose
     preflight would write (the mailbox writable-root probe) are DEFERRED to execute:
     a distinct state that is neither a pass nor a refusal and does not fail the run."""
+    _emit_fallback_notice()
+    backend = backend or _default_backend()
     _installer, plan, _manifest = build_plan(
         manifest_path, persona, harness=harness, repo_root=repo_root, root=root,
-        maintenance_bypass=maintenance_bypass, workflow=workflow,
+        maintenance_bypass=maintenance_bypass, workflow=workflow, only=only,
+        live_probe=_live_probe(backend),
     )
     require_target_account(plan, euid=euid, uid_of=uid_of)
     ensure_account_path(_account_home(plan))
     verdicts = preflight_verdicts(
-        plan, backend or _default_backend(), actor_for_plan(plan, uid=euid), dry_run=True,
+        plan, backend, actor_for_plan(plan, uid=euid), dry_run=True,
         workflow=workflow,
     )
     problems = [v for v in verdicts if v["state"] == "refused"]
     deferred = [v for v in verdicts if v["state"] == "deferred"]
+    # T-4835: the same classification the apply gate uses, so a green dry-run cannot be
+    # refused at --execute for a credential ref. Refusing classes make the dry run not-ok.
+    credentials = (_installer or PersonaInstaller(repo_root)).credential_resolution(plan)
+    credential_warnings = [credentials.refusal] if credentials.refusal else []
     report = {
         "mode": "dry-run",
+        "driver": FALLBACK_DRIVER,
         "persona": plan.persona,
         "account": plan.account,
         "workflow": workflow,
+        "only": list(only) if only is not None else None,
         "plan_digest": plan.digest,
         "operation_count": len(plan.operations),
         "operations": verdicts,
-        "problems": [f"{v['operation_id']}: {v['classification']}: {v['detail']}" for v in problems],
+        "problems": [f"{v['operation_id']}: {v['classification']}: {v['detail']}" for v in problems]
+        + credential_warnings,
         "deferred": [f"{v['operation_id']}: {v['detail']}" for v in deferred],
-        "ok": not problems,
+        "credential_resolution": [dict(item) for item in credentials.entries],
+        "credential_warnings": credential_warnings,
+        "ok": not problems and not credential_warnings,
         "next": (
-            f"re-run with --execute --plan-digest {plan.digest} to apply exactly this plan"
-            if not problems
+            f"re-run with --execute --plan-digest {plan.digest}"
+            + (f" --only {','.join(only)}" if only is not None else "")
+            + " to apply exactly this plan"
+            if not problems and not credential_warnings
             else "resolve the problems above; nothing was changed"
         ),
     }
-    return (0 if not problems else 1), report
+    return (0 if not problems and not credential_warnings else 1), report
 
 
 def _atomic_json(directory: Path, name: str, payload: Mapping[str, Any]) -> Path:
@@ -374,7 +487,12 @@ def _write_plan_sidecar(plan: InstallPlan, receipt: ApplyReceipt) -> Path:
     return _atomic_json(
         directory,
         f"{receipt.receipt_id}.plan.json",
-        {"schema": PLAN_SIDECAR_SCHEMA, "receipt_id": receipt.receipt_id, "plan": plan.to_dict()},
+        {
+            "schema": PLAN_SIDECAR_SCHEMA,
+            "driver": FALLBACK_DRIVER,
+            "receipt_id": receipt.receipt_id,
+            "plan": plan.to_dict(),
+        },
     )
 
 
@@ -409,12 +527,16 @@ def execute(
     euid: int | None = None,
     uid_of: Callable[[str], int | None] = _account_uid,
     maintenance_bypass: bool = False,
+    only: Sequence[str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
+    _emit_fallback_notice()
     if workflow not in WORKFLOWS:
         raise ApplyRefused(f"unknown workflow {workflow!r}")
+    backend = backend or _default_backend()
     installer, plan, manifest = build_plan(
         manifest_path, persona, harness=harness, repo_root=repo_root, root=root,
-        maintenance_bypass=maintenance_bypass, workflow=workflow,
+        maintenance_bypass=maintenance_bypass, workflow=workflow, only=only,
+        live_probe=_live_probe(backend),
     )
     require_target_account(plan, euid=euid, uid_of=uid_of)
     if plan_digest != plan.digest:
@@ -423,7 +545,6 @@ def execute(
             f"{plan.digest!r}; re-run the dry run from this commit and approve its digest"
         )
     ensure_account_path(_account_home(plan))
-    backend = backend or _default_backend()
     actor = actor_for_plan(plan, uid=euid)
     if workflow in {"all-in-one", "reconcile-keep-going"}:
         report = installer.apply(plan, plan.digest, backend, actor, manifest=manifest)
@@ -443,8 +564,10 @@ def execute(
         sidecar = str(_write_plan_sidecar(plan, report.receipt))
     summary = {
         "mode": "execute",
+        "driver": FALLBACK_DRIVER,
         "persona": plan.persona,
         "workflow": workflow,
+        "only": list(only) if only is not None else None,
         "plan_digest": plan.digest,
         "status": report.status,
         "changed": report.changed,
@@ -549,6 +672,8 @@ def rollback_receipt(
 __all__ = [
     "ApplyRefused",
     "DEFAULT_STATE_DIR_RELATIVE",
+    "FALLBACK_DRIVER",
+    "FALLBACK_NOTICE",
     "WORKFLOWS",
     "actor_for_plan",
     "build_plan",

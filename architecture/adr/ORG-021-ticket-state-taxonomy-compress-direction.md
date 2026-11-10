@@ -86,6 +86,7 @@ fields:
   - {field: nearest_intent_ref, kind: scalar, required: never, authority: "ORG-054; T-3168", status: active}
   - {field: serves, kind: scalar, required: never, authority: "ORG-034; T-1103", status: active}
   - {field: labels, kind: list, required: never, authority: "ORG-003 (free vocabulary); ORG-021 (interactive-required)", status: active}
+  - {field: tier_rank, kind: int, required: never, authority: "ORG-078 Amendment 1; T-5715 (the operator TG 12437/12447)", status: active}
   - {field: intent, kind: enum, values: [action, ratify, noodle], required: "when target == operator", authority: "ORG-021; T-0465", status: active}
   - {field: operator_intent, kind: enum, values: [action, ratify, noodle], required: never, authority: "T-5015", status: active}
   - {field: ratifiable_files, kind: list, required: "when intent == ratify", authority: "ORG-021; ORG-015", status: active}

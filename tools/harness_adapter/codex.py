@@ -41,6 +41,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import stat
 import sys
 import tempfile
@@ -160,8 +161,13 @@ def _parse_codex_reset(region: str, *, now: datetime, tz: tzinfo | None) -> date
         day, minute = int(match.group(2)), int(match.group(5))
         year = int(match.group(3)) if match.group(3) else now.astimezone(zone).year
         candidate = datetime(year, month, day, hour, minute, tzinfo=zone)
-        if not match.group(3) and candidate < now - timedelta(days=1):
-            candidate = datetime(year + 1, month, day, hour, minute, tzinfo=zone)
+        if not match.group(3):
+            # T-5801: nearest year. A banner shown after its reset stays past;
+            # only a date more than half a year off crosses a year boundary.
+            if candidate < now - timedelta(days=183):
+                candidate = datetime(year + 1, month, day, hour, minute, tzinfo=zone)
+            elif candidate > now + timedelta(days=183):
+                candidate = datetime(year - 1, month, day, hour, minute, tzinfo=zone)
     except (ValueError, OverflowError):
         return None
     return candidate.astimezone(timezone.utc)
@@ -1393,7 +1399,17 @@ def _insert_into_toml_table(
 
 def ensure_update_check_disabled(codex_home: Path) -> bool:
     """Idempotently set ``check_for_update_on_startup = false`` at config.toml
-    root scope.
+    root scope, and ``apps = false`` under ``[features]``.
+
+    T-6257: the built-in ``codex_apps`` service (ChatGPT apps/connectors, the
+    stable ``apps`` feature, default on in the pinned codex-cli 0.147.0 per
+    ``codex features list``) failed to initialize on repeated Artisan launches,
+    including the T-5023 bounded relaunch. No fleet seat uses ChatGPT apps, and
+    0.147.0 has no optional-MCP startup-grace key, so the supported control on
+    the pin is to not start the service at all. Same respect-prior-choice rule:
+    an explicit ``features.apps`` is left alone. If ``features`` is declared in a
+    shape a ``[features]`` block cannot extend (dotted keys, inline table) the
+    apps seed is skipped rather than writing invalid TOML.
 
     T-2597 wedge-map wedges #2 (blocking "Update available!" 1/2/3 picker)
     and #3 (non-blocking update banner): both read the same cached
@@ -1426,10 +1442,20 @@ def ensure_update_check_disabled(codex_home: Path) -> bool:
             f"codex config.toml at {config_path} is not valid TOML -- refusing to "
             "blind-insert an update-check entry into unparseable content"
         ) from exc
-    if "check_for_update_on_startup" in parsed:
+    new_text = existing_text
+    if "check_for_update_on_startup" not in parsed:
+        new_text = _insert_root_level_toml_bool(new_text, "check_for_update_on_startup", False)
+    features = parsed.get("features")
+    if not (isinstance(features, dict) and "apps" in features):
+        candidate = _insert_into_toml_table(new_text, "features", {"apps": False})
+        try:
+            if tomllib.loads(candidate).get("features", {}).get("apps") is False:
+                new_text = candidate
+        except tomllib.TOMLDecodeError:
+            pass
+    if new_text == existing_text:
         return False
     codex_home.mkdir(parents=True, exist_ok=True)
-    new_text = _insert_root_level_toml_bool(existing_text, "check_for_update_on_startup", False)
     config_path.write_text(new_text, encoding="utf-8")
     return True
 
@@ -1605,18 +1631,44 @@ _HOOKS_LIST_TIMEOUT_S = 15.0
 
 
 def worker_guard_command(account_home: Path) -> str:
-    """The PreToolUse worker-guard command for a seat (codex-config snippet).
+    """The canonical PreToolUse worker-guard command for a seat: the v2 guard (T-5695, T-6123).
 
     ``-I`` (T-4397 part A): an isolated interpreter ignores PYTHON* env vars and the user
     site-packages, so a worker-written usercustomize/sitecustomize/.pth cannot run before the
     guard. Decision-identical to the plain invocation (T-4395 smoke: 1040 payloads, 0 diffs).
     """
+    return f"/usr/bin/python3 -I {account_home}/pantheon-config/tools/hooks/worker-guard-v2.py"
+
+
+def rollback_worker_guard_command(account_home: Path) -> str:
+    """The v1 ``-I`` guard command: the previous canonical, kept as the operator ROLLBACK (T-6123).
+
+    An operator re-points the one guard entry here when v2 misbehaves; the launch path leaves it
+    alone (only its trust is maintained) unless ``upgrade_rollback`` is asked for."""
     return f"/usr/bin/python3 -I {account_home}/pantheon-config/tools/hooks/worker-guard.py"
 
 
 def _legacy_worker_guard_commands(account_home: Path) -> tuple[str, ...]:
-    """Earlier canonical guard commands (codex-config da8c863, T-4144/T-4160/T-4166), upgraded in place."""
-    return (f"/usr/bin/python3 {account_home}/pantheon-config/tools/hooks/worker-guard.py",)
+    """Stale guard forms (codex-config da8c863, T-4144/T-4160/T-4166), upgraded in place: the
+    plain invocations (no ``-I``) of v1 and v2."""
+    return (f"/usr/bin/python3 {account_home}/pantheon-config/tools/hooks/worker-guard.py",
+            f"/usr/bin/python3 {account_home}/pantheon-config/tools/hooks/worker-guard-v2.py")
+
+
+_GUARD_SCRIPT_RE = re.compile(r"/pantheon-config/tools/hooks/worker-guard(?:-v2)?\.py(?![\w.-])")
+
+
+def _guard_like_positions(parsed: dict[str, Any]) -> list[tuple[int, int]]:
+    """(group, hook) of EVERY PreToolUse hook whose command names a worker-guard script, however
+    edited (extra args, another interpreter): the never-two-guards scan (T-6123)."""
+    groups = (parsed.get("hooks") or {}).get("PreToolUse") or []
+    return [
+        (g, h)
+        for g, group in enumerate(groups if isinstance(groups, list) else [])
+        for h, hook in enumerate((group or {}).get("hooks") or [])
+        if isinstance(hook, dict) and isinstance(hook.get("command"), str)
+        and _GUARD_SCRIPT_RE.search(hook["command"])
+    ]
 
 
 _WORKER_GUARD_BLOCK = """
@@ -1624,8 +1676,10 @@ _WORKER_GUARD_BLOCK = """
 # seat's codex runtime. codex 0.147 ships multi_agent default-on and sets agent_type
 # only on a spawned subagent's tool calls, so the main loop is never restricted.
 # Seeded by tools.harness_adapter.codex.ensure_worker_guard_hook; source of truth is
-# codex-config templates/config.toml.snippet. python3 -I (T-4397 A); timeout 30 sits
-# above the guard's own fail-closed deadline, since a codex hook timeout fails open (T-4395).
+# harness/codex/templates/config.toml.snippet (which moves to v2 in T-6122); worker-guard-v2.py
+# is canonical since T-5695/T-6123, v1 worker-guard.py is the operator rollback. python3 -I
+# (T-4397 A); timeout 30
+# sits above the guard's own fail-closed deadline, since a codex hook timeout fails open (T-4395).
 [[hooks.PreToolUse]]
 matcher = "Bash|apply_patch"
 
@@ -1643,7 +1697,12 @@ def _worker_guard_log(message: str) -> None:
 
 def _guard_positions(parsed: dict[str, Any], command: str) -> list[tuple[int, int]]:
     """(group, hook) indices of `command` under [[hooks.PreToolUse]]: codex's key suffix."""
-    groups = (parsed.get("hooks") or {}).get("PreToolUse") or []
+    return _hook_positions(parsed, "PreToolUse", command)
+
+
+def _hook_positions(parsed: dict[str, Any], event: str, command: str) -> list[tuple[int, int]]:
+    """(group, hook) indices of ``command`` for one Codex lifecycle event."""
+    groups = (parsed.get("hooks") or {}).get(event) or []
     return [
         (g, h)
         for g, group in enumerate(groups if isinstance(groups, list) else [])
@@ -1653,7 +1712,12 @@ def _guard_positions(parsed: dict[str, Any], command: str) -> list[tuple[int, in
 
 
 def _guard_hook(parsed: dict[str, Any], pos: tuple[int, int]) -> tuple[dict[str, Any], dict[str, Any]]:
-    group = parsed["hooks"]["PreToolUse"][pos[0]]
+    return _hook_at(parsed, "PreToolUse", pos)
+
+
+def _hook_at(parsed: dict[str, Any], event: str,
+             pos: tuple[int, int]) -> tuple[dict[str, Any], dict[str, Any]]:
+    group = parsed["hooks"][event][pos[0]]
     return group, group["hooks"][pos[1]]
 
 
@@ -1668,7 +1732,11 @@ def _key_config_path(codex_home: Path) -> Path:
 
 def _guard_key(codex_home: Path, pos: tuple[int, int]) -> str:
     """codex's hook key: position-based, NOT derived from the command (live-verified)."""
-    return f"{_key_config_path(codex_home)}:pre_tool_use:{pos[0]}:{pos[1]}"
+    return _hook_key(codex_home, "pre_tool_use", pos)
+
+
+def _hook_key(codex_home: Path, event_key: str, pos: tuple[int, int]) -> str:
+    return f"{_key_config_path(codex_home)}:{event_key}:{pos[0]}:{pos[1]}"
 
 
 def _guard_definition_current(parsed: dict[str, Any], pos: tuple[int, int], command: str) -> bool:
@@ -1703,10 +1771,16 @@ def _guard_definition_toml(parsed: dict[str, Any], pos: tuple[int, int]) -> str 
     currentHash covers the matcher and any extra hook key, e.g. statusMessage). Sibling hooks of
     the group are left out (the hash is per hook). None when a value can't be rendered exactly;
     the round-trip below proves the rendering."""
-    group, hook = _guard_hook(parsed, pos)
+    return _hook_definition_toml(parsed, "PreToolUse", pos)
+
+
+def _hook_definition_toml(parsed: dict[str, Any], event: str,
+                          pos: tuple[int, int]) -> str | None:
+    """Standalone TOML for exactly one hook definition, for Codex hash precomputation."""
+    group, hook = _hook_at(parsed, event, pos)
     group_keys = {k: v for k, v in group.items() if k != "hooks"}
-    lines = ["[[hooks.PreToolUse]]"]
-    for table, items in ((None, group_keys), ("[[hooks.PreToolUse.hooks]]", hook)):
+    lines = [f"[[hooks.{event}]]"]
+    for table, items in ((None, group_keys), (f"[[hooks.{event}.hooks]]", hook)):
         if table:
             lines += ["", table]
         for k, v in items.items():
@@ -1715,7 +1789,7 @@ def _guard_definition_toml(parsed: dict[str, Any], pos: tuple[int, int]) -> str 
                 return None
             lines.append(f"{_toml_key(k)} = {rendered}")
     text = "\n".join(lines) + "\n"
-    [rt_group] = tomllib.loads(text)["hooks"]["PreToolUse"]
+    [rt_group] = tomllib.loads(text)["hooks"][event]
     rt_hooks = rt_group.pop("hooks")
     return text if (rt_group, rt_hooks) == (group_keys, [hook]) else None
 
@@ -1732,19 +1806,29 @@ def _precompute_guard_hash(definition: str, command: str, *, executable: Path, a
     which the real home holds an untrusted/"modified" guard (codex skips those without
     --dangerously-bypass-hook-trust, i.e. fails open). None on any failure.
     """
-    with tempfile.TemporaryDirectory(prefix="codex-wg-hash-") as tmp:
+    return _precompute_hook_hash(
+        definition, command, event_name="preToolUse", event_key="pre_tool_use",
+        executable=executable, account_home=account_home, read_hooks=read_hooks,
+    )
+
+
+def _precompute_hook_hash(definition: str, command: str, *, event_name: str, event_key: str,
+                          executable: Path, account_home: Path, read_hooks) -> str | None:
+    """Ask a scratch Codex home for the hash of one exact hook definition."""
+    with tempfile.TemporaryDirectory(prefix="codex-hook-hash-") as tmp:
         scratch = Path(tmp)
-        (scratch / "config.toml").write_text(definition, encoding="utf-8")
+        feature = "[features]\nhooks = true\n\n" if event_name in {"sessionStart", "stop"} else ""
+        (scratch / "config.toml").write_text(feature + definition, encoding="utf-8")
         try:
             hooks = read_hooks(executable, codex_home=scratch, cwd=account_home,
                                timeout=_HOOKS_LIST_TIMEOUT_S)
         except Exception as exc:  # noqa: BLE001 - best-effort read, never fatal to a launch
             _worker_guard_log(f"hash precompute failed: {exc!r}")
             return None
-        prefix = f"{_key_config_path(scratch)}:pre_tool_use:"
+        prefix = f"{_key_config_path(scratch)}:{event_key}:"
         matches = [
             h for h in hooks or []
-            if h.get("command") == command and h.get("eventName") == "preToolUse"
+            if h.get("command") == command and h.get("eventName") == event_name
             and str(h.get("key") or "").startswith(prefix)
         ]
     digest = matches[0].get("currentHash") if len(matches) == 1 else None
@@ -1828,9 +1912,9 @@ def _rewrite_guard_definition(
         return None
 
 
-def _set_trusted_hash(text: str, parsed: dict[str, Any], key: str, digest: str) -> str | None:
-    """`text` with state[key].trusted_hash = digest (replacing any stale one, keeping sibling
-    keys), or None unless that is provably the ONLY change."""
+def _set_hook_state_value(text: str, parsed: dict[str, Any], key: str,
+                          name: str, value: Any) -> str | None:
+    """Set one ``hooks.state[key]`` scalar, preserving every sibling key."""
     lines = text.splitlines(keepends=True)
     if lines and not lines[-1].endswith("\n"):
         lines[-1] += "\n"
@@ -1840,17 +1924,23 @@ def _set_trusted_hash(text: str, parsed: dict[str, Any], key: str, digest: str) 
         return None
     if headers:
         hs, he = _table_bounds(lines, headers[0])
-        if not _set_line(lines, hs + 1, he, "trusted_hash", digest, after=hs):
+        if not _set_line(lines, hs + 1, he, name, value, after=hs):
             return None
         new_text = "".join(lines)
     else:
-        new_text = "".join(lines).rstrip("\n") + f"\n\n{header}\ntrusted_hash = {_toml_scalar(digest)}\n"
+        new_text = ("".join(lines).rstrip("\n")
+                    + f"\n\n{header}\n{name} = {_toml_scalar(value)}\n")
     expected = copy.deepcopy(parsed)
-    expected.setdefault("hooks", {}).setdefault("state", {}).setdefault(key, {})["trusted_hash"] = digest
+    expected.setdefault("hooks", {}).setdefault("state", {}).setdefault(key, {})[name] = value
     try:
         return new_text if tomllib.loads(new_text) == expected else None
     except tomllib.TOMLDecodeError:
         return None
+
+
+def _set_trusted_hash(text: str, parsed: dict[str, Any], key: str, digest: str) -> str | None:
+    """Set one trusted hash through the generic, provably-minimal state editor."""
+    return _set_hook_state_value(text, parsed, key, "trusted_hash", digest)
 
 
 # T-4428: a verified-marker in CODEX_HOME lets a launch skip the real home's hooks/list (median
@@ -1892,28 +1982,30 @@ def _verified_marker_body(codex_home: Path, key: str, command: str, config_bytes
     }
 
 
-def _verified_marker_hit(codex_home: Path, key: str, command: str, *, executable: Path) -> bool:
+def _verified_marker_hit(codex_home: Path, key: str, command: str, *, executable: Path,
+                         marker_name: str = _VERIFIED_MARKER_NAME) -> bool:
     """True only when the marker matches the CURRENT config bytes, key, command and binary."""
     try:
         config_bytes = (codex_home / "config.toml").read_bytes()
         expected = _verified_marker_body(codex_home, key, command, config_bytes, executable)
-        stored = json.loads((codex_home / _VERIFIED_MARKER_NAME).read_text(encoding="utf-8"))
+        stored = json.loads((codex_home / marker_name).read_text(encoding="utf-8"))
         return stored == expected
     except Exception:  # noqa: BLE001 - missing/unreadable/malformed: no hit, read instead
         return False
 
 
-def _write_verified_marker(codex_home: Path, body: dict[str, Any]) -> None:
+def _write_verified_marker(codex_home: Path, body: dict[str, Any], *,
+                           marker_name: str = _VERIFIED_MARKER_NAME) -> None:
     """Atomic (temp + rename), 0600. Best-effort: a failure only costs the next launch a read."""
     tmp_name = None
     try:
         directory = Path(os.path.realpath(codex_home))
-        fd, tmp_name = tempfile.mkstemp(prefix=f"{_VERIFIED_MARKER_NAME}.", suffix=".tmp",
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{marker_name}.", suffix=".tmp",
                                         dir=directory)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(body, handle, sort_keys=True)
         os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, directory / _VERIFIED_MARKER_NAME)
+        os.replace(tmp_name, directory / marker_name)
         tmp_name = None
     except Exception as exc:  # noqa: BLE001 - never fatal to a launch
         _worker_guard_log(f"{codex_home}: verified-marker not written: {exc!r}")
@@ -1938,6 +2030,506 @@ def _read_real_guard(codex_home: Path, account_home: Path, key: str, *, executab
     return next((h for h in hooks if h.get("key") == key), {})
 
 
+def _read_real_hooks(codex_home: Path, account_home: Path, *, executable: Path, read_hooks):
+    """One bounded hooks/list read; None is the common unverifiable result."""
+    try:
+        return read_hooks(executable, codex_home=codex_home, cwd=account_home,
+                          timeout=_HOOKS_LIST_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001 - best-effort launch preparation
+        _worker_guard_log(f"hooks/list on {codex_home} raised {exc!r}")
+        return None
+
+
+LIFECYCLE_SESSION_MATCHER = "startup|resume|clear|compact"
+LIFECYCLE_TIMEOUT_S = 5
+LIFECYCLE_CONTEXT_LIMIT = 1200
+_LIFECYCLE_MARKERS = {
+    "SessionStart": ".pantheon-session-start-hook-verified.json",
+    "Stop": ".pantheon-stop-hook-verified.json",
+}
+
+
+def resolve_lifecycle_persona(account_home: Path, persona: str | None = None) -> str | None:
+    if persona is not None:
+        return persona
+    try:
+        from tools import agent_role_map
+        return agent_role_map.account_persona(account_home.name)
+    except Exception:  # noqa: BLE001 - unknown accounts have no safe identity source
+        return None
+
+
+def lifecycle_source_path(account_home: Path, persona: str | None = None) -> Path | None:
+    """The persona-owned pinned standing source passed to SessionStart explicitly.
+
+    Codex compatibility layers take precedence when present.  A persona's canonical
+    pinned rules are the fallback for Codex-primary personas and fallback seats that
+    have no compatibility layer.  Consultant's ``codex.md`` is Consultant-only: an unknown or
+    source-less persona returns ``None`` rather than inheriting another identity.
+    """
+    persona = resolve_lifecycle_persona(account_home, persona)
+    names = (["codex.md"] if persona in {"consultant", "codex"}
+             else ([f"{persona}-codex.md", f"{persona}.md"] if persona else []))
+    for name in names:
+        candidate = account_home / "pantheon-config" / "pinned-rules" / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def lifecycle_hook_commands(account_home: Path, source_path: Path) -> tuple[str, str]:
+    hook_dir = account_home / "pantheon-config" / "harness" / "codex"
+    return (
+        f"/usr/bin/python3 {hook_dir}/run_codex_session_start_hook.py --source {source_path}",
+        f"/usr/bin/python3 {hook_dir}/run_codex_stop_hook.py",
+    )
+
+
+def _legacy_lifecycle_commands(account_home: Path) -> tuple[str, str]:
+    return (
+        f"/usr/bin/python3 {account_home}/codex-telegram/run_codex_session_start_hook.py",
+        f"/usr/bin/python3 {account_home}/codex-telegram/run_codex_stop_hook.py",
+    )
+
+
+def accepted_legacy_lifecycle_commands(
+    account_home: Path, persona: str | None = None,
+) -> tuple[str, str] | None:
+    """Consultant-only legacy pair, and only while both legacy entrypoints still exist."""
+    persona = resolve_lifecycle_persona(account_home, persona)
+    legacy_dir = account_home / "codex-telegram"
+    if persona not in {"consultant", "codex"} or not all(
+        (legacy_dir / name).is_file()
+        for name in ("run_codex_session_start_hook.py", "run_codex_stop_hook.py")
+    ):
+        return None
+    return _legacy_lifecycle_commands(account_home)
+
+
+def _lifecycle_entrypoints(account_home: Path, event: str) -> tuple[Path, Path]:
+    """The exact repo and legacy script paths that define one lifecycle family."""
+    hook_dir = account_home / "pantheon-config" / "harness" / "codex"
+    legacy_dir = account_home / "codex-telegram"
+    names = {
+        "SessionStart": "run_codex_session_start_hook.py",
+        "Stop": "run_codex_stop_hook.py",
+    }
+    name = names[event]
+    return hook_dir / name, legacy_dir / name
+
+
+def _raw_lifecycle_entrypoint_in_family(
+    account_home: Path, event: str, command: Any,
+) -> bool:
+    """Find exact entrypoint evidence without requiring shell-valid quoting."""
+    if not isinstance(command, str):
+        return False
+    interpreter = "/usr/bin/python3"
+    if not command.startswith(interpreter):
+        return False
+    remainder = command[len(interpreter):]
+    if not remainder or not remainder[0].isspace():
+        return False
+    remainder = remainder.lstrip()
+    for path in map(str, _lifecycle_entrypoints(account_home, event)):
+        for opener in ("", "'", '"'):
+            candidate = f"{opener}{path}"
+            if not remainder.startswith(candidate):
+                continue
+            tail = remainder[len(candidate):]
+            if opener and tail.startswith(opener):
+                tail = tail[1:]
+            if not tail or tail[0].isspace():
+                return True
+    return False
+
+
+def lifecycle_command_in_family(account_home: Path, event: str, command: Any) -> bool:
+    """Whether raw ``command`` names this account's exact lifecycle entrypoint.
+
+    Family evidence is deliberately broader than a valid/accepted command: once the
+    exact entrypoint follows ``/usr/bin/python3``, an unmatched opening quote or extra
+    arguments must not make the hook disappear from installer/checker inventory.
+    ``_lifecycle_command_migration_target`` separately enforces argv validity before
+    any existing family command can be migrated or normalized.
+    """
+    return _raw_lifecycle_entrypoint_in_family(account_home, event, command)
+
+
+def _lifecycle_command_migration_target(
+    account_home: Path,
+    event: str,
+    command: str,
+    *,
+    canonical: str,
+    legacy: str,
+    accepted: tuple[str, ...],
+) -> str | None:
+    """Return the safe final command, or ``None`` for malformed family evidence.
+
+    The preflight has already proved this is the event's only family candidate.
+    Accepted commands stay as-is.  The exact non-Consultant legacy form retains its prior
+    deterministic migration.  For the repo SessionStart entrypoint, exactly one
+    ``--source PATH`` argument is safe to normalize to the persona-canonical command.
+    No other argument-bearing or malformed family use is migrated.
+    """
+    if command in accepted:
+        return command
+    if command == legacy:
+        return canonical
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    repo_start, _legacy_start = _lifecycle_entrypoints(account_home, "SessionStart")
+    if event == "SessionStart" and argv[:2] == ["/usr/bin/python3", str(repo_start)]:
+        if len(argv) == 4 and argv[2] == "--source" and argv[3]:
+            return canonical
+    return None
+
+
+def _lifecycle_family_positions(
+    parsed: dict[str, Any], event: str, account_home: Path,
+) -> list[tuple[tuple[int, int], str]]:
+    """Every hook position using this account's lifecycle entrypoint family."""
+    groups = (parsed.get("hooks") or {}).get(event) or []
+    found: list[tuple[tuple[int, int], str]] = []
+    for group_index, group in enumerate(groups if isinstance(groups, list) else []):
+        if not isinstance(group, dict):
+            continue
+        hooks = group.get("hooks") or []
+        for hook_index, hook in enumerate(hooks if isinstance(hooks, list) else []):
+            if not isinstance(hook, dict):
+                continue
+            command = hook.get("command")
+            if lifecycle_command_in_family(account_home, event, command):
+                found.append(((group_index, hook_index), command))
+    return found
+
+
+def _replace_lifecycle_command(text: str, old: str, new: str) -> str | None:
+    lines = text.splitlines(keepends=True)
+    hits = [i for i, line in enumerate(lines) if _key_line(line, "command") == old]
+    if len(hits) != 1:
+        return None
+    indent = re.match(r"\s*", lines[hits[0]]).group(0)
+    lines[hits[0]] = f"{indent}command = {_toml_scalar(new)}\n"
+    candidate = "".join(lines)
+    try:
+        tomllib.loads(candidate)
+    except tomllib.TOMLDecodeError:
+        return None
+    return candidate
+
+
+def _lifecycle_definition_current(parsed: dict[str, Any], event: str,
+                                  pos: tuple[int, int], commands: tuple[str, ...]) -> bool:
+    group, hook = _hook_at(parsed, event, pos)
+    common = (hook.get("command") in commands and hook.get("type") == "command"
+              and hook.get("timeout") == LIFECYCLE_TIMEOUT_S)
+    if event == "SessionStart":
+        return (common and group.get("matcher") == LIFECYCLE_SESSION_MATCHER
+                and hook.get("statusMessage") == "Loading Codex orientation"
+                and hook.get("additionalContextLimit") == LIFECYCLE_CONTEXT_LIMIT)
+    return common
+
+
+def _set_features_hooks(text: str, parsed: dict[str, Any]) -> str | None:
+    features = parsed.get("features")
+    if features is None:
+        return _insert_into_toml_table(text, "features", {"hooks": True})
+    if not isinstance(features, dict):
+        return None
+    if features.get("hooks") is True:
+        return text
+    lines = text.splitlines(keepends=True)
+    headers = [i for i, line in enumerate(lines) if line.strip() == "[features]"]
+    if len(headers) != 1:
+        return None
+    start, end = _table_bounds(lines, headers[0])
+    if not _set_line(lines, start + 1, end, "hooks", True, after=headers[0]):
+        return None
+    candidate = "".join(lines)
+    try:
+        return candidate if tomllib.loads(candidate).get("features", {}).get("hooks") is True else None
+    except tomllib.TOMLDecodeError:
+        return None
+
+
+def _lifecycle_block(event: str, command: str) -> str:
+    matcher = (f"matcher = {_toml_scalar(LIFECYCLE_SESSION_MATCHER)}\n" if event == "SessionStart" else "")
+    extras = (f"statusMessage = {_toml_scalar('Loading Codex orientation')}\n"
+              f"additionalContextLimit = {LIFECYCLE_CONTEXT_LIMIT}\n" if event == "SessionStart" else "")
+    return (f"\n[[hooks.{event}]]\n{matcher}\n[[hooks.{event}.hooks]]\n"
+            f"type = \"command\"\ncommand = {_toml_scalar(command)}\n{extras}"
+            f"timeout = {LIFECYCLE_TIMEOUT_S}\n")
+
+
+def _normalize_lifecycle_definition(text: str, event: str, command: str) -> str | None:
+    """Normalize one uniquely identified known lifecycle definition in place."""
+    lines = text.splitlines(keepends=True)
+    hits = [i for i, line in enumerate(lines) if _key_line(line, "command") == command]
+    if len(hits) != 1:
+        return None
+
+    def set_hook_value(name: str, value: Any) -> bool:
+        current_hits = [i for i, line in enumerate(lines) if _key_line(line, "command") == command]
+        if len(current_hits) != 1:
+            return False
+        start, end = _table_bounds(lines, current_hits[0])
+        return _set_line(lines, start, end, name, value, after=current_hits[0])
+
+    for name, value in (("type", "command"), ("timeout", LIFECYCLE_TIMEOUT_S)):
+        if not set_hook_value(name, value):
+            return None
+    if event == "SessionStart":
+        for name, value in (("statusMessage", "Loading Codex orientation"),
+                            ("additionalContextLimit", LIFECYCLE_CONTEXT_LIMIT)):
+            if not set_hook_value(name, value):
+                return None
+        command_index = next(i for i, line in enumerate(lines) if _key_line(line, "command") == command)
+        group_headers = [i for i in range(command_index - 1, -1, -1)
+                         if lines[i].strip() == "[[hooks.SessionStart]]"]
+        if not group_headers:
+            return None
+        header = group_headers[0]
+        _start, end = _table_bounds(lines, header)
+        if not _set_line(lines, header + 1, end, "matcher", LIFECYCLE_SESSION_MATCHER, after=header):
+            return None
+    candidate = "".join(lines)
+    try:
+        parsed = tomllib.loads(candidate)
+    except tomllib.TOMLDecodeError:
+        return None
+    positions = _hook_positions(parsed, event, command)
+    return candidate if len(positions) == 1 and _lifecycle_definition_current(
+        parsed, event, positions[0], (command,)
+    ) else None
+
+
+def ensure_lifecycle_hooks(
+    codex_home: Path,
+    account_home: Path,
+    *,
+    executable: Path,
+    source_path: Path | None = None,
+    persona: str | None = None,
+    read_hooks=read_codex_app_server_hooks,
+) -> bool:
+    """Install and Codex-trust SessionStart/Stop orientation hooks before launch (T-4990).
+
+    Definitions and both trusted hashes land in one atomic config write. Known Consultant
+    ``~/codex-telegram`` commands remain valid and are trusted in place. Any failed
+    post-write verification restores the exact prior bytes with compare-and-swap.
+    """
+    hook_dir = account_home / "pantheon-config" / "harness" / "codex"
+    if not all((hook_dir / name).is_file() for name in (
+        "run_codex_session_start_hook.py", "run_codex_stop_hook.py"
+    )):
+        return False
+    persona = resolve_lifecycle_persona(account_home, persona)
+    source_path = source_path or lifecycle_source_path(account_home, persona)
+    if source_path is None or not source_path.is_file():
+        _worker_guard_log(
+            f"{account_home}: lifecycle install refused; no persona-owned standing source"
+        )
+        return False
+    canonical = lifecycle_hook_commands(account_home, source_path)
+    legacy = _legacy_lifecycle_commands(account_home)
+    accepted_legacy = accepted_legacy_lifecycle_commands(account_home, persona)
+    specs = {
+        "SessionStart": (
+            "sessionStart", "session_start",
+            (canonical[0], *((accepted_legacy[0],) if accepted_legacy else ())),
+            legacy[0],
+        ),
+        "Stop": (
+            "stop", "stop",
+            (canonical[1], *((accepted_legacy[1],) if accepted_legacy else ())),
+            legacy[1],
+        ),
+    }
+    config_path = codex_home / "config.toml"
+    try:
+        original = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        original = ""
+    try:
+        parsed = tomllib.loads(original) if original.strip() else {}
+    except tomllib.TOMLDecodeError as exc:
+        raise RuntimeError(
+            f"codex config.toml at {config_path} is not valid TOML -- refusing to "
+            "blind-insert lifecycle hooks into unparseable content"
+        ) from exc
+
+    # Inventory BOTH events from the original bytes before constructing any candidate.
+    # A hook cannot escape by being untrusted/disabled (state is position-keyed and not
+    # part of this definition scan), by carrying the wrong source, or by adding malformed
+    # arguments after an exact account-local lifecycle entrypoint.
+    inventory: dict[str, tuple[tuple[int, int], str, str] | None] = {}
+    for index, (event, (_wire, _key_event, accepted, legacy_command)) in enumerate(specs.items()):
+        positions = _lifecycle_family_positions(parsed, event, account_home)
+        if len(positions) > 1:
+            raise RuntimeError(
+                f"{config_path}: {len(positions)} {event} lifecycle-family hooks; "
+                "refusing ambiguity before mutation"
+            )
+        if not positions:
+            inventory[event] = None
+            continue
+        pos, command = positions[0]
+        target = _lifecycle_command_migration_target(
+            account_home, event, command, canonical=canonical[index],
+            legacy=legacy_command, accepted=accepted,
+        )
+        if target is None:
+            raise RuntimeError(
+                f"{config_path}: malformed or non-canonical {event} lifecycle-family "
+                "command; refusing before mutation"
+            )
+        inventory[event] = pos, command, target
+
+    candidate = _set_features_hooks(original, parsed)
+    if candidate is None:
+        _worker_guard_log(f"{config_path}: lifecycle install refused; ambiguous [features]")
+        return False
+    parsed = tomllib.loads(candidate) if candidate.strip() else {}
+    selected: dict[str, tuple[int, int]] = {}
+    for index, (event, (_wire, _key_event, accepted, _legacy_command)) in enumerate(specs.items()):
+        existing = inventory[event]
+        if existing is None:
+            candidate = candidate.rstrip("\n") + "\n" + _lifecycle_block(event, canonical[index])
+        else:
+            pos, command, target = existing
+            if command != target:
+                migrated = _replace_lifecycle_command(candidate, command, target)
+                if migrated is None:
+                    raise RuntimeError(
+                        f"{config_path}: could not isolate {event} lifecycle migration; "
+                        "refusing before mutation"
+                    )
+                candidate = migrated
+                command = target
+                parsed = tomllib.loads(candidate)
+                (pos,) = _hook_positions(parsed, event, command)
+            if not _lifecycle_definition_current(parsed, event, pos, accepted):
+                normalized = _normalize_lifecycle_definition(candidate, event, command)
+                if normalized is None:
+                    _worker_guard_log(f"{config_path}: could not safely normalize {event}")
+                    return False
+                candidate = normalized
+        parsed = tomllib.loads(candidate)
+
+    # Resolve final positions and allow a verified-marker fast path only when the bytes are
+    # already current. A config change invalidates every marker through config_sha256.
+    selected_commands: dict[str, str] = {}
+    for event, (_wire, _key_event, accepted, _legacy_command) in specs.items():
+        matches = [(pos, command) for command in accepted
+                   for pos in _hook_positions(parsed, event, command)]
+        if len(matches) != 1 or not _lifecycle_definition_current(parsed, event, matches[0][0], accepted):
+            return False
+        selected[event] = matches[0][0]
+        selected_commands[event] = matches[0][1]
+    if candidate == original and all(
+        _verified_marker_hit(
+            codex_home, _hook_key(codex_home, specs[event][1], selected[event]),
+            selected_commands[event], executable=executable, marker_name=_LIFECYCLE_MARKERS[event],
+        ) for event in specs
+    ):
+        return False
+
+    desired_hashes: dict[str, str] = {}
+    if candidate != original:
+        for event, (wire_event, event_key, _accepted, _legacy_command) in specs.items():
+            definition = _hook_definition_toml(parsed, event, selected[event])
+            digest = definition and _precompute_hook_hash(
+                definition, selected_commands[event], event_name=wire_event, event_key=event_key,
+                executable=executable, account_home=account_home, read_hooks=read_hooks,
+            )
+            if not digest:
+                _worker_guard_log(f"{config_path}: lifecycle hash precompute failed for {event}")
+                return False
+            desired_hashes[event] = digest
+    else:
+        hooks = _read_real_hooks(codex_home, account_home, executable=executable, read_hooks=read_hooks)
+        if hooks is None:
+            return False
+        by_key = {hook.get("key"): hook for hook in hooks}
+        for event, (_wire, event_key, _accepted, _legacy_command) in specs.items():
+            key = _hook_key(codex_home, event_key, selected[event])
+            hook = by_key.get(key) or {}
+            if hook.get("command") != selected_commands[event]:
+                return False
+            digest = hook.get("currentHash")
+            if not isinstance(digest, str) or not digest.startswith("sha256:"):
+                return False
+            desired_hashes[event] = digest
+
+    final = candidate
+    enable_events = {
+        event for event, (_wire, event_key, _accepted, _legacy_command) in specs.items()
+        if (((tomllib.loads(final).get("hooks") or {}).get("state") or {}).get(
+            _hook_key(codex_home, event_key, selected[event])
+        ) or {}).get("enabled") is False
+    }
+    if candidate == original:
+        # A real hooks/list verdict is authoritative even if a future Codex version
+        # reports disabled without serializing the flag in the shape we expect.
+        enable_events.update(
+            event for event, (_wire, event_key, _accepted, _legacy_command) in specs.items()
+            if (by_key.get(_hook_key(codex_home, event_key, selected[event])) or {}).get("enabled") is False
+        )
+    for event, (_wire, event_key, _accepted, _legacy_command) in specs.items():
+        current_parsed = tomllib.loads(final)
+        key = _hook_key(codex_home, event_key, selected[event])
+        updated = _set_trusted_hash(final, current_parsed, key, desired_hashes[event])
+        if updated is None:
+            return False
+        final = updated
+        if event in enable_events:
+            current_parsed = tomllib.loads(final)
+            updated = _set_hook_state_value(final, current_parsed, key, "enabled", True)
+            if updated is None:
+                return False
+            final = updated
+    if final == original:
+        config_bytes = original.encode()
+        for event, (_wire, event_key, _accepted, _legacy_command) in specs.items():
+            key = _hook_key(codex_home, event_key, selected[event])
+            _write_verified_marker(
+                codex_home, _verified_marker_body(codex_home, key, selected_commands[event],
+                                                  config_bytes, executable),
+                marker_name=_LIFECYCLE_MARKERS[event],
+            )
+        return False
+
+    if not _file_holds(config_path, original):
+        return False
+    _write_config_preserving_mode(config_path, final)
+    hooks = _read_real_hooks(codex_home, account_home, executable=executable, read_hooks=read_hooks)
+    by_key = {hook.get("key"): hook for hook in hooks or []}
+    verified = all(
+        (by_key.get(_hook_key(codex_home, event_key, selected[event])) or {}).get("trustStatus") == "trusted"
+        and (by_key.get(_hook_key(codex_home, event_key, selected[event])) or {}).get("enabled") is True
+        and (by_key.get(_hook_key(codex_home, event_key, selected[event])) or {}).get("currentHash")
+        == desired_hashes[event]
+        for event, (_wire, event_key, _accepted, _legacy_command) in specs.items()
+    )
+    if not verified:
+        _restore_if_unchanged(config_path, final, original)
+        return False
+    config_bytes = final.encode()
+    for event, (_wire, event_key, _accepted, _legacy_command) in specs.items():
+        key = _hook_key(codex_home, event_key, selected[event])
+        _write_verified_marker(
+            codex_home, _verified_marker_body(codex_home, key, selected_commands[event],
+                                              config_bytes, executable),
+            marker_name=_LIFECYCLE_MARKERS[event],
+        )
+    _worker_guard_log(f"{config_path}: lifecycle SessionStart/Stop installed and trusted")
+    return True
+
+
 def ensure_worker_guard_hook(
     codex_home: Path,
     account_home: Path,
@@ -1945,45 +2537,57 @@ def ensure_worker_guard_hook(
     executable: Path,
     read_hooks=read_codex_app_server_hooks,
     trust_marker: bool = True,
+    upgrade_rollback: bool = False,
 ) -> bool:
     """Idempotently wire, UPGRADE and trust the worker-guard PreToolUse hook in ``config.toml``
-    (T-4166; upgrade path T-4395 / T-4397 part A).
+    (T-4166; upgrade path T-4395 / T-4397 part A; v2 canonical + rollback rule T-6123).
 
     Every seat with a codex runtime needs it (T-4160): codex 0.147 ships multi_agent
     default-on, so without the hook a failover can spawn codex subagents that hold nothing
-    back. Skipped entirely when the seat's clone has no worker-guard.py (a PreToolUse hook whose
-    script is missing could fail every main-loop tool call). Refuses (raises) on a config.toml
-    it cannot parse. Hook keys use the REALPATH of CODEX_HOME, as codex does. Cases:
+    back. Skipped entirely when the seat's clone has no worker-guard-v2.py (every write targets
+    v2; a PreToolUse hook whose script is missing could fail every main-loop tool call). Refuses
+    (raises) on a config.toml it cannot parse. Hook keys use the REALPATH of CODEX_HOME, as
+    codex does. Cases:
 
-    * CURRENT guard (this command, timeout 30, matcher Bash|apply_patch): the real home's
-      hooks/list (bounded) is asked; trusted -> no-op. Untrusted or "modified" (a stale hash):
-      codex's own currentHash for the definition ON DISK is written as trusted_hash, the only
-      change, in one write. T-4428: a "current + trusted" verdict records a verified-marker
+    * CURRENT guard (the v2 ``-I`` command, timeout 30, matcher Bash|apply_patch): the real
+      home's hooks/list (bounded) is asked; trusted -> no-op. Untrusted or "modified" (a stale
+      hash): codex's own currentHash for the definition ON DISK is written as trusted_hash, the
+      only change, in one write. T-4428: a "current + trusted" verdict records a verified-marker
       (sha256 of config.toml's bytes + key + command + codex binary identity); while all of those
       are unchanged the hooks/list read is skipped (``trust_marker=False`` always reads). A codex
       upgrade changes the binary identity, so a stale hash it causes is still read and repaired.
-    * STALE guard (the pre-T-4395 command, or a stale timeout/matcher): rewritten IN PLACE (so
-      its position-based key is unchanged) to the canonical command/timeout/matcher, every other
-      key kept. The new hash is precomputed in a scratch CODEX_HOME holding EXACTLY that
-      rewritten definition (the hash covers only the definition), then the definition AND its
-      trusted_hash land in ONE atomic write. Codex never sees an untrusted/"modified" guard:
-      no fail-open window. After the write the real home is re-read (bounded); unless it
-      reports the guard trusted under that hash, the ORIGINAL bytes are restored, but only if
-      the file still holds what was written (compare-and-swap; a concurrent edit is left alone
-      and logged). A failed precompute, or an edit that isn't provably minimal, leaves the
-      file untouched.
-    * NO guard: the canonical block is appended with its precomputed trusted_hash in one write;
-      if the hash can't be read the block is still wired (T-4166 best-effort: an untrusted hook
-      runs under this adapter's --dangerously-bypass-hook-trust launch, and the parity axis
-      codex-worker-guard-hook-trusted flags it).
+    * ROLLBACK guard (the EXACT v1 ``-I`` command, timeout 30, canonical matcher): an operator
+      re-pointed the one guard entry to v1 because v2 misbehaves. On the launch path it is LEFT
+      AS IS and treated like current: only its trust is maintained, it is NOT rewritten to v2.
+      With ``upgrade_rollback=True`` (the explicit operator choice, the rollout CLI's
+      ``--upgrade-rollback``) it is upgraded in place to v2 like a stale guard.
+    * STALE guard (any other recognised form: the plain no-``-I`` v1/v2 commands, or v1/v2 with a
+      stale timeout/matcher): rewritten IN PLACE (so its position-based key is unchanged) to the
+      canonical v2 command/timeout/matcher, every other key kept. The new hash is precomputed in a
+      scratch CODEX_HOME holding EXACTLY that rewritten definition (the hash covers only the
+      definition), then the definition AND its trusted_hash land in ONE atomic write. Codex never
+      sees an untrusted/"modified" guard: no fail-open window. After the write the real home is
+      re-read (bounded); unless it reports the guard trusted under that hash, the ORIGINAL bytes
+      are restored, but only if the file still holds what was written (compare-and-swap; a
+      concurrent edit is left alone and logged). A failed precompute, or an edit that isn't
+      provably minimal, leaves the file untouched.
+    * NO guard of either generation: the canonical v2 block is appended with its precomputed
+      trusted_hash in one write; if the hash can't be read the block is still wired (T-4166
+      best-effort: an untrusted hook runs under this adapter's --dangerously-bypass-hook-trust
+      launch, and the parity axis codex-worker-guard-hook-trusted flags it).
+    * NEVER TWO GUARDS: a guard is only appended when no PreToolUse command names a worker-guard
+      script at all. An entry that does but matches no recognised form (an edited command) is
+      refused, logged and left untouched; several recognised positions are an ambiguity refusal
+      (a current one wins, trust only), never an append.
 
     Every upgrade/repair/restore/refusal is logged to stderr. Returns True iff ``config.toml``
     was left modified.
     """
-    if not (account_home / "pantheon-config" / "tools" / "hooks" / "worker-guard.py").is_file():
+    if not (account_home / "pantheon-config" / "tools" / "hooks" / "worker-guard-v2.py").is_file():
         return False
     config_path = codex_home / "config.toml"
     command = worker_guard_command(account_home)
+    rollback = rollback_worker_guard_command(account_home)
     try:
         text = config_path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -1997,10 +2601,10 @@ def ensure_worker_guard_hook(
         ) from exc
     positions = [
         (pos, cmd)
-        for cmd in (command, *_legacy_worker_guard_commands(account_home))
+        for cmd in (command, rollback, *_legacy_worker_guard_commands(account_home))
         for pos in _guard_positions(parsed, cmd)
     ]
-    current = [pos for pos, _cmd in positions if _guard_definition_current(parsed, pos, command)]
+    current = [pos for pos, cmd in positions if cmd == command and _guard_definition_current(parsed, pos, command)]
     if current:
         return _trust_current_guard(codex_home, account_home, config_path, text, parsed, current[0],
                                     executable=executable, read_hooks=read_hooks,
@@ -2011,8 +2615,17 @@ def ensure_worker_guard_hook(
                               "to upgrade an ambiguous config (left untouched)")
             return False
         (pos, old_command), = positions
+        if old_command == rollback and _guard_definition_current(parsed, pos, rollback):
+            if not upgrade_rollback:
+                return _trust_current_guard(codex_home, account_home, config_path, text, parsed, pos,
+                                            executable=executable, read_hooks=read_hooks,
+                                            trust_marker=trust_marker)
         return _upgrade_guard(codex_home, account_home, config_path, text, parsed, pos, old_command,
                               command, executable=executable, read_hooks=read_hooks)
+    if _guard_like_positions(parsed):
+        _worker_guard_log(f"{config_path}: unrecognised worker-guard entry; refusing to append a "
+                          "second guard (left untouched)")
+        return False
     wired = (text.rstrip("\n") + "\n" if text.strip() else "") + _WORKER_GUARD_BLOCK.format(
         command=_toml_scalar(command)
     )
@@ -2235,8 +2848,10 @@ def worker_guard_hook_status(
 ) -> dict[str, Any]:
     """Per-home rollout verdict for Recovery (T-4395): is the block current, enabled and codex-trusted?
 
-    ``block_current``: a guard with this seat's current command, timeout 30 and the canonical
-    matcher. ``hash_matches``: its stored trusted_hash equals codex's own currentHash.
+    ``generation``: "v2" (canonical), "rollback-v1" (the exact v1 ``-I`` entry alone, T-6123:
+    an accepted operator rollback) or None. ``block_current``: the primary guard has its
+    generation's exact command, timeout 30 and the canonical matcher; ``legacy_present``: ANY
+    other guard-like entry exists (stale forms, v1 beside v2, an edited command), which fails ``ok``. ``hash_matches``: its stored trusted_hash equals codex's own currentHash.
     ``enabled``: codex's view (a disabled guard never runs, i.e. fails open). ``measurable`` is
     False when the app-server read failed (trust fields are then None). ``ok`` needs all of it,
     trustStatus "trusted", and no leftover legacy guard. That is the ON-DISK verdict;
@@ -2244,18 +2859,23 @@ def worker_guard_hook_status(
     of this home started before the config's last write and so still run their startup snapshot.
     """
     config_path = codex_home / "config.toml"
-    command = worker_guard_command(account_home)
+    v2_command = worker_guard_command(account_home)
+    v1_command = rollback_worker_guard_command(account_home)
     try:
         text = config_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         text = ""
     parsed = tomllib.loads(text) if text.strip() else {}
-    positions = _guard_positions(parsed, command)
-    legacy = [pos for cmd in _legacy_worker_guard_commands(account_home)
-              for pos in _guard_positions(parsed, cmd)]
-    pos = positions[0] if positions else None
+    v2_positions = _guard_positions(parsed, v2_command)
+    v1_positions = _guard_positions(parsed, v1_command)
+    # The primary guard: v2 when wired, else the v1 entry. Any OTHER guard-like entry (stale
+    # forms, v1 beside v2, an edited command, a second copy) is "legacy_present" and fails ok.
+    pos = (v2_positions or v1_positions or [None])[0]
+    command = v1_command if pos is not None and not v2_positions else v2_command
+    legacy = [p for p in _guard_like_positions(parsed) if p != pos]
     key = _guard_key(codex_home, pos) if pos else None
     block_current = bool(pos) and _guard_definition_current(parsed, pos, command)
+    generation = ((("v2" if command == v2_command else "rollback-v1") if block_current else None))
     stored = _stored_trusted_hash(parsed, key) if key else None
     guard = _read_real_guard(codex_home, account_home, key, executable=executable,
                              read_hooks=read_hooks) if key else None
@@ -2268,6 +2888,7 @@ def worker_guard_hook_status(
         "config_path": str(config_path),
         "key": key,
         "command": command,
+        "generation": generation,
         "block_current": block_current,
         "legacy_present": bool(legacy),
         "stored_hash": stored,
@@ -2329,6 +2950,14 @@ def prepare_codex_launch(binding: Any, *, cwd: Path) -> None:
     # presets (T-2597 wedge #4) -- see ensure_model_migration_prompts_
     # hidden's own docstring for the documented residual gap.
     ensure_model_migration_prompts_hidden(codex_home)
+    # T-4990: orientation/active-step lifecycle hooks come from the seat's own
+    # clone and must be trusted before Codex starts; never hand-patch a seat.
+    ensure_lifecycle_hooks(
+        codex_home,
+        binding.account_home,
+        executable=Path(binding.launch.executable),
+        persona=binding.persona,
+    )
     # T-4166: codex 0.147 ships multi_agent default-on, so every codex runtime
     # (the codex seat and each Claude seat's fallback) gets the worker-guard
     # PreToolUse hook wired + trusted before launch -- see

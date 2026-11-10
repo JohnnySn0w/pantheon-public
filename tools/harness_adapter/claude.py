@@ -16,6 +16,7 @@ References:
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -29,6 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from tools.harness_adapter._common import (
     deliver_to_mailbox,
@@ -73,6 +75,10 @@ from tools.harness_adapter.provider_quota import (
     valid_acceptance_run_id,
 )
 
+
+# Native keys a claude role binding may carry. diagnostics._NATIVE_KEYS["claude"]
+# is a pinned copy (tools/test_t4531_openrouter_profile.py asserts equality).
+CLAUDE_NATIVE_KEYS = frozenset({"permission_mode", "channels", "effort", "base_url"})
 
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _COMPLETION_SCHEMA = "pantheon-harness-provider-completion/v1"
@@ -240,6 +246,8 @@ _DOW_ABBR_TO_NUM = {
 # occurrence -- mirrors acp_bridge._CAP_RESET_SKEW_GRACE_SECS exactly (same
 # reasoning, independently named per the no-cross-module-coupling call above).
 _MID_SESSION_CAP_RESET_SKEW_GRACE_SECONDS = 15 * 60.0
+# T-5801: a dated reset this far from `now` belongs to the adjacent year.
+_DATED_RESET_YEAR_ROLL_SECONDS = 183 * 86400.0
 
 _MONTH_ABBR_TO_NUM = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
@@ -440,8 +448,9 @@ def _parse_claude_mid_session_cap_reset_at(text: str, *, now: datetime) -> datet
     `_MID_SESSION_CAP_RESET_SKEW_GRACE_SECONDS` behind `now` reads as boundary
     skew and returns None (no confident parse) -- genuinely further behind
     rolls to the next occurrence (next day for the bare form; next week for
-    the day-name form; next year for the dated form, since month+day are
-    already pinned). Never raises: any malformed group returns None, same as
+    the day-name form). The dated form takes the nearest year instead
+    (T-5801): a reset already past stays past, so a modal outliving its
+    reset reads as due; only a date more than half a year off moves a year. Never raises: any malformed group returns None, same as
     "no reset text present" -- the caller (runtime_controller.py) falls back
     to a conservative default either way.
     """
@@ -480,13 +489,22 @@ def _resolve_dated_reset(match: re.Match[str], *, now: datetime) -> datetime | N
         )
     except ValueError:
         return None  # e.g. Feb 30 -- not a real date
-    if candidate <= now:
-        if (now - candidate).total_seconds() <= _MID_SESSION_CAP_RESET_SKEW_GRACE_SECONDS:
-            return None
+    # T-5801: month+day pin the date to within a year of `now`, so pick the
+    # NEAREST year. A modal still shown after its reset (the case
+    # cap_modal_reaper exists for) stays in the past; only a date more than
+    # half a year off crosses a year boundary (Jan shown in Dec, or Dec in Jan).
+    year_shift = 0
+    if (candidate - now).total_seconds() > _DATED_RESET_YEAR_ROLL_SECONDS:
+        year_shift = -1
+    elif (now - candidate).total_seconds() > _DATED_RESET_YEAR_ROLL_SECONDS:
+        year_shift = 1
+    if year_shift:
         try:
-            candidate = candidate.replace(year=candidate.year + 1)
+            candidate = candidate.replace(year=candidate.year + year_shift)
         except ValueError:
-            return None  # T-4173: Feb 29 has no next-year date -> unparsed
+            return None  # T-4173: Feb 29 has no adjacent-year date -> unparsed
+    if candidate <= now and (now - candidate).total_seconds() <= _MID_SESSION_CAP_RESET_SKEW_GRACE_SECONDS:
+        return None
     return candidate
 
 
@@ -964,6 +982,104 @@ def _assistant_delta_has_nonce(path: Path, *, start: int, marker: str) -> tuple[
     return False, st.st_size, assistant_events, malformed
 
 
+BACKEND_OVERRIDE_FLAG = "PANTHEON_CLAUDE_BACKEND_OVERRIDE"
+BACKEND_KEY_RELPATH = Path(".claude") / "backend-api-key"
+_APIKEY_HELPER = Path(__file__).resolve().parents[1] / "claude_apikey_helper.py"
+
+
+class ClaudeBackendOverrideError(RuntimeError):
+    """T-6005: the dark base_url backend override failed a safety check.
+
+    Deliberately not an OSError/ValueError: the controller's fail-open settings
+    wiring must not swallow it. Messages never contain key material.
+    """
+
+
+def _claude_login_present(home: Path) -> bool:
+    """Minimal detector for a Claude subscription login on this account.
+
+    Broad on purpose: any `.claude/.credentials.json` entry (even empty or a
+    link), a non-empty `oauthAccount` in `.claude.json`, or an OAuth token env.
+    """
+    try:
+        os.lstat(home / ".claude" / ".credentials.json")
+        return True
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return True  # cannot prove absence: fail closed
+    try:
+        data = json.loads((home / ".claude.json").read_text(encoding="utf-8"))
+        if isinstance(data, dict) and data.get("oauthAccount"):
+            return True
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        return True
+    return bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"))
+
+
+def _check_key_file(path: Path) -> None:
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        raise ClaudeBackendOverrideError("backend key file missing") from None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ClaudeBackendOverrideError("backend key file is a symlink") from None
+        raise ClaudeBackendOverrideError(
+            f"backend key file unreadable ({type(exc).__name__})"
+        ) from None
+    try:
+        st = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise ClaudeBackendOverrideError("backend key file is not a regular file")
+    if st.st_uid != os.geteuid():
+        raise ClaudeBackendOverrideError("backend key file is not owned by the running uid")
+    if stat.S_IMODE(st.st_mode) != 0o600:
+        raise ClaudeBackendOverrideError("backend key file mode is not 0600")
+
+
+def _check_backend_override(launch: HarnessLaunchConfig | None, home: Path) -> str | None:
+    """Return the validated base_url, or None when no override is in play.
+
+    Raises ClaudeBackendOverrideError on any failed check (fail closed).
+    """
+    native = launch.native if launch is not None and isinstance(launch.native, Mapping) else {}
+    flag = os.environ.get(BACKEND_OVERRIDE_FLAG) == "1"
+    if "base_url" not in native:
+        if flag:
+            raise ClaudeBackendOverrideError(
+                f"{BACKEND_OVERRIDE_FLAG}=1 set but the profile has no base_url"
+            )
+        return None
+    assert launch is not None
+    if launch.meter != "api" or not flag:
+        raise ClaudeBackendOverrideError(
+            f"base_url requires meter: api and {BACKEND_OVERRIDE_FLAG}=1"
+        )
+    base_url = native["base_url"]
+    parts = urlsplit(base_url) if isinstance(base_url, str) else None
+    if (
+        parts is None
+        or parts.scheme != "https"
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+        or any(ch.isspace() or ord(ch) < 32 for ch in base_url)
+    ):
+        raise ClaudeBackendOverrideError("base_url must be an https URL without userinfo")
+    if _claude_login_present(home):
+        raise ClaudeBackendOverrideError(
+            "account holds a Claude subscription login; refusing third-party backend"
+        )
+    _check_key_file(home / BACKEND_KEY_RELPATH)
+    return base_url
+
+
 class ClaudeHarnessAdapter(PantheonHarnessAdapter):
     """Harness adapter for claude-code (Orchestrator / Specialist / Recovery instances).
 
@@ -1054,7 +1170,14 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
             hook_events=hooks,
         )
 
+    def _refuse_headless_backend_override(self) -> None:
+        if self.launch is not None and "base_url" in self.launch.native:
+            raise ClaudeBackendOverrideError(
+                "base_url backend override is not supported on headless launches"
+            )
+
     def build_exec(self, request: ExecutionRequest) -> CommandSpec:
+        self._refuse_headless_backend_override()
         argv = [
             str(self.executable),
             "-p",
@@ -1078,6 +1201,7 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
         session: SessionHandle,
         prompt: str | None = None,
     ) -> CommandSpec:
+        self._refuse_headless_backend_override()
         cwd = session.cwd if session.cwd is not None else Path.cwd()
         return CommandSpec(
             argv=(
@@ -1193,10 +1317,25 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
                     evidence={"profile": "", "legacy": "true"},
                 ),
             )
-        allowed_native = {"permission_mode", "channels", "effort"}
-        unknown = sorted(set(self.launch.native) - allowed_native)
+        unknown = sorted(set(self.launch.native) - CLAUDE_NATIVE_KEYS)
         status = "fail" if unknown else "pass"
-        return (
+        override_obs: tuple[DiagnosticObservation, ...] = ()
+        if "base_url" in self.launch.native or os.environ.get(BACKEND_OVERRIDE_FLAG) == "1":
+            try:
+                _check_backend_override(self.launch, self._claude_home)
+                override_status, override_summary = "pass", "backend override guard passes"
+            except ClaudeBackendOverrideError as exc:
+                override_status, override_summary = "fail", str(exc)
+            override_obs = (
+                DiagnosticObservation(
+                    check_id="claude.backend_override",
+                    status=override_status,
+                    summary=override_summary,
+                    authoritative=True,
+                    evidence={"harness": "claude", "profile": self.launch.profile},
+                ),
+            )
+        return override_obs + (
             DiagnosticObservation(
                 check_id="claude.runtime_profile",
                 status=status,
@@ -1274,6 +1413,7 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
         )
 
     def build_interactive_launch(self, target: TmuxTarget, *, cwd: Path) -> CommandSpec:
+        base_url = _check_backend_override(self.launch, self._claude_home)
         argv = [str(self.executable)]
         channels = (
             self.launch.native.get("channels")
@@ -1301,16 +1441,21 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
             permission_mode = "bypassPermissions"
         if isinstance(permission_mode, str):
             argv.extend(["--permission-mode", permission_mode])
-        return CommandSpec(
-            argv=tuple(argv),
-            stdin=None,
-            cwd=cwd,
-            env={
+        env = {
                 "PANTHEON_TMUX_SESSION": target.session,
                 "PANTHEON_TMUX_WINDOW": target.window,
                 "PANTHEON_TMUX_PANE": target.pane,
-            },
-        )
+                # T-5843: seats receive injected text (inbox_consumer, mailbox_wake, Recovery
+                # alerts); a typed '@/path' would load the file pre-model, bypassing
+                # permission prompts and the worker guard. Probed live (2.1.316): the flag
+                # turns every mention into an unread reference. T-4382 stays as the
+                # per-site layer for harnesses without it.
+                "CLAUDE_CODE_DISABLE_FILE_MENTIONS": "1",
+        }
+        if base_url is not None:
+            # Not secret; the key travels only via apiKeyHelper (T-6005).
+            env["ANTHROPIC_BASE_URL"] = base_url
+        return CommandSpec(argv=tuple(argv), stdin=None, cwd=cwd, env=env)
 
     def interactive_statusline_settings(self, *, output: Path) -> dict[str, Any]:
         """T-4024: Claude settings that make the MAIN session write the status-line
@@ -1328,7 +1473,18 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
             shlex.quote(part)
             for part in ("/usr/bin/python3", str(helper), "--output", str(output))
         )
-        return {"statusLine": {"type": "command", "command": command}}
+        settings: dict[str, Any] = {"statusLine": {"type": "command", "command": command}}
+        if _check_backend_override(self.launch, self._claude_home) is not None:
+            settings["apiKeyHelper"] = " ".join(
+                shlex.quote(part)
+                for part in (
+                    "/usr/bin/python3",
+                    str(_APIKEY_HELPER),
+                    "--key-file",
+                    str(self._claude_home / BACKEND_KEY_RELPATH),
+                )
+            )
+        return settings
 
     def quota_observer(self, state_dir: Path) -> QuotaObserver:
         profile = self.launch.profile if self.launch else "legacy"
@@ -1521,6 +1677,44 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
                 changed_capture_indices=(),
             )
         baseline_text = str(probe.provider_state.get("baseline_pane_text") or "")
+        # T-6235: fallback-return may launch Claude straight into the monthly
+        # spend-limit panel.  In that shape the provider-completion baseline
+        # ALREADY contains the modal, so the older post-start classifier's
+        # deliberate baseline-diff requirement can never fire.  The
+        # mid-session classifier is safe here because it is structurally
+        # anchored to the final modal footer and selected-option glyph; use it
+        # for both the first baseline and later samples.  This also returns the
+        # parsed reset boundary so controller_main re-holds until the actual
+        # provider reset rather than periodically retrying a known-blocked UI.
+        observed_at = probe.provider_state.get("submitted_at")
+        if not isinstance(observed_at, datetime):
+            observed_at = datetime.now(timezone.utc)
+        modal_samples = (baseline_text, *(sample.text for sample in sample_tuple))
+        for modal_text in modal_samples:
+            modal = classify_claude_mid_session_cap(modal_text, now=observed_at)
+            if modal is None:
+                continue
+            pattern_id = (
+                "claude-monthly-spend-limit-modal"
+                if modal.modal_kind == "monthly-spend-limit"
+                else f"claude-{modal.modal_kind}-modal"
+            )
+            return ProviderCompletionAssessment(
+                schema=_COMPLETION_SCHEMA,
+                harness=harness,
+                profile=profile,
+                status="subscription-cap",
+                cause="provider-completion-subscription-cap",
+                pattern_id=pattern_id,
+                nonce_sha256=probe.nonce_sha256,
+                prompt_sha256=probe.prompt_sha256,
+                statusline_baseline_sha256=probe.provider_state.get("baseline_statusline_sha256"),
+                statusline_observed_sha256=_sha256_file(probe.provider_state["statusline_path"]),
+                capture_count=len(sample_tuple),
+                changed_capture_indices=changed,
+                cap_kind=modal.modal_kind,
+                reset_at=modal.reset_at,
+            )
         for sample in sample_tuple:
             pattern_id, cause = classify_claude_post_start_subscription_cap(
                 baseline_text=baseline_text,

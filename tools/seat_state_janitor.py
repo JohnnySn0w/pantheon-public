@@ -153,8 +153,14 @@ def _write_sidecar(persona: str, root: Path, set_ts: str, last_nag_ts: str) -> N
                     {"schema": SIDECAR_SCHEMA, "set_ts": set_ts, "last_nag_ts": last_nag_ts})
 
 
-def _how_to_extend(persona: str) -> str:
-    return (f"To extend: harness {persona} pause --for <duration> --reason \"...\" "
+def _how_to_extend(persona: str, state: str = ss.STATE_PAUSED_INTAKE) -> str:
+    """T-5623: the extend verb matches the record's state. `pause` over a deep sleep would
+    downgrade it to paused-intake. A HALTED record has no extend verb (plain wake is refused,
+    it is cleared by `wake --clear-halted`), so it gets no advice line."""
+    if state == ss.STATE_HALTED:
+        return ""
+    verb = "sleep" if state == ss.STATE_DEEP_SLEEP else "pause"
+    return (f"To extend: harness {persona} {verb} --for <duration> --reason \"...\" "
             f"(refreshes the record). To end it now: harness {persona} wake --reason \"...\".")
 
 
@@ -163,8 +169,16 @@ def _key(record: dict) -> tuple:
     return (record.get("set_ts"), record.get("expires"), record.get("owner"))
 
 
+HALTED_LIST_AGE = timedelta(hours=1)
+
+
 def _classify(record: dict, when: datetime, root: Path, persona: str) -> str | None:
-    """'expire' | 'pre_expiry_notice' | 'indefinite_nag' | None."""
+    """'expire' | 'pre_expiry_notice' | 'indefinite_nag' | 'halted_listed' | None.
+    T-5868: a HALTED record is never expired, reaped or nagged; it is only listed (stderr)
+    once older than HALTED_LIST_AGE. Re-alerting belongs to activity_monitor."""
+    if record.get("state") == ss.STATE_HALTED:
+        at = _parse(record.get("halted_at")) or _parse(record.get("set_ts"))
+        return "halted_listed" if at is not None and when - at >= HALTED_LIST_AGE else None
     expires = _parse(record.get("expires"))
     if expires is not None:
         if expires <= when:
@@ -239,6 +253,10 @@ def _tick_locked(persona: str, *, now: datetime | None = None, state_root: Path 
         kind = _classify(record, when, root, persona) if record else None
         if kind is None:
             return []
+        if kind == "halted_listed":
+            _log(f"{persona}: HALTED since {record.get('halted_at')} (run {record.get('run_id')}); "
+                 f"rollback: {record.get('rollback_cmd')}")
+            return ["halted_listed"]
         if kind == "expire":
             if record.get("state") == ss.STATE_DEEP_SLEEP:
                 # ORG-106 L3a: the system-orchestrator hold-down flag goes first (as in
@@ -267,12 +285,12 @@ def _tick_locked(persona: str, *, now: datetime | None = None, state_root: Path 
     if kind == "pre_expiry_notice":
         sent = _notify(owner, f"{persona}: pause expires soon",
                        f"The {record['state']} on {persona} (reason: {reason}) expires at "
-                       f"{record['expires']}. {_how_to_extend(persona)}", mail, deadline)
+                       f"{record['expires']}. {_how_to_extend(persona, record['state'])}", mail, deadline)
     else:
         age_days = (when - _parse(record["set_ts"])).days
         sent = _notify(owner, f"{persona}: indefinite pause is {age_days}d old",
                        f"The {record['state']} on {persona} (reason: {reason}) has been "
-                       f"indefinite for {age_days} days. {_how_to_extend(persona)}", mail, deadline)
+                       f"indefinite for {age_days} days. {_how_to_extend(persona, record['state'])}", mail, deadline)
     if not sent:
         return [kind, f"{kind}_failed"]
     with hs.seat_state_lock(persona, root=root, blocking=False):

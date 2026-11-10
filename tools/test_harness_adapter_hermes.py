@@ -449,6 +449,27 @@ def test_quota_observer_without_key_reports_unavailable(tmp_path):
     assert snapshot.balance is None
 
 
+def test_quota_observer_routes_balance_through_key_holding_proxy(tmp_path, monkeypatch):
+    from tools.harness_adapter import hermes as hermes_module
+
+    seen = {}
+
+    def read(env_file, **kwargs):
+        seen["env_file"] = env_file
+        seen.update(kwargs)
+        raise OSError("stop")
+
+    monkeypatch.setattr(hermes_module, "read_deepseek_balance", read)
+    adapter = _adapter(
+        tmp_path,
+        balance={"currency": "USD", "low_water": "10", "hard_floor": "1"},
+        base_url="https://deepseek-proxy.invalid:8448/v1",
+    )
+    adapter.quota_observer(tmp_path).read()
+    assert seen["base_url"] == "https://deepseek-proxy.invalid:8448/v1"
+    assert seen["key_holding_proxy"] is True
+
+
 # --- post-start readiness ----------------------------------------------------
 
 

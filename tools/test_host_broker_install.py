@@ -54,10 +54,10 @@ def registry_doc() -> dict:
     return {
         "schema": H.REGISTRY_SCHEMA,
         "seats": [
-            {"seat_id": "recovery", "uid": 1002, "persona": "recovery", "role": "head-system-orchestrator",
-             "instance": "pantheon", "account": "claude-fallback", "harness": "claude", "install_root": "/"},
-            {"seat_id": "watchman", "uid": 1011, "persona": "watchman", "role": "system-orchestrator-1",
-             "instance": "pantheon", "account": "codex-fallback", "harness": "codex", "install_root": "/"},
+            {"seat_id": "recovery", "uid": 2001, "persona": "recovery", "role": "head-system-orchestrator",
+             "instance": "pantheon", "account": "fixture-recovery", "harness": "claude", "install_root": "/"},
+            {"seat_id": "watchman", "uid": 2002, "persona": "watchman", "role": "system-orchestrator-1",
+             "instance": "pantheon", "account": "fixture-watchman", "harness": "codex", "install_root": "/"},
         ],
         "manifests": [{
             "revision": "m1", "path": "/etc/pantheon/host-broker/manifests/m1.yaml", "sha256": "a" * 64,
@@ -70,6 +70,16 @@ def registry_doc() -> dict:
 
 def manifest_doc() -> dict:
     return json.loads(H.EXAMPLE_MANIFEST.read_text(encoding="utf-8"))
+
+
+def with_protocol_test_seats(doc: dict, ids=("watchman",)) -> dict:
+    """ORG-052 section 8 clarification (#1665): name the disposable protocol-test
+    seats whose installer plans are registered with the broker (the production
+    template carries [])."""
+
+    doc = copy.deepcopy(doc)
+    doc["plan_registration"]["protocol_test_seat_ids"] = list(ids)
+    return doc
 
 
 def with_approver(doc: dict, seat_id: str = "recovery") -> dict:
@@ -106,7 +116,7 @@ def closure() -> H.Closure:
 
 
 def build(manifest: dict | None = None, registry: dict | None = None):
-    m = H.parse_manifest(raw(manifest or with_approver(manifest_doc())))
+    m = H.parse_manifest(raw(manifest or with_protocol_test_seats(with_approver(manifest_doc()))))
     r = H.parse_registry(raw(registry or registry_doc()))
     return H.build_plan(m, r, REPO_ROOT, closure=closure())
 
@@ -322,7 +332,7 @@ class RenderTest(unittest.TestCase):
     def test_per_seat_and_per_approver_renders(self) -> None:
         doc, _ = plan()
         ids = {e["id"]: e for e in doc["entries"]}
-        for seat_id, uid, account in (("recovery", 1002, "claude-fallback"), ("watchman", 1011, "codex-fallback")):
+        for seat_id, uid, account in (("recovery", 2001, "fixture-recovery"), ("watchman", 2002, "fixture-watchman")):
             unit = ids[f"unit:pantheon-host-executor@{seat_id}.service"]
             self.assertEqual(unit["path"], f"/etc/systemd/system/pantheon-host-executor@{seat_id}.service")
             self.assertIn(f"dbus_policy:org.pantheon.HostBroker1.seat-{seat_id}.conf", ids)
@@ -334,9 +344,9 @@ class RenderTest(unittest.TestCase):
         self.assertNotIn("dbus_policy:org.pantheon.HostApproval1.approver-watchman.conf", ids)
         _, staging = plan()
         text = staging["units/pantheon-host-executor@recovery.service"].decode()
-        self.assertIn("ReadWritePaths=/home/claude-fallback /home/post-office/mailbox", text)
-        self.assertIn("BusName=org.pantheon.HostExecutor1.U1002", text)
-        self.assertIn("User=claude-fallback", text)
+        self.assertIn("ReadWritePaths=/home/fixture-recovery /home/post-office/mailbox", text)
+        self.assertIn("BusName=org.pantheon.HostExecutor1.U2001", text)
+        self.assertIn("User=fixture-recovery", text)
         self.assertNotIn("[Install]", text)
 
 
@@ -561,7 +571,6 @@ GOLDEN = [
     ("P6", "dir", "dir:/run/pantheon-host-install", "tool"),
     ("P6", "dir", "dir:/run/pantheon-host-install/staging", "tool"),
     ("P6", "plan_registration", "plan-registration:watchman:m1", "tool"),
-    ("P6", "plan_registration", "plan-registration:recovery:m1", "tool"),
     ("P6", "registry_post_registration", "registry-post:/etc/pantheon/host-broker/seat-registry.json", "tool"),
     ("P7", "dbus_policy", "dbus_policy:org.pantheon.HostApproval1.conf", "family"),
     ("P7", "dbus_policy", "dbus_policy:org.pantheon.HostApprovalTelegram1.conf", "family"),
@@ -577,8 +586,8 @@ GOLDEN = [
     ("P7", "unit", "unit:pantheon-host-broker.service", "family"),
     ("P7", "unit", "unit:pantheon-host-executor@watchman.service", "family"),
     ("P7", "unit", "unit:pantheon-host-executor@recovery.service", "family"),
-    ("P7", "activation", "activation:org.pantheon.HostExecutor1.U1002.service", "tool"),
-    ("P7", "activation", "activation:org.pantheon.HostExecutor1.U1011.service", "tool"),
+    ("P7", "activation", "activation:org.pantheon.HostExecutor1.U2001.service", "tool"),
+    ("P7", "activation", "activation:org.pantheon.HostExecutor1.U2002.service", "tool"),
     ("P8", "credential", "credential:/etc/pantheon/host-approval-telegram/credentials/bot-token", "tool"),
     ("P9", "unit_enable", "unit_enable:pantheon-host-approval.service", "family"),
     ("P9", "unit_enable", "unit_enable:pantheon-host-broker.service", "family"),
@@ -595,7 +604,7 @@ class DeterminismTest(unittest.TestCase):
             tmp_path = Path(tmp)
             manifest = tmp_path / "manifest.json"
             registry = tmp_path / "registry.json"
-            manifest.write_bytes(raw(with_approver(manifest_doc())))
+            manifest.write_bytes(raw(with_protocol_test_seats(with_approver(manifest_doc()))))
             registry.write_bytes(raw(registry_doc()))
             tracked_path = tmp_path / "tracked"
             tracked_path.write_bytes(tracked_bytes())
@@ -986,6 +995,111 @@ class CliTest(unittest.TestCase):
         self.assertEqual(len(uid_rows), 4)
         for r in uid_rows:
             self.assertIn("uid >= 1000", r["rename_later_is_migration"])
+
+
+class ProtocolTestSeatScopeTest(unittest.TestCase):
+    """ORG-052 section 8 clarification (#1665; T-6167 PR-1): the broker is
+    sudo-on-behalf for running seats and seat installation is the germination
+    engine's, so a production plan registers NO seat installer plan. Only a seat
+    named in plan_registration.protocol_test_seat_ids (a disposable ORG-052 E37
+    seat) is registered."""
+
+    P6_KINDS = ("plan_registration", "registry_post_registration")
+
+    def production(self):
+        return build(with_approver(manifest_doc()))
+
+    def refused(self, manifest: dict, message: str, registry: dict | None = None) -> None:
+        with self.assertRaisesRegex(H.InstallPlanError, message):
+            build(manifest, registry)
+
+    def test_a_production_plan_registers_nothing_with_the_broker(self) -> None:
+        doc, _ = self.production()
+        kinds = {e["kind"] for e in doc["entries"]}
+        self.assertFalse(kinds & set(self.P6_KINDS), kinds)
+        paths = {e["path"] for e in doc["entries"] if e.get("path")}
+        self.assertNotIn("/run/pantheon-host-install", paths)
+        self.assertNotIn("/run/pantheon-host-install/staging", paths)
+        self.assertFalse([e["id"] for e in doc["entries"] if e["id"].startswith(("plan-registration:", "registry-post:"))])
+        # the installed registry keeps its pre-registration bytes: seats and manifests, NO plans key
+        self.assertNotIn("plans", registry_doc())
+        reg = next(e for e in doc["entries"] if e["kind"] == "registry" and e.get("content_sha256"))
+        self.assertEqual(reg["content_sha256"], H.sha256_bytes((H.canonical(registry_doc()) + "\n").encode("ascii")))
+        # the units still wait on the registry entry (no dangling dependency on registry-post)
+        ids = {e["id"] for e in doc["entries"]}
+        for e in doc["entries"]:
+            self.assertTrue(set(e["after"]) <= ids, e["id"])
+
+    def test_the_example_manifest_lists_no_protocol_test_seat(self) -> None:
+        self.assertEqual(manifest_doc()["plan_registration"], {"protocol_test_seat_ids": []})
+        self.assertEqual(H.parse_manifest(H.EXAMPLE_MANIFEST.read_bytes()).protocol_test_seat_ids, ())
+
+    def test_a_named_protocol_test_seat_is_registered_and_only_it(self) -> None:
+        doc, _ = build()  # the default test manifest names watchman only
+        regs = [e for e in doc["entries"] if e["kind"] == "plan_registration"]
+        self.assertEqual([e["id"] for e in regs], ["plan-registration:watchman:m1"])
+        self.assertTrue(regs[0]["inputs"]["protocol_test_seat"])
+        self.assertNotIn("plan-registration:recovery:m1", {e["id"] for e in doc["entries"]})
+        self.assertEqual([e["kind"] for e in doc["entries"] if e["kind"] == "registry_post_registration"],
+                         ["registry_post_registration"])
+        self.assertEqual(sum(1 for e in doc["entries"] if e["kind"] == "dir" and e["owner"] == "nobody"), 1)
+
+    def test_one_registration_per_manifest_revision(self) -> None:
+        registry = registry_doc()
+        second = copy.deepcopy(registry["manifests"][0])
+        second.update(revision="m2", path="/etc/pantheon/host-broker/manifests/m2.yaml", sha256="b" * 64)
+        registry["manifests"].append(second)
+        doc, _ = build(registry=registry)
+        self.assertEqual([e["id"] for e in doc["entries"] if e["kind"] == "plan_registration"],
+                         ["plan-registration:watchman:m1", "plan-registration:watchman:m2"])
+
+    def test_a_marker_id_missing_from_the_registry_is_refused(self) -> None:
+        self.refused(with_protocol_test_seats(with_approver(manifest_doc()), ["ghost"]), "not in the seat registry")
+
+    def test_a_marker_id_that_is_an_approver_is_refused(self) -> None:
+        with self.assertRaisesRegex(H.InstallPlanError, "approver seat cannot be a protocol-test seat"):
+            H.parse_manifest(raw(with_protocol_test_seats(with_approver(manifest_doc(), "recovery"), ["recovery"])))
+
+    def test_duplicates_and_bad_ids_are_refused(self) -> None:
+        for ids, message in ((["watchman", "watchman"], "duplicates"), (["bad id"], "list of seat ids"),
+                             ([7], "list of seat ids")):
+            with self.assertRaisesRegex(H.InstallPlanError, message):
+                H.parse_manifest(raw(with_protocol_test_seats(with_approver(manifest_doc()), ids)))
+
+    def test_the_plan_registration_key_is_required_and_closed(self) -> None:
+        missing = with_approver(manifest_doc())
+        del missing["plan_registration"]
+        with self.assertRaisesRegex(H.InstallPlanError, "plan_registration"):
+            H.parse_manifest(raw(missing))
+        extra = with_approver(manifest_doc())
+        extra["plan_registration"]["note"] = "x"
+        with self.assertRaisesRegex(H.InstallPlanError, "plan_registration"):
+            H.parse_manifest(raw(extra))
+        empty = with_approver(manifest_doc())
+        empty["plan_registration"] = {}
+        with self.assertRaisesRegex(H.InstallPlanError, "plan_registration"):
+            H.parse_manifest(raw(empty))
+        not_list = with_approver(manifest_doc())
+        not_list["plan_registration"]["protocol_test_seat_ids"] = "watchman"
+        with self.assertRaisesRegex(H.InstallPlanError, "list of seat ids"):
+            H.parse_manifest(raw(not_list))
+
+    def test_the_marker_is_bound_by_the_plan_digest(self) -> None:
+        production, _ = self.production()
+        marked, _ = build()
+        self.assertNotEqual(H.plan_bytes(production), H.plan_bytes(marked))
+
+    def test_a_seat_with_an_instance_yaml_role_identity_is_never_a_protocol_test_seat(self) -> None:
+        accounts, uids = H._instance_role_identities(REPO_ROOT)
+        self.assertTrue(accounts and uids)  # data, read from instance.yaml
+        for field, value in (("account", sorted(accounts)[0]), ("uid", sorted(uids)[0])):
+            registry = registry_doc()
+            registry["seats"][1][field] = value  # watchman
+            with self.assertRaisesRegex(H.InstallPlanError, "instance.yaml role identity"):
+                build(registry=registry)
+            # the same seat is fine in a production plan: the wall guards the marker, not the registry
+            doc, _ = build(with_approver(manifest_doc()), registry)
+            self.assertFalse([e for e in doc["entries"] if e["kind"] == "plan_registration"])
 
 
 if __name__ == "__main__":

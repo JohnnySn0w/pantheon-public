@@ -16,6 +16,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -260,6 +261,14 @@ class TestAppendRefusesDuplicateIds(unittest.TestCase):
     addressing defect forfeits the property the addressing exists to serve.
     """
 
+    def setUp(self) -> None:
+        # T-4739: this class tests mechanics (routing / uniqueness / serialization) with
+        # deliberately minimal or historical-ts fixtures, not ORG-001's rules (those are
+        # enforced and tested in TestValidateEntryOrg001), so the gate is turned off here.
+        _p = mock.patch.object(ls, "ENFORCE", False)
+        _p.start()
+        self.addCleanup(_p.stop)
+
     def _ledger(self, tmp: str) -> Path:
         d = Path(tmp) / "ledger"
         d.mkdir()
@@ -421,23 +430,94 @@ class TestValidateEntryOrg001(unittest.TestCase):
         e["executor"] = "engineering-orchestrator-2"
         self.assertEqual(ls.validate_entry(e, self.NOW), [])
 
-    def test_warn_mode_writes_and_enforce_mode_refuses(self):
-        bad = self.entry(agent="artisan")
-        bad["ts"] = datetime.now(timezone.utc).strftime(ls.TS_FORMAT)
-        bad["id"] = f"{bad['ts']}-warn-mode"
-        with tempfile.TemporaryDirectory() as d:
-            ledger = Path(d)
-            target = ls.append_entry(ledger, bad)
+    def _now_entry(self, slug, **over):
+        ts = datetime.now(timezone.utc).strftime(ls.TS_FORMAT)
+        return self.entry(ts=ts, id=f"{ts}-{slug}", **over)
+
+    def test_enforce_is_on_by_default(self):
+        self.assertTrue(ls.ENFORCE)
+
+    def test_warn_mode_writes_when_enforce_is_turned_off(self):
+        bad = self._now_entry("warn-mode", agent="artisan")
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(ls, "ENFORCE", False):
+            target = ls.append_entry(Path(d), bad)
             self.assertIn("warn-mode", target.read_text())
-            old = ls.ENFORCE
-            ls.ENFORCE = True
-            try:
-                again = dict(bad, id=f"{bad['ts']}-enforce-mode")
-                with self.assertRaises(ValueError):
-                    ls.append_entry(ledger, again)
-                self.assertNotIn("enforce-mode", target.read_text())
-            finally:
-                ls.ENFORCE = old
+
+    def test_enforce_refuses_each_rule_and_leaves_the_ledger_untouched(self):
+        cases = {
+            "missing rationale": {"rationale": None},
+            "missing justifies_via": {"justifies_via": None},
+            "justifies_via not a list": {"justifies_via": "P4"},
+            "missing action": {"action": None},
+            "bad ts format": {"ts": "2026-10-08 15:00:00", "id": "2026-10-08 15:00:00-x"},
+            "stale ts": {"ts": "2026-01-01T00:00:00Z", "id": "2026-01-01T00:00:00Z-stale"},
+            "id not <ts>-<slug>": {"id": "not-an-id"},
+            "legacy agent": {"agent": "orchestrator"},
+            "persona agent": {"agent": "artisan"},
+            "shared role without executor": {"agent": "engineering_orchestrator"},
+        }
+        for name, over in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as d:
+                ledger = Path(d)
+                bad = self._now_entry("rule-check")
+                for key, value in over.items():
+                    if value is None:
+                        bad.pop(key, None)
+                    else:
+                        bad[key] = value
+                with self.assertRaises(ValueError) as ctx:
+                    ls.append_entry(ledger, bad)
+                self.assertIn("ORG-001", str(ctx.exception))
+                self.assertEqual(list(ledger.rglob("*.jsonl")), [])
+
+    def test_enforce_accepts_a_conforming_entry(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = ls.append_entry(Path(d), self._now_entry("conforms"))
+            self.assertIn("conforms", target.read_text())
+
+
+class TestVocabularyLoadFailure(unittest.TestCase):
+    """T-4739 (orchestrator requirement 3): what ENFORCE does when the ORG-100 role vocabulary
+    cannot be loaded. VOCAB_LOAD_FAIL_OPEN picks the posture; both are pinned."""
+
+    def _entry(self, **over):
+        ts = datetime.now(timezone.utc).strftime(ls.TS_FORMAT)
+        base = {"id": f"{ts}-vocab", "ts": ts, "agent": "artisan", "action": "a",
+                "rationale": "r", "justifies_via": ["P4"]}
+        base.update(over)
+        return base
+
+    def _broken_vocab(self):
+        return mock.patch.object(ls, "_role_vocabulary", side_effect=RuntimeError("manifest unreadable"))
+
+    def test_default_is_fail_open(self):
+        self.assertTrue(ls.VOCAB_LOAD_FAIL_OPEN)
+
+    def test_fail_open_warns_loudly_and_lets_the_entry_through(self):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with self._broken_vocab(), mock.patch.object(ls, "VOCAB_LOAD_FAIL_OPEN", True), \
+                contextlib.redirect_stderr(err), tempfile.TemporaryDirectory() as d:
+            target = ls.append_entry(Path(d), self._entry())
+            self.assertTrue(target.exists())
+        self.assertIn("WARN ORG-001", err.getvalue())
+        self.assertIn("NOT checked", err.getvalue())
+
+    def test_fail_open_still_enforces_every_other_rule(self):
+        with self._broken_vocab(), mock.patch.object(ls, "VOCAB_LOAD_FAIL_OPEN", True), \
+                tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError):
+                ls.append_entry(Path(d), self._entry(rationale=""))
+            self.assertEqual(list(Path(d).rglob("*.jsonl")), [])
+
+    def test_fail_closed_refuses_the_entry(self):
+        with self._broken_vocab(), mock.patch.object(ls, "VOCAB_LOAD_FAIL_OPEN", False), \
+                tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(ValueError) as ctx:
+                ls.append_entry(Path(d), self._entry())
+            self.assertIn("cannot load the ORG-100 role vocabulary", str(ctx.exception))
+            self.assertEqual(list(Path(d).rglob("*.jsonl")), [])
 
 
 if __name__ == "__main__":

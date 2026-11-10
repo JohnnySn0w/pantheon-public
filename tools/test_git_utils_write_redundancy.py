@@ -25,10 +25,13 @@ from tools._git_utils import _classify_push_failure, push_with_retry
 REAL_HOOKS = Path(__file__).resolve().parent.parent / ".githooks"
 DEAD_ORIGIN = "https://127.0.0.1:1/nothing.git"  # connection refused, loopback only
 
-_ENV = {
-    **os.environ,
+_GIT_IDENTITY = {
     "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@example.com",
     "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@example.com",
+}
+_ENV = {
+    **os.environ,
+    **_GIT_IDENTITY,
     "GIT_TERMINAL_PROMPT": "0",
 }
 
@@ -89,7 +92,11 @@ class _Base(unittest.TestCase):
         return _commit(self.repo, name)
 
     def push(self, **kw):
-        return push_with_retry(self.repo, refspec="HEAD:main", **kw)
+        # push_with_retry owns its fetch/rebase subprocesses.  Give those children the
+        # same fixture identity as the setup commits; a clean CI worker must not need
+        # ~/.gitconfig merely because a non-FF path rewrites the temporary commit.
+        with unittest.mock.patch.dict(os.environ, _GIT_IDENTITY):
+            return push_with_retry(self.repo, refspec="HEAD:main", **kw)
 
     def _fake_origin_push(self, stderr):
         real = _git_utils._git
@@ -213,6 +220,116 @@ class NeverFailOverTest(_Base):
         self.assertFalse(ok)
         self.assertIn("non-retryable", msg)
         self.assertEqual(_head(self.mirror), self.baseline)
+
+    def test_persistent_publickey_rejection_no_mirror_fallback(self):
+        self.new_commit()
+        with self._fake_origin_push(
+            "git@github.com: Permission denied (publickey).\n"
+            "fatal: Could not read from remote repository."
+        ), unittest.mock.patch.object(_git_utils, "_origin_reachable", return_value=False):
+            ok, msg = self.push(mirror_url=str(self.mirror))
+        self.assertFalse(ok)
+        self.assertIn("non-retryable", msg)
+        self.assertEqual(_head(self.mirror), self.baseline)
+
+    def test_transient_publickey_rejection_with_authenticated_probe_retries_origin(self):
+        sha = self.new_commit()
+        real = _git_utils._git
+        pushes = []
+
+        def fail_once(*args, cwd=None):
+            if args[:2] == ("push", "origin"):
+                pushes.append("origin")
+                if len(pushes) == 1:
+                    return subprocess.CompletedProcess(
+                        args, 128, "", "git@github.com: Permission denied (publickey)."
+                    )
+            return real(*args, cwd=cwd) if cwd is not None else real(*args)
+
+        with unittest.mock.patch.object(_git_utils, "_git", side_effect=fail_once), \
+             unittest.mock.patch.object(_git_utils, "_origin_reachable", return_value=True):
+            ok, msg = self.push(mirror_url=str(self.mirror))
+        self.assertTrue(ok, msg)
+        self.assertEqual(pushes, ["origin", "origin"])
+        self.assertEqual(_head(self.origin), sha)
+        self.assertEqual(_head(self.mirror), sha)
+        self.assertNotIn("replay to GitHub pending", msg)
+
+    def test_repeated_publickey_rejection_after_recovered_probe_fails_closed(self):
+        self.new_commit()
+        pushes = []
+        real = _git_utils._git
+
+        def always_reject(*args, cwd=None):
+            if args[:2] == ("push", "origin"):
+                pushes.append("origin")
+                return subprocess.CompletedProcess(
+                    args, 128, "", "git@github.com: Permission denied (publickey)."
+                )
+            return real(*args, cwd=cwd) if cwd is not None else real(*args)
+
+        with unittest.mock.patch.object(_git_utils, "_git", side_effect=always_reject), \
+             unittest.mock.patch.object(_git_utils, "_origin_reachable", return_value=True):
+            ok, msg = self.push(mirror_url=str(self.mirror))
+        self.assertFalse(ok)
+        self.assertEqual(pushes, ["origin", "origin"])
+        self.assertEqual(_head(self.mirror), self.baseline)
+        self.assertIn("non-retryable", msg)
+
+    def test_compound_publickey_and_policy_refusal_never_retries_or_fails_over(self):
+        self.new_commit()
+        stderr = (
+            "git@github.com: Permission denied (publickey).\n"
+            "remote: error: GH006: Protected branch update failed."
+        )
+        with self._fake_origin_push(stderr), \
+             unittest.mock.patch.object(_git_utils, "_origin_reachable") as probe:
+            ok, msg = self.push(mirror_url=str(self.mirror))
+        self.assertFalse(ok)
+        probe.assert_not_called()
+        self.assertEqual(_head(self.mirror), self.baseline)
+        self.assertIn("non-retryable", msg)
+
+    def test_compound_publickey_and_gh013_never_retries_or_fails_over(self):
+        self.new_commit()
+        stderr = (
+            "git@github.com: Permission denied (publickey).\n"
+            "remote: error: GH013: Repository rule violations found for refs/heads/main."
+        )
+        with self._fake_origin_push(stderr), \
+             unittest.mock.patch.object(_git_utils, "_origin_reachable") as probe:
+            ok, msg = self.push(mirror_url=str(self.mirror))
+        self.assertFalse(ok)
+        probe.assert_not_called()
+        self.assertEqual(_head(self.mirror), self.baseline)
+        self.assertIn("non-retryable", msg)
+
+    def test_compound_publickey_and_generic_auth_or_permission_never_retries(self):
+        for index, extra in enumerate((
+            "fatal: Authentication failed for 'https://github.com/x/y.git/'",
+            "remote: Permission to x/y.git denied to user.",
+        )):
+            with self.subTest(extra=extra):
+                self.new_commit(f"auth-{index}")
+                stderr = "git@github.com: Permission denied (publickey).\n" + extra
+                with self._fake_origin_push(stderr), \
+                     unittest.mock.patch.object(_git_utils, "_origin_reachable") as probe:
+                    ok, msg = self.push(mirror_url=str(self.mirror))
+                self.assertFalse(ok)
+                probe.assert_not_called()
+                self.assertEqual(_head(self.mirror), self.baseline)
+                self.assertIn("non-retryable", msg)
+
+    def test_arbitrary_publickey_mention_never_retries_or_fails_over(self):
+        self.new_commit()
+        stderr = "fatal: custom publickey helper returned an unknown state"
+        with self._fake_origin_push(stderr), \
+             unittest.mock.patch.object(_git_utils, "_origin_reachable") as probe:
+            ok, msg = self.push(mirror_url=str(self.mirror))
+        self.assertFalse(ok)
+        probe.assert_not_called()
+        self.assertEqual(_head(self.mirror), self.baseline)
+        self.assertIn("non-retryable", msg)
 
     def test_network_marker_but_origin_still_reachable_no_fallback(self):
         # Classifier says "network" but the confirming ls-remote succeeds -> fail closed.

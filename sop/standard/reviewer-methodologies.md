@@ -22,6 +22,8 @@ For reviewing a ticket or a close-not-build disposition BEFORE code is written, 
 
 **Discipline.** Reviewer keeps a checklist of the enumerated items from the trigger, and each item is marked verified/unverified against the diff — never marked verified by transitivity ("the whole area was refactored, so this is probably covered").
 
+**Decisive-check rule (T-4614).** For each acceptance criterion or enumerated blocker, the reviewer runs at least one decisive check themselves in the review worktree and quotes its command and result. A decisive check is the named test, a targeted repro, or a command whose output would differ if the criterion failed. The implementer's reported output is context, not evidence. Where running is impossible (live-only, cost, a forbidden actuation), the reviewer says so and marks the item UNVERIFIED rather than verified. Source: arXiv:2610.01023 (decisive checks improved both catch and over-rejection; reviewer size was not a consistent predictor of review quality).
+
 ### 2. Architecture-vault (founding-principle check)
 
 **Definition.** Given the project's hand-curated architectural documents — the "vault" (per project: for Pantheon, `rulebook/principles.md` + `rulebook/directives.md` + `architecture/adr/`; for echo-prismatic, the ADR vault + visual-grammar + source-reference-status-policy + ORG-076/050/080; for other projects, whatever hand-curated docs act as the founding surface) — verify that the change does not contradict any of them, and that it aligns with the principles they express.
@@ -86,6 +88,7 @@ For reviewing a ticket or a close-not-build disposition BEFORE code is written, 
 
 ## Reviewer report SHOULD produce
 
+- Per criterion, the decisive check run and its quoted result, or UNVERIFIED with the reason it could not be run.
 - Per-lens verdict — never a monolithic "APPROVE"/"REBOUND" that doesn't distinguish which lens surfaced what.
 - Explicit contradiction-check results ("no contradiction found against X:line" / "contradiction at Y:line").
 - For rendered surfaces: the rendered content the reviewer inspected, quoted or linked.

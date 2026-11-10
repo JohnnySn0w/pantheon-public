@@ -354,6 +354,51 @@ class RoutingTests(StoreCase):
         self.assertEqual(fm["target"], "role:engineering_orchestrator")
         self.assertEqual(self.pages, [])
 
+    def test_codex_faulted_routes_other_harness_to_recovery_end_to_end(self):  # §6.6, T-5999
+        spec = make_spec(candidates=rev.REPAIR_CANDIDATES, harness="codex", account="claude-fallback")
+        ports = self.ports()
+        for _ in range(3):
+            self.obs(spec, es.Broken("f1", "small\n"), ports)
+        fm, _ = ticket.parse_front_matter(self.origin_ticket_text())
+        self.assertEqual(fm["repair_route"], "recovery@claude")
+
+    def test_claude_faulted_with_repair_candidates_still_routes_watchman(self):  # T-5999
+        spec = make_spec(candidates=rev.REPAIR_CANDIDATES, harness="claude", account="claude-fallback")
+        ports = self.ports()
+        for _ in range(3):
+            self.obs(spec, es.Broken("f1", "small\n"), ports)
+        fm, _ = ticket.parse_front_matter(self.origin_ticket_text())
+        self.assertEqual(fm["repair_route"], "watchman@codex")
+
+    def test_recovery_subject_deferred_pages_instead_of_routing_to_recovery(self):  # T-5999 Recovery condition
+        spec = make_spec(candidates=rev.REPAIR_CANDIDATES, harness="codex", account="claude-fallback")
+        ports = self.ports()
+        for _ in range(3):
+            self.obs(spec, es.Broken("x:recovery", ("z" * 99 + "\n") * 400), ports)
+        fm, _ = ticket.parse_front_matter(self.origin_ticket_text())
+        self.assertEqual((fm["evidence_deferred"], fm["repair_route"]), ("true", "page"))
+        (ep,) = es.load_domain(spec.domain_key)["episodes"].values()
+        self.assertEqual(ep["delivery"]["route"]["excluded_subject"], ["recovery"])
+        self.assertEqual(len(self.pages), 1)
+
+    def test_recovery_subject_routes_watchman_end_to_end(self):  # T-5999 Recovery condition
+        spec = make_spec(candidates=rev.REPAIR_CANDIDATES, harness="codex", account="claude-fallback")
+        ports = self.ports()
+        for _ in range(3):
+            self.obs(spec, es.Broken("x:recovery", "small\n"), ports)
+        fm, _ = ticket.parse_front_matter(self.origin_ticket_text())
+        self.assertEqual(fm["repair_route"], "watchman@codex")
+
+    def test_malformed_fault_id_routes_without_crashing(self):  # T-5999: no subject => no exclusion
+        spec = make_spec(candidates=rev.REPAIR_CANDIDATES, harness="codex", account="claude-fallback")
+        ports = self.ports()
+        for _ in range(3):
+            self.obs(spec, es.Broken("no-colon-here", "small\n"), ports)
+        fm, _ = ticket.parse_front_matter(self.origin_ticket_text())
+        self.assertEqual(fm["repair_route"], "recovery@claude")
+        (ep,) = es.load_domain(spec.domain_key)["episodes"].values()
+        self.assertNotIn("excluded_subject", ep["delivery"]["route"])
+
     def test_deferred_pages_when_no_same_account_live(self):  # §6.18
         fm = self._run({"consultant"}, evidence=("z" * 99 + "\n") * 400)
         self.assertEqual(fm["repair_route"], "page")

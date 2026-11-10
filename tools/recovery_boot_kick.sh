@@ -47,8 +47,9 @@ SEND_CMD="${RECOVERY_KICK_SEND_CMD:-$SCRIPT_DIR/send_keys_submit.sh}"
 # T-4455: the kick lands on a FRESH TUI, which is slow to render a paste (T-4362).
 # Ungated, the Enter beat the render and the verify read the still-empty composer
 # as "submitted" (a false rc 0: 2026-09-30 15:51:38Z, the kick sat unsent 2m41s).
-# 8s matches runtime_controller's FRESH_RUNTIME_SUBMIT_RENDER_WAIT_SECONDS.
-RENDER_WAIT="${RECOVERY_KICK_RENDER_WAIT:-8}"
+# T-6293: the bound comes from the submit_verify harness profile (one source; 8 only if
+# python is unavailable), the same value runtime_controller uses for fresh-runtime submits.
+RENDER_WAIT="${RECOVERY_KICK_RENDER_WAIT:-$(/usr/bin/python3 "$SCRIPT_DIR/submit_verify.py" --harness claude-code --print-first-paste-render-wait 2>/dev/null || echo 8)}"
 
 # Steady-state sentinel conjunction — identical to handoff_and_restart.sh step 7.
 # The `─` quantifiers MUST stay grouped: `─` is 3 bytes and in a byte locale a bare

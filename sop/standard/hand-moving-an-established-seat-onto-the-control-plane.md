@@ -27,7 +27,7 @@ The operator's ruling (TG 2026-09-11): **do NOT teach the installer/germination-
 | Rollback: disable the timer, restore, re-enable the bespoke unit | Rollback: stop both launchers, stop the Codex poller and prove it absent, take the control-plane pane down, restore state and backups, re-enable the bespoke unit | HO decision 2; §6 |
 | Maintenance: `enter-maintenance` with no account named | Arm it in the shared registry (T-4150) from an up-to-date clone, and keep it armed until commit B is live on claude-fallback's clone | HO decision 6; §9f-6 |
 
-**2026-09-29 amendment (T-4330).** If the bootstrap falls back to Codex, its receiver handoff starts `codex-telegram-poller.service` on the seat's bot token. That happened on recovery's attempt 1 (20:01:15-20Z), and the rollback tore it down seconds later. On a seat with no `~/.config/codex-telegram/poller.offset` (recovery, today), the poller's first start runs codex-config's first-boot drain-and-skip. It confirms every queued update and injects none, and the dark window from phase 2 on is exactly when the operator's messages queue up.
+**2026-09-29 amendment (T-4330).** If the bootstrap falls back to Codex, its receiver handoff starts `codex-telegram-poller.service` on the seat's bot token. That happened on recovery's attempt 1 (20:01:15-20Z), and the rollback tore it down seconds later. On a seat with no `~/.config/codex-telegram/poller.offset` (recovery, today), the poller's first start runs the `harness/codex` first-boot drain-and-skip. It confirms every queued update and injects none, and the dark window from phase 2 on is exactly when the operator's messages queue up.
 - The script now holds the poller from phase 1 until exit. `tools/codex_poller_hold.sh hold` adds a runtime drop-in with a failing `ExecStartPre` and `Restart=no`.
 - While held, a Codex fallback's start fails, and the controller records `receiver_handoff_failed` and compensates. Gate A then rolls back, and the queue waits for the restored Claude plugin. Messages are delayed, never lost.
 - Don't use `systemctl --user mask --runtime`: the unit file in `~/.config/systemd/user` outranks the runtime directory, so that mask is a silent no-op (measured: `start` rc 0, unit active).
@@ -136,16 +136,7 @@ systemctl --user is-enabled pantheon-runtime-controller@<persona>.service   # ex
 ```
 Linger is already on for both accounts (`/var/lib/systemd/linger/{claude,claude-fallback}`).
 
-**S4 (Orchestrator only, optional, recommended).** Keep the shared echo cargo cache, which `claude-bot-supervise.sh` exports (T-3937).
-- Put the drop-in on **both** launchers, because either one may create the tmux server.
-- `umask 002` and the `pantheon-shared` group need no drop-in; §9f-4 has the check.
-```bash
-for u in pantheon-runtime-controller@orchestrator.service pantheon-persona-consume@orchestrator.service; do
-  mkdir -p ~/.config/systemd/user/$u.d
-  printf '[Service]\nEnvironment=CARGO_TARGET_DIR=/var/lib/pantheon/echo-target\n' > ~/.config/systemd/user/$u.d/t3650-echo-target.conf
-done
-systemctl --user daemon-reload
-```
+**S4 (retired 2026-11-09, T-5070).** Do NOT export `CARGO_TARGET_DIR` session-wide on any launcher. A session-wide export lets a bare `cargo` build into the shared echo target without `echo_target_adopt.py`, which is how the 10-12 and 10-14 EPERM recurrences happened. Echo builds go through `~/pantheon-config/tools/echo-cargo.sh`, which sets the shared target, `umask 002` and adopt itself (`/var/lib/pantheon/README-echo-target.md`). Orchestrator's earlier `t3650-echo-target.conf` drop-ins were removed on 2026-11-09.
 
 **S5. The day before.** Confirm that T-4101 attach has worked live on specialist. Its ticket says "LIVE-VERIFY pending" (`tickets/done/T-4101.md:38`). Recovery's own Gate B also counts as that proof before the Orchestrator move. Run from `claude`:
 ```bash

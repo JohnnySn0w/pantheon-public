@@ -93,7 +93,7 @@ TRANSITIONS: tuple[Transition, ...] = (
         State.PENDING_PARK,
         State.ACTIVE,
         "rollback_step2_crash",
-        "ORG-080 L403 reconciliation-matrix row: step-2 succeeded, step-3 "
+        "ORG-080 run-state note §Reconciliation for every prefix state, row: step-2 succeeded, step-3 "
         "crashed; roll back record to `_prior_state.json.prior_state` "
         "(ACTIVE -- PENDING_PARK's sole predecessor in this closed graph)",
     ),
@@ -101,7 +101,7 @@ TRANSITIONS: tuple[Transition, ...] = (
         State.PENDING_PARK,
         State.ACTIVE,
         "rollback_step3_crash",
-        "ORG-080 L404 reconciliation-matrix row: step-3 succeeded, step-4 "
+        "ORG-080 run-state note §Reconciliation for every prefix state, row: step-3 succeeded, step-4 "
         "crashed; unlink resume/handle.json (immutable-authority allows "
         "unlink on abandonment), roll back record to prior state",
     ),

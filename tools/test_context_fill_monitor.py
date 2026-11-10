@@ -2625,8 +2625,15 @@ class TestCheckPluginDirAllowlist(unittest.TestCase):
         completed.returncode = 0
         completed.stdout = json.dumps(settings)
         completed.stderr = ""
-        with patch.object(cfm.subprocess, "run", return_value=completed):
+        # The matcher is exercised against a patched allowlist; the shipped one is empty
+        # since T-4643 step 4 (pinned below).
+        with patch.object(cfm.subprocess, "run", return_value=completed), \
+                patch.dict(cfm.PLUGIN_DIR_ALLOWLIST, {"orchestrator": {"fleet-usage"}}):
             return cfm.check_hook_allowlist("orchestrator", AGENT_CONFIG["orchestrator"])
+
+    def test_shipped_allowlist_is_empty_after_the_managed_org_mod(self):
+        """T-4643 step 4: fleet-usage loads as the managed org mod; any sideload is a deviation."""
+        self.assertEqual(cfm.PLUGIN_DIR_ALLOWLIST, {})
 
     def test_allowlisted_in_repo_mod_is_clean(self):
         self.assertEqual(self._run(self.MOD), [])
@@ -2696,6 +2703,15 @@ class TestCheckMarketplaceModAllowlist(unittest.TestCase):
 
     def test_no_mods_is_clean(self):
         self.assertEqual(self._run(self._report()), [])
+
+    def test_managed_org_fleet_usage_mod_is_allowlisted_for_every_seat(self):
+        """T-4643: the managed enabledPlugins enables the org mod on every host account, so
+        every monitored seat must allow exactly that key (and nothing broader)."""
+        for agent in AGENT_CONFIG:
+            self.assertIn("pantheon-fleet-usage@pantheon", cfm.MARKETPLACE_MOD_ALLOWLIST.get(agent, set()), agent)
+        self.assertEqual(self._run(self._report(
+            {"key": "pantheon-fleet-usage@pantheon", "path": "/opt/pantheon/claude-plugins/plugins/fleet-usage", "modules": 1})), [])
+        self.assertEqual(len(self._run(self._report({"key": "fleet-usage@other", "path": "/p", "modules": 1}))), 1)
 
     def test_probe_failure_fails_open(self):
         self.assertEqual(self._run("", probe_rc=1), [])
@@ -4378,6 +4394,15 @@ class TestApiHealthDirectFlow(unittest.TestCase):
         os.environ["CONTEXT_FILL_RESTART_ABSOLUTE_TOKENS"] = "500"
         os.environ["CONTEXT_FILL_IDLE_VELOCITY_TOKENS"] = "60"
         os.environ["PANTHEON_API_HEALTH_ENABLED"] = "1"  # arm for fire-path tests
+        # T-5705: hermetic seat-state (same pin as T-5817's maintenance class). Since
+        # T-5527 L4b the poll path asks safe_effective_for(agent) whether the seat is in
+        # deep-sleep; unpinned, that runs a real cross-account `sudo -n -u <account> cat`
+        # through subprocess.Popen, which these tests assert is never called.
+        import tools.seat_state as ss
+        for name in ("_read_seat_state", "_read_seat_state_cross", "_read_oom"):
+            p = patch.object(ss, name, return_value=ss.Contribution())
+            p.start()
+            self.addCleanup(p.stop)
 
     def tearDown(self) -> None:
         for k in (

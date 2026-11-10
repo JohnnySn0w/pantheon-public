@@ -502,6 +502,104 @@ def _handle_factory_offset(base: int) -> Callable[[], str]:
     return next_handle
 
 
+SLOW_APPROVAL_HANDLE = "7" * 64
+SLOW_PLAN_HANDLE = "e" * 64
+
+
+def _install_slow_consumer(bus_address: str, fixture: "DomainFixture", subject_uid: int):
+    """T-5644: serve a fake HostApproval1.Consumer IN THIS PROCESS on its
+    own connection, whose ApprovalStatus reply is HELD until the test calls
+    Release, and return a real ApprovalConsumerClient wired to it. Because
+    the fake is served by the very main loop the broker handlers run on, a
+    broker that blocks that loop on the status call can never be answered
+    and every other call stalls until the 10s client timeout: the exact
+    T-5644 defect. WaitPending replies once a status request has arrived,
+    so the test synchronises on an event, not a sleep."""
+
+    import dbus
+    import dbus.bus
+    import dbus.service
+
+    from tools.host_control.approval_client import (
+        ApprovalConsumerClient,
+        DBusConsumerTransport,
+    )
+
+    seat_id = fixture.registry.subject_for_uid(subject_uid).seat_id
+    payload = json.dumps(
+        {
+            "schema": "pantheon-approval-status/v2",
+            "approval_handle": SLOW_APPROVAL_HANDLE,
+            "state": "issued",
+            "expires_at": "2026-10-10T01:00:00+00:00",
+            "summary": "bounded",
+            "plan_handle": SLOW_PLAN_HANDLE,
+            "plan_owner": seat_id,
+        },
+        sort_keys=True,
+    )
+
+    class SlowConsumer(dbus.service.Object):
+        def __init__(self, *args: object) -> None:
+            super().__init__(*args)
+            self.held: list = []
+            self.waiters: list = []
+
+        @dbus.service.method(
+            "org.pantheon.HostApproval1.Consumer",
+            in_signature="s",
+            out_signature="ss",
+            async_callbacks=("reply_cb", "error_cb"),
+        )
+        def ApprovalStatus(self, approval_handle, reply_cb, error_cb):
+            self.held.append(reply_cb)
+            for waiter in self.waiters:
+                waiter()
+            self.waiters = []
+
+        @dbus.service.method(
+            "org.pantheon.Test.SlowConsumer",
+            in_signature="",
+            out_signature="",
+            async_callbacks=("reply_cb", "error_cb"),
+        )
+        def WaitPending(self, reply_cb, error_cb):
+            if self.held:
+                reply_cb()
+            else:
+                self.waiters.append(reply_cb)
+
+        @dbus.service.method(
+            "org.pantheon.Test.SlowConsumer",
+            in_signature="",
+            out_signature="",
+        )
+        def Release(self):
+            held, self.held = self.held, []
+            for reply_cb in held:
+                reply_cb("issued", payload)
+
+    consumer_connection = dbus.bus.BusConnection(bus_address)
+    consumer_name = dbus.service.BusName("org.pantheon.HostApproval1", consumer_connection)
+    consumer = SlowConsumer(consumer_connection, "/org/pantheon/HostApproval1")
+    consumer._keepalive_name = consumer_name
+    client_connection = dbus.bus.BusConnection(bus_address)
+
+    class Ownership:
+        def subject_references_approval(self, *, subject, approval_handle):
+            return approval_handle == SLOW_APPROVAL_HANDLE
+
+        def subject_operation_binds_plan(self, *, subject, approval_handle, plan_handle):
+            return approval_handle == SLOW_APPROVAL_HANDLE and plan_handle == SLOW_PLAN_HANDLE
+
+    client = ApprovalConsumerClient(
+        transport=DBusConsumerTransport(lambda: client_connection, main_loop_attached=True),
+        ownership=Ownership(),
+    )
+    client._keepalive_consumer = consumer
+    return client
+
+
 def serve(config_path: str) -> int:
     """Driver entrypoint: export the service on the private bus named in
     the config and run until killed. See module docstring."""
@@ -557,6 +655,12 @@ def serve(config_path: str) -> int:
             registry=fixture.registry,
         ),
     )
+    if config.get("slow_consumer"):
+        service_object._approval_status = _install_slow_consumer(
+            config["bus_address"],
+            fixture,
+            int(config["subject_uid"]),
+        )
     state_path = root / "state.json"
     state_path.write_text(json.dumps(state), encoding="utf-8")
     # keep the name and object alive for the life of the loop: releasing

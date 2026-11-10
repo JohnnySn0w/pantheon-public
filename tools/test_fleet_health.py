@@ -3,7 +3,14 @@ main() exit codes. The `run` seam is stubbed — no live sudo/systemctl/bwrap.""
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
+import os
+import tempfile
 import unittest
+from datetime import datetime, timezone
+from pathlib import Path
 from unittest import mock
 
 from tools import fleet_health as fh
@@ -687,6 +694,128 @@ class SeatStateT5527(unittest.TestCase):
         self.assertEqual(row["status"], fh.WARN)
         _, row = self._skip_row("seat_sleep", _seat(state="paused-intake"))
         self.assertEqual(row["status"], fh.WARN)
+
+
+class ChronicleTranscriptAndExport(unittest.TestCase):
+    """T-6118 PR-4b: transcript ratio + export size per seat per day (--chronicle). Soft: never FAIL."""
+
+    NOW = datetime(2026, 11, 4, 12, 0, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.export = Path(self._tmp.name) / "export"
+        self.export.mkdir()
+        env = mock.patch.dict(os.environ, {"PANTHEON_CHRONICLE_EXPORT_ROOT": str(self.export)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _file(self, seat, date, name, size):
+        d = self.export / seat / date
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_bytes(b"x" * size)
+
+    @staticmethod
+    def _cov_run(ratio_by_persona):
+        seen = []
+
+        def run(user, inner, timeout=15):
+            seen.append((user, inner))
+            persona = inner.split("--persona ")[1].split()[0]
+            if persona not in ratio_by_persona:
+                return (None, "", False)
+            out = ratio_by_persona[persona]
+            return (0, out if isinstance(out, str) else json.dumps(out), True)
+        run.seen = seen
+        return run
+
+    def _cov(self, ratio, eligible=15, with_t=14, hollow=3):
+        status = "OK" if ratio is None or ratio >= 0.9 else "FAIL"
+        return {"status": status, "ratio": ratio, "eligible": eligible, "with_transcript": with_t,
+                "hollow": hollow, "detail": "d", "threshold": 0.9}
+
+    def test_ratio_ok_and_below_threshold_is_warn_not_fail(self):
+        run = self._cov_run({"recovery": self._cov(0.9333), "specialist": self._cov(0.5, 10, 5), "artisan": "garbage"})
+        recs = fh.transcript_coverage_sweep(["recovery", "specialist", "artisan", "watchman"], run=run)
+        self.assertEqual([r["status"] for r in recs], [fh.OK, fh.WARN, fh.WARN, fh.WARN])
+        self.assertEqual(recs[0]["ratio"], 0.9333)
+        self.assertEqual(run.seen[0][0], fh.FLEET["recovery"]["user"])
+        self.assertIn("transcript-coverage --persona recovery --days 7 --json", run.seen[0][1])
+        self.assertIn("could not query", recs[3]["detail"])
+
+    def test_null_ratio_is_ok(self):
+        recs = fh.transcript_coverage_sweep(["recovery"], run=self._cov_run({"recovery": self._cov(None, 0, 0, 2)}))
+        self.assertEqual(recs[0]["status"], fh.OK)
+
+    def test_export_sizes_per_seat_per_day_and_codex_maps_to_consultant(self):
+        self._file("recovery", "2026-11-04", "a.md", 100)
+        self._file("recovery", "2026-11-04", "a.transcript.jsonl.gz", 2000)
+        self._file("recovery", "2026-11-03", "b.md", 7)
+        self._file("recovery", "2026-10-01", "old.md", 999)          # outside window
+        self._file("consultant", "2026-11-04", "c.md", 50)
+        self._file("codex", "2026-11-04", "wrong.md", 5000)      # not the export seat for codex
+        (self.export / ".ingested" / "recovery" / "2026-11-04").mkdir(parents=True)
+        (self.export / ".ingested" / "recovery" / "2026-11-04" / "r.receipt.json").write_bytes(b"y" * 9)
+        os.symlink("/etc/hostname", self.export / "recovery" / "2026-11-04" / "link.md")
+        sizes, note = fh.export_size_sweep(["recovery", "codex", "specialist"], now=self.NOW)
+        self.assertIsNone(note)
+        self.assertEqual(sizes["recovery"], {"2026-11-04": 2100, "2026-11-03": 7})
+        self.assertEqual(sizes["consultant"], {"2026-11-04": 50})
+        self.assertNotIn("codex", sizes)
+        self.assertEqual(sizes["specialist"], {})
+
+    def test_symlinked_seat_and_date_dirs_are_never_followed(self):
+        big = Path(tempfile.mkdtemp(dir=self.export.parent))
+        self.addCleanup(lambda: __import__("shutil").rmtree(big, ignore_errors=True))
+        (big / "2026-11-04").mkdir()
+        (big / "2026-11-04" / "huge.md").write_bytes(b"x" * 5000)
+        (big / "huge.md").write_bytes(b"x" * 5000)
+        os.symlink(big, self.export / "consultant")                    # symlinked SEAT dir (consultant = codex's seat)
+        (self.export / "recovery").mkdir(exist_ok=True)
+        os.symlink(big / "2026-11-04", self.export / "recovery" / "2026-11-04")  # symlinked DATE dir
+        self._file("recovery", "2026-11-03", "real.md", 7)
+        sizes, note = fh.export_size_sweep(["recovery", "codex"], now=self.NOW)
+        self.assertIsNone(note)
+        self.assertEqual(sizes["consultant"], {})
+        self.assertEqual(sizes["recovery"], {"2026-11-03": 7})
+
+    def test_missing_or_unreadable_tree_is_a_note_not_a_crash(self):
+        with mock.patch.dict(os.environ, {"PANTHEON_CHRONICLE_EXPORT_ROOT": str(self.export / "nope")}):
+            sizes, note = fh.export_size_sweep(["recovery"], now=self.NOW)
+        self.assertEqual(sizes, {})
+        self.assertIn("export tree unreadable/unprovisioned", note)
+
+    def test_render_line(self):
+        self._file("recovery", "2026-11-04", "a.md", 2200000)
+        recs = fh.transcript_coverage_sweep(["recovery"], run=self._cov_run({"recovery": self._cov(0.9333)}))
+        sizes, note = fh.export_size_sweep(["recovery"], now=self.NOW)
+        text = fh.render_chronicle_export(recs, sizes, note)
+        self.assertIn("chronicle-export recovery 7d ratio 0.93 (14/15, hollow 3) | 2026-11-04 2.1M", text)
+
+    def test_main_json_adds_keys_and_exit_code_is_unchanged(self):
+        self._file("recovery", "2026-11-04", "a.md", 10)
+        run = self._cov_run({a: self._cov(0.1, 10, 1) for a in fh.FLEET})
+        buf = io.StringIO()
+        chron = [{"agent": "recovery", "status": fh.OK, "detail": "ok"}]
+        with mock.patch.object(fh, "sweep", return_value=[]), mock.patch.object(fh, "_run", run), \
+                mock.patch.object(fh, "chronicle_coverage_sweep", return_value=chron), \
+                contextlib.redirect_stdout(buf):
+            rc = fh.main(["--agent", "recovery", "--no-failed-sweep", "--chronicle", "--json"])
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["chronicle"], chron)
+        self.assertEqual(payload["transcript_coverage"][0]["status"], fh.WARN)
+        self.assertEqual(payload["export_bytes"]["recovery"], {"2026-11-04": 10})
+
+    def test_main_text_prints_export_line(self):
+        run = self._cov_run({"recovery": self._cov(0.1, 10, 1)})
+        buf = io.StringIO()
+        with mock.patch.object(fh, "sweep", return_value=[]), mock.patch.object(fh, "_run", run), \
+                mock.patch.object(fh, "chronicle_coverage_sweep", return_value=[]), \
+                contextlib.redirect_stdout(buf):
+            rc = fh.main(["--agent", "recovery", "--no-failed-sweep", "--chronicle"])
+        self.assertEqual(rc, 0)
+        self.assertIn("chronicle-export recovery 7d ratio 0.1", buf.getvalue())
 
 
 if __name__ == "__main__":

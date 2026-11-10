@@ -47,6 +47,12 @@ DEFAULT_HISTORY = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" /
 HISTORY_KEEP = 400
 MIN_RATE_WINDOW_S = 20 * 3600
 HDD_RATE_WINDOW_S = 6 * 86400
+# T-5919: SSD daily writes are bursty (planned reboots, guest restores, CI): one day can sit
+# well over budget while the week is under it. Judge the budget on the newest sample at least
+# this old; only when history is shorter, fall back to the >=20h window. A single day above
+# RUNAWAY_DAY_FACTOR x budget still fires (a runaway writer must not wait a week).
+SSD_BUDGET_WINDOW_S = 6 * 86400
+RUNAWAY_DAY_FACTOR = 3
 LIFE_USED_LIMIT_PCT = 90
 
 # the operator's Windows NVMe on pve2: off limits, never touched or queried.
@@ -161,6 +167,17 @@ def daily_budget_bytes(s: dict) -> float | None:
     return None
 
 
+def _write_rate(history: list[dict], host: str, s: dict, now: float, windows) -> float | None:
+    """Bytes/day since the newest sample at least the first satisfiable window old (None if none)."""
+    for window in windows:
+        base = next((h for h in reversed(history)
+                     if h.get("host") == host and now - h["now"] >= window), None)
+        prev = (base or {}).get("disks", {}).get(s["serial"], {}).get("written_bytes")
+        if prev is not None:
+            return (s["written_bytes"] - prev) / ((now - base["now"]) / 86400)
+    return None
+
+
 def evaluate(facts: dict, *, ack: dict, history: list[dict]) -> list[str]:
     """Problems, one line each; [] when every disk is clean."""
     host, now = facts["host"], facts["now"]
@@ -178,14 +195,19 @@ def evaluate(facts: dict, *, ack: dict, history: list[dict]) -> list[str]:
         if s["life_used_pct"] is not None and s["life_used_pct"] >= LIFE_USED_LIMIT_PCT:
             problems.append(f"{tag}: {s['life_used_pct']}% of rated life used")
         budget = daily_budget_bytes(s)
-        min_rate_window = HDD_RATE_WINDOW_S if s["kind"] == "hdd" else MIN_RATE_WINDOW_S
-        base = next((h for h in reversed(history)
-                     if h.get("host") == host and now - h["now"] >= min_rate_window), None)
-        prev = (base or {}).get("disks", {}).get(s["serial"], {}).get("written_bytes")
-        if budget and prev is not None and s["written_bytes"] is not None:
-            rate = (s["written_bytes"] - prev) / ((now - base["now"]) / 86400)
-            if rate > budget:
+        if budget and s["written_bytes"] is not None:
+            if s["kind"] == "hdd":
+                windows = (HDD_RATE_WINDOW_S,)
+            else:
+                windows = (SSD_BUDGET_WINDOW_S, MIN_RATE_WINDOW_S)  # weekly first, short-history fallback
+            rate = _write_rate(history, host, s, now, windows)
+            if rate is not None and rate > budget:
                 problems.append(f"{tag}: wrote {rate / 1e9:.0f} GB/day (budget {budget / 1e9:.0f} GB/day)")
+            elif s["kind"] != "hdd":
+                day = _write_rate(history, host, s, now, (MIN_RATE_WINDOW_S,))
+                if day is not None and day > RUNAWAY_DAY_FACTOR * budget:
+                    problems.append(f"{tag}: wrote {day / 1e9:.0f} GB in a day "
+                                    f"(over {RUNAWAY_DAY_FACTOR}x the {budget / 1e9:.0f} GB/day budget)")
     ke = facts.get("kernel_errors") or []
     if ke:
         problems.append(f"{host}: {len(ke)} kernel ATA error line(s) in the last 26h, e.g. {ke[0][:160]}")

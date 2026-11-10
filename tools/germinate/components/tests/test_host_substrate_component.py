@@ -32,7 +32,8 @@ from tools.germinate.registry.contract_digest import compute_contract_digest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 COMPONENTS = REPO_ROOT / "tools" / "germinate" / "components"
-FILES = ("host-substrate.yaml", "host-substrate.py", "host-substrate_handlers.py", "host-substrate.invariants.yaml")
+FILES = ("host-substrate.yaml", "host-substrate.py", "host-substrate_handlers.py", "host-substrate.invariants.yaml",
+         "harness_manager_root.py")  # T-5827: a component-local helper the handlers digest covers
 CID = "host-substrate"
 UNIT_BODY = "[Unit]\nDescription=fixture\n[Service]\nType=oneshot\nExecStart=/usr/bin/true\n"
 POLICY_BODY = "<busconfig/>\n"
@@ -153,7 +154,7 @@ def test_real_manifest_validates_and_pins_the_oom_unit_bytes():
                                          "user-account-slice-oomd-dropin"}
     assert {r["path"] for r in doc["legacy_requirements"]} == {
         "/usr/local/sbin/pantheon_oom_shield.sh", "/etc/systemd/oomd.conf.d/50-pantheon.conf", "/usr/lib/systemd/systemd-oomd",
-        "/etc/default/earlyoom", "/usr/bin/earlyoom"}
+        "/etc/default/earlyoom", "/usr/bin/earlyoom", "/etc/tmpfiles.d/pantheon-health.conf"}
     doc["units"]["pantheon-oom-shield.timer"]["sha256"] = "0" * 64
     with pytest.raises(F.ManifestError, match="pinned sha256"):
         F.load_manifest(doc, repo_root=REPO_ROOT)

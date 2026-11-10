@@ -1,7 +1,7 @@
 """The canonical planner-launcher entrypoint (T-3295, ORG-080 tranche D).
 
 Implements the canonical launcher startup order from
-``adr/ORG-080-germination-engine.md`` Component contract L130-140:
+``adr/ORG-080-germination-engine.md`` Component contract (relocated to notes/2026-11-02-org-080-sandbox-relocated.md §Environment and Python startup boundary):
 
     1. Freeze ``sys.path`` to the stdlib-only closure.
     2. ``os.environ.clear()``.

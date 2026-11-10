@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from tools import recovery_continuity_switch as wcs
 from tools import continuity_switch_coordinator as csc
@@ -23,6 +25,18 @@ from tools.test_continuity_switch_coordinator import FakeWorld, _ports, _binding
 
 
 class BuildConfigTests(unittest.TestCase):
+    def test_home_defaults_are_resolved_when_called(self) -> None:
+        state_dir = Path("/tmp/call-time-recovery-state")
+        with mock.patch.dict(os.environ, {"PANTHEON_STATE_DIR": str(state_dir)}):
+            cfg = wcs.build_config()
+            args = wcs.build_parser().parse_args(["show-config"])
+        state = state_dir / "personas"
+        continuity = state / "recovery/continuity"
+        self.assertEqual(cfg.state_root, state)
+        self.assertEqual(cfg.bundle_path, continuity / "descriptor/bundle.yaml")
+        self.assertEqual(Path(args.state_root), state)
+        self.assertEqual(Path(args.continuity_root), continuity)
+
     def test_paths_reconstruct_from_continuity_root(self) -> None:
         cont = Path("/tmp/x/continuity")
         cfg = wcs.build_config(continuity_root=cont, repo_root=Path("/repo"),
@@ -173,6 +187,37 @@ class HardeningTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             wcs.enforce_live_gate(args)
 
+
+
+class PersonaStateDirResolutionTests(unittest.TestCase):
+    """T-6285: resolve the personas dir exactly as the runtime planes do
+    (harness_state.state_root_from_env), not PANTHEON_STATE_DIR alone."""
+
+    def _env(self, **kv):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("PANTHEON_STATE_DIR", "PANTHEON_PERSONA_STATE_DIR")}
+        env.update(kv)
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def test_persona_state_dir_alone_is_honoured(self) -> None:
+        with self._env(PANTHEON_PERSONA_STATE_DIR="/tmp/t6285-root/personas"):
+            self.assertEqual(wcs._default_state_root(), Path("/tmp/t6285-root/personas"))
+
+    def test_both_set_and_agreeing(self) -> None:
+        with self._env(PANTHEON_PERSONA_STATE_DIR="/tmp/t6285-root/personas",
+                       PANTHEON_STATE_DIR="/tmp/t6285-root"):
+            self.assertEqual(wcs._default_state_root(), Path("/tmp/t6285-root/personas"))
+
+    def test_disagreeing_env_is_refused(self) -> None:
+        with self._env(PANTHEON_PERSONA_STATE_DIR="/tmp/a/personas",
+                       PANTHEON_STATE_DIR="/tmp/b"):
+            with self.assertRaises(Exception):
+                wcs._default_state_root()
+
+    def test_default_is_recovery_home(self) -> None:
+        with self._env():
+            self.assertEqual(wcs._default_state_root(),
+                             wcs.RECOVERY_HOME / ".local/state/pantheon/personas")
 
 if __name__ == "__main__":
     unittest.main()

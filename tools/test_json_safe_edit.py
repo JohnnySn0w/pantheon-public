@@ -44,7 +44,8 @@ i = int(sys.argv[1])
 p = {path!r}
 time.sleep(0.05)
 try:
-    cfg = json.loads(open(p).read())
+    with open(p) as fh:
+        cfg = json.load(fh)
 except FileNotFoundError:
     cfg = {{}}
 entries = cfg.setdefault("entries", [])

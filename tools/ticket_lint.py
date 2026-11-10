@@ -90,6 +90,7 @@ from tools.ticket import (  # noqa: E402
     _build_ticket_text,
     _fm_snapshot,
     parse_front_matter,
+    ratifiable_excluded_class,
     serialize_front_matter,
 )
 from tools.watch_digest import read_telegram_token  # noqa: E402
@@ -963,6 +964,32 @@ def warn_operator_unattached(paths: list[Path]) -> list[LintResult]:
                    if has_reason else "")
             ),
         ))
+    return results
+
+
+def warn_excluded_ratifiable_class(paths: list[Path]) -> list[LintResult]:
+    """T-6071: WARN (never error) per ticket whose ratifiable_files names a path
+    in an ORG-015 excluded class. Grandfathered: new ones are refused at
+    file/retarget/attach time, existing ones only warn. All states scanned."""
+    results: list[LintResult] = []
+    for path in paths:
+        try:
+            fields, _body = parse_front_matter(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — unparseable: reported elsewhere
+            continue
+        for entry in fields.get("ratifiable_files") or []:
+            cls = ratifiable_excluded_class(str(entry))
+            if cls is None:
+                continue
+            results.append(LintResult(
+                tid=path.stem,
+                path=path,
+                action=LintAction.WARN,
+                description=(
+                    f"ratifiable_files entry {entry!r} is in ORG-015 excluded "
+                    f"class {cls} (grandfathered; new ones are refused)"
+                ),
+            ))
     return results
 
 
@@ -3045,6 +3072,7 @@ def build_lint_digest(
     warned: list[LintResult] | None = None,
     purpose_warned: list[LintResult] | None = None,
     unattached_warned: list[LintResult] | None = None,
+    excluded_class_warned: list[LintResult] | None = None,
     typed_graph_findings: list[TypedGraphFinding] | None = None,
     program_index_findings: list[ProgramIndexFinding] | None = None,
 ) -> str:
@@ -3085,6 +3113,7 @@ def build_lint_digest(
     warned = warned or []
     purpose_warned = purpose_warned or []
     unattached_warned = unattached_warned or []
+    excluded_class_warned = excluded_class_warned or []
     typed_graph_findings = typed_graph_findings or []
     program_index_findings = program_index_findings or []
     header = f"[Recovery · ticket-lint · {now_iso}]"
@@ -3092,7 +3121,7 @@ def build_lint_digest(
     if (not auto_fixed and not flagged and not retargeted
             and not orphan_ratifications and not dep_graph_findings
             and not unanchored_gates and not warned and not purpose_warned
-            and not unattached_warned
+            and not unattached_warned and not excluded_class_warned
             and not typed_graph_findings
             and not program_index_findings):
         return (
@@ -3201,6 +3230,16 @@ def build_lint_digest(
             "ticket.py retarget <tid> --to operator --ratifiable-file <repo>:<path> "
             "(or --no-file '<reason>' if the ask truly has no file)"
         )
+        lines.append("")
+
+    # T-6071 / ORG-015: grandfathered excluded-class ratifiable_files targets.
+    if excluded_class_warned:
+        lines.append(
+            "ratifiable_files in an ORG-015 excluded class — grandfathered, "
+            f"WARN only ({len(excluded_class_warned)}):"
+        )
+        for r in excluded_class_warned:
+            lines.append(f"  - {r.tid}: {r.description}")
         lines.append("")
 
     # T-3168 / ORG-054: warn-first migration for structured purpose fields.
@@ -3411,6 +3450,7 @@ def _do_lint(
     # to warn_tickets(); it self-filters to inbox-only (single source of truth
     # for that predicate). Warns never affect failures, push, or exit code.
     warn_results = warn_tickets([r.path for r in results])
+    excluded_class_warn_results = warn_excluded_ratifiable_class([r.path for r in results])  # T-6071
     purpose_warn_results = warn_ticket_purposes([r.path for r in results])
     unattached_warn_results = warn_operator_unattached([r.path for r in results])
 
@@ -3534,6 +3574,7 @@ def _do_lint(
             warned=warn_results,
             purpose_warned=purpose_warn_results,
             unattached_warned=unattached_warn_results,
+            excluded_class_warned=excluded_class_warn_results,
             typed_graph_findings=typed_graph_findings,
             program_index_findings=program_index_findings,
         )
@@ -3647,6 +3688,7 @@ def main(argv: list[str] | None = None) -> int:
         dep_graph_findings = detect_dep_graph_issues(tickets_root_dry)
         # T-1105 / ORG-034: dry-run warn parity — same tickets as the cron digest shows.
         dry_warns = warn_tickets([r.path for r in results])
+        dry_excluded = warn_excluded_ratifiable_class([r.path for r in results])  # T-6071
         dry_unattached = warn_operator_unattached([r.path for r in results])
         # T-2841 / ORG-065 BT1: dry-run parity for the generalized typed-edge graph.
         # T-2926: dry-run parity for the corpus-wide receipt-id uniqueness scan.
@@ -3689,12 +3731,17 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  operator asks citing a file with none attached ({len(dry_unattached)}):")
             for r in dry_unattached:
                 print(f"    {r.tid}: {r.description}")
+        if dry_excluded:
+            print(f"  ratifiable_files in ORG-015 excluded class, grandfathered WARN ({len(dry_excluded)}):")
+            for r in dry_excluded:
+                print(f"    {r.tid}: {r.description}")
         if typed_graph_findings:
             print(f"  typed-edge graph findings ({len(typed_graph_findings)}):")
             for f in typed_graph_findings:
                 print(f"    [{f.kind}] {f.detail}")
         if (not auto_fix and not flags and not retargets and not dep_graph_findings
-                and not dry_warns and not dry_unattached and not typed_graph_findings):
+                and not dry_warns and not dry_unattached and not dry_excluded
+                and not typed_graph_findings):
             print("  all clean — no actions needed")
         return 0
 

@@ -136,3 +136,18 @@ def test_unknown_schema_refuses(tmp_path):
         RS.validate_record(
             {k: None for k in RS.RECORD_KEYS} | {"schema": "pantheon-run-state/v2"}
         )
+
+
+def _open_fds() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+def test_handle_close_releases_every_wal_fd_it_handed_out(tmp_path):
+    """T-5147: handle.wal() dup()s the run directory fd; closing the handle must release it."""
+    _store, _tup, handle = _create(tmp_path)
+    before = _open_fds()
+    for _ in range(5):
+        handle.wal()  # callers (executor apply/rollback/reconcile) never close it themselves
+    assert _open_fds() == before + 5
+    handle.close()
+    assert _open_fds() == before - 1  # the 5 wal dups and the handle's own fd

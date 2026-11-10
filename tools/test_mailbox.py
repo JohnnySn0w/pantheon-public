@@ -904,6 +904,7 @@ class AbandonedClaimReaperTest(unittest.TestCase):
         p = subprocess.Popen([sys.executable, "-c", _claim_and_die(str(self.inbox), mode)],
                              stdout=subprocess.PIPE, text=True)
         claim_dir = p.stdout.readline().strip()
+        p.stdout.close()
         return p, Path(claim_dir)
 
     def test_crashed_consumer_message_is_requeued_and_redelivered(self):
@@ -1030,6 +1031,7 @@ class ClaimStepDoesNotBreakDLQTest(unittest.TestCase):
             [sys.executable, "-c", _claim_and_die(str(self.inbox), "live")],
             stdout=subprocess.PIPE, text=True)
         claim_dir = Path(p.stdout.readline().strip())
+        p.stdout.close()
         try:
             self.assertFalse((self.inbox / "new" / mid).exists(),
                              "precondition: the message is in-flight, not in new/")
@@ -1078,6 +1080,18 @@ class ClaimStepDoesNotBreakDLQTest(unittest.TestCase):
 # `supersedes=` — which needs the id of your OWN earlier message — was unusable
 # by construction. Measured 0 uses across 1552 messages and 9 senders.
 # --------------------------------------------------------------------------
+class SentLedgerPathTest(unittest.TestCase):
+    def test_default_tracks_the_call_time_state_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "first"
+            second = Path(tmp) / "second"
+            with mock.patch.dict(os.environ, {"PANTHEON_STATE_DIR": str(first)}, clear=False):
+                os.environ.pop("PANTHEON_SENT_LEDGER", None)
+                self.assertEqual(mailbox.sent_ledger_path(), first / "sent.jsonl")
+                os.environ["PANTHEON_STATE_DIR"] = str(second)
+                self.assertEqual(mailbox.sent_ledger_path(), second / "sent.jsonl")
+
+
 class SenderLedgerTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

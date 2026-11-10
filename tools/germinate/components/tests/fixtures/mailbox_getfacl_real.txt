@@ -1,0 +1,279 @@
+# file: /home/post-office/mailbox/artisan
+# owner: post-office
+# group: pantheon-mailbox
+# flags: -s-
+user::rwx
+user:claude:rwx
+user:claude-fallback:rwx
+user:claude-research:rwx
+user:codex:rwx
+user:the-ancestor:rwx
+user:exocortex:rwx
+user:suborch1:rwx
+user:suborch2:rwx
+user:codex-fallback:rwx
+group::---
+mask::rwx
+other::---
+default:user::rwx
+default:user:claude:rwx
+default:user:claude-fallback:rwx
+default:user:claude-research:rwx
+default:user:codex:rwx
+default:user:the-ancestor:rwx
+default:user:exocortex:rwx
+default:user:suborch1:rwx
+default:user:suborch2:rwx
+default:user:codex-fallback:rwx
+default:group::---
+default:mask::rwx
+default:other::---
+
+# file: /home/post-office/mailbox/artisan/new
+# owner: post-office
+# group: pantheon-mailbox
+# flags: -s-
+user::rwx
+user:claude:rwx
+user:claude-fallback:rwx
+user:claude-research:rwx
+user:codex:rwx
+user:the-ancestor:rwx
+user:exocortex:rwx
+user:suborch1:rwx
+user:suborch2:rwx
+user:codex-fallback:rwx
+group::---
+mask::rwx
+other::---
+default:user::rwx
+default:user:claude:rwx
+default:user:claude-fallback:rwx
+default:user:claude-research:rwx
+default:user:codex:rwx
+default:user:the-ancestor:rwx
+default:user:exocortex:rwx
+default:user:suborch1:rwx
+default:user:suborch2:rwx
+default:user:codex-fallback:rwx
+default:group::---
+default:mask::rwx
+default:other::---
+
+# file: /home/post-office/mailbox/artisan/tmp
+# owner: post-office
+# group: pantheon-mailbox
+# flags: -s-
+user::rwx
+user:claude:rwx
+user:claude-fallback:rwx
+user:claude-research:rwx
+user:codex:rwx
+user:the-ancestor:rwx
+user:exocortex:rwx
+user:suborch1:rwx
+user:suborch2:rwx
+user:codex-fallback:rwx
+group::---
+mask::rwx
+other::---
+default:user::rwx
+default:user:claude:rwx
+default:user:claude-fallback:rwx
+default:user:claude-research:rwx
+default:user:codex:rwx
+default:user:the-ancestor:rwx
+default:user:exocortex:rwx
+default:user:suborch1:rwx
+default:user:suborch2:rwx
+default:user:codex-fallback:rwx
+default:group::---
+default:mask::rwx
+default:other::---
+
+# file: /home/post-office/mailbox/orchestrator
+# owner: post-office
+# group: pantheon-mailbox
+# flags: -s-
+user::rwx
+user:claude:rwx
+user:claude-fallback:rwx
+user:claude-research:rwx
+user:codex:rwx
+user:the-ancestor:rwx
+user:exocortex:rwx
+user:suborch1:rwx
+user:suborch2:rwx
+user:codex-fallback:rwx
+group::---
+mask::rwx
+other::---
+default:user::rwx
+default:user:claude:rwx
+default:user:claude-fallback:rwx
+default:user:claude-research:rwx
+default:user:codex:rwx
+default:user:the-ancestor:rwx
+default:user:exocortex:rwx
+default:user:suborch1:rwx
+default:user:suborch2:rwx
+default:user:codex-fallback:rwx
+default:group::---
+default:mask::rwx
+default:other::---
+
+# file: /home/post-office/mailbox/orchestrator/new
+# owner: post-office
+# group: pantheon-mailbox
+# flags: -s-
+user::rwx
+user:claude:rwx
+user:claude-fallback:rwx
+user:claude-research:rwx
+user:codex:rwx
+user:the-ancestor:rwx
+user:exocortex:rwx
+user:suborch1:rwx
+user:suborch2:rwx
+user:codex-fallback:rwx
+group::---
+mask::rwx
+other::---
+default:user::rwx
+default:user:claude:rwx
+default:user:claude-fallback:rwx
+default:user:claude-research:rwx
+default:user:codex:rwx
+default:user:the-ancestor:rwx
+default:user:exocortex:rwx
+default:user:suborch1:rwx
+default:user:suborch2:rwx
+default:user:codex-fallback:rwx
+default:group::---
+default:mask::rwx
+default:other::---
+
+# file: /home/post-office/mailbox/orchestrator/tmp
+# owner: post-office
+# group: pantheon-mailbox
+# flags: -s-
+user::rwx
+user:claude:rwx
+user:claude-fallback:rwx
+user:claude-research:rwx
+user:codex:rwx
+user:the-ancestor:rwx
+user:exocortex:rwx
+user:suborch1:rwx
+user:suborch2:rwx
+user:codex-fallback:rwx
+group::---
+mask::rwx
+other::---
+default:user::rwx
+default:user:claude:rwx
+default:user:claude-fallback:rwx
+default:user:claude-research:rwx
+default:user:codex:rwx
+default:user:the-ancestor:rwx
+default:user:exocortex:rwx
+default:user:suborch1:rwx
+default:user:suborch2:rwx
+default:user:codex-fallback:rwx
+default:group::---
+default:mask::rwx
+default:other::---
+
+# file: /home/post-office/mailbox/mason
+# owner: post-office
+# group: pantheon-mailbox
+# flags: -s-
+user::rwx
+user:claude:rwx
+user:claude-fallback:rwx
+user:claude-research:rwx
+user:codex:rwx
+user:the-ancestor:rwx
+user:exocortex:rwx
+user:suborch1:rwx
+user:suborch2:rwx
+user:codex-fallback:rwx
+group::---
+mask::rwx
+other::---
+default:user::rwx
+default:user:claude:rwx
+default:user:claude-fallback:rwx
+default:user:claude-research:rwx
+default:user:codex:rwx
+default:user:the-ancestor:rwx
+default:user:exocortex:rwx
+default:user:suborch1:rwx
+default:user:suborch2:rwx
+default:user:codex-fallback:rwx
+default:group::---
+default:mask::rwx
+default:other::---
+
+# file: /home/post-office/mailbox/mason/new
+# owner: post-office
+# group: pantheon-mailbox
+# flags: -s-
+user::rwx
+user:claude:rwx
+user:claude-fallback:rwx
+user:claude-research:rwx
+user:codex:rwx
+user:the-ancestor:rwx
+user:exocortex:rwx
+user:suborch1:rwx
+user:suborch2:rwx
+user:codex-fallback:rwx
+group::---
+mask::rwx
+other::---
+default:user::rwx
+default:user:claude:rwx
+default:user:claude-fallback:rwx
+default:user:claude-research:rwx
+default:user:codex:rwx
+default:user:the-ancestor:rwx
+default:user:exocortex:rwx
+default:user:suborch1:rwx
+default:user:suborch2:rwx
+default:user:codex-fallback:rwx
+default:group::---
+default:mask::rwx
+default:other::---
+
+# file: /home/post-office/mailbox/mason/tmp
+# owner: post-office
+# group: pantheon-mailbox
+# flags: -s-
+user::rwx
+user:claude:rwx
+user:claude-fallback:rwx
+user:claude-research:rwx
+user:codex:rwx
+user:the-ancestor:rwx
+user:exocortex:rwx
+user:suborch1:rwx
+user:suborch2:rwx
+user:codex-fallback:rwx
+group::---
+mask::rwx
+other::---
+default:user::rwx
+default:user:claude:rwx
+default:user:claude-fallback:rwx
+default:user:claude-research:rwx
+default:user:codex:rwx
+default:user:the-ancestor:rwx
+default:user:exocortex:rwx
+default:user:suborch1:rwx
+default:user:suborch2:rwx
+default:user:codex-fallback:rwx
+default:group::---
+default:mask::rwx
+default:other::---
+

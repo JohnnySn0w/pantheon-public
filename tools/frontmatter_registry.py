@@ -19,10 +19,14 @@ Contract:
                         is a removal, not a value);
     - `legacy-write`    a NEW write of a `status: legacy` field.
 * `enforce_write(...)` applies the mode from env
-  `PANTHEON_FRONTMATTER_REGISTRY_MODE` (warn | refuse | off; default warn):
+  `PANTHEON_FRONTMATTER_REGISTRY_MODE` (warn | refuse | off; default refuse):
   warn prints one stderr line per finding and proceeds; refuse raises
   `RegistryRefusal` (callers invoke it BEFORE any file write / git step); off
-  skips. S2 flips the default to refuse.
+  skips. S2 (T-4762) flipped the default from warn to refuse.
+  System-written operational fields (SYSTEM_WARN_FIELDS: the auto_delivered
+  stamp, delivered_to, auto_declined_by) stay WARN-only even in refuse mode: a registry
+  mis-edit must never stop fleet-wide work intake (P7). The drift test and CI
+  catch such a mis-edit instead (T-4762).
 * Fail-OPEN: a missing ADR, a missing section/block, or unparseable YAML emits
   ONE loud stderr WARN per process and validation is skipped — even in refuse
   mode. A broken registry edit must never freeze ticketing (ORG-021 §registry).
@@ -53,7 +57,16 @@ MODE_ENV = "PANTHEON_FRONTMATTER_REGISTRY_MODE"
 # Test seam / operator override: point the loader at a different ADR file.
 PATH_ENV = "PANTHEON_FRONTMATTER_REGISTRY_PATH"
 MODES = ("warn", "refuse", "off")
-DEFAULT_MODE = "warn"
+DEFAULT_MODE = "refuse"
+# T-4762: written by the inbox consumer / claim path, not by a human. A refusal
+# here would stop work intake fleet-wide, so findings on these are WARN-only in
+# every mode. test_frontmatter_registry pins them to the real ADR registry.
+# `state` is deliberately NOT in this set: it is core, and a registry edit that
+# drops it is loud (CI + the drift test catch it), so it stays refuse-checked.
+SYSTEM_WARN_FIELDS = frozenset({
+    "auto_delivered", "auto_delivered_at", "delivered_to",
+    "auto_declined_by",  # inbox_consumer._clear_auto_delivered decline record (T-5049)
+})
 
 PREFIX = "[frontmatter-registry]"
 AUTHORING_HINT = (
@@ -331,7 +344,7 @@ def enforce_write(old_fields: dict | None, new_fields: dict, *,
 
     MUST be called before the write and before any git step. warn: prints one
     `[frontmatter-registry] WARN` line per finding, returns them. refuse:
-    raises RegistryRefusal. off: returns [] without loading the registry.
+    raises RegistryRefusal (SYSTEM_WARN_FIELDS findings only warn). off: returns [] without loading the registry.
     """
     mode = get_mode()
     if mode == "off":
@@ -341,7 +354,14 @@ def enforce_write(old_fields: dict | None, new_fields: dict, *,
         return []
     who = ticket_id or str(new_fields.get("id") or "<ticket>")
     if mode == "refuse":
-        lines = "; ".join(f.message() for f in findings)
+        blocking = [f for f in findings if f.field not in SYSTEM_WARN_FIELDS]
+        for f in findings:
+            if f.field in SYSTEM_WARN_FIELDS:
+                print(f"{PREFIX} WARN {who}: {f.message()} (system field, never "
+                      f"refused; {AUTHORING_HINT})", file=sys.stderr)
+        if not blocking:
+            return findings
+        lines = "; ".join(f.message() for f in blocking)
         raise RegistryRefusal(
             f"{PREFIX} REFUSE {who}: {lines}. Nothing was written. To register "
             f"a field/value, {AUTHORING_HINT}."

@@ -7,9 +7,9 @@
          jsonl confirms the rate-limit assistant turn is ≥5min old + no
          further activity since (turn was silently abandoned by the runtime).
 
-T-4510 fleet usage gate: at >=95% (configurable) of the fleet's SHARED weekly Max, the
-periodic anti-idle/queue content pokes (P1.a, P1.b) suppress themselves and resume at the
-reset (tools/fleet_usage_gate.py; fail-open; logged once per window). The gate sits at the
+T-4510/T-4889 fleet usage gate: provider-specific weekly pacing suppresses periodic
+anti-idle/queue content pokes (P1.a, P1.b) and resumes at the provider reset
+(tools/fleet_usage_gate.py; fail-open; logged/mailed once per window band). The gate sits at the
 send point inside _dispatch_poke, AFTER every recovery branch. P1.d, P1.c, the cap-modal /
 cap / cyber / effectiveness handling and the TUI-wedge escalation are recovery and never
 consult it.
@@ -71,6 +71,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools import agent_role_map  # noqa: E402  (after the sys.path shim above)
+from tools import appserver_seats as _appserver_seats  # noqa: E402  (T-4889 quota authority)
 from tools import telegram_inbound  # noqa: E402  (T-4212: shared inbound parser)
 from tools import fleet_usage_gate  # noqa: E402  (T-4510: fleet usage gate, stdlib-only)
 from tools import harness_idle  # noqa: E402  (T-5793: harness resolver + reader seam)
@@ -142,14 +143,17 @@ P1B_BACKOFF_COOLDOWN_SECONDS = 60 * 60  # 60 min — the T-3991 proposed downshi
 P1B_BACKOFF_AFTER_FIRES = 2            # backoff engages once >= this many p1b fires are already on the streak (so fire 3+ is rate-limited)
 P1B_BACKOFF_STREAK_GAP_SECONDS = 90 * 60  # fires within this gap count as one wait-streak; > the 60min backoff cadence so the streak survives its own downshift
 
-# Bounded-poke (T-1363) — stop re-poking a session that isn't responding.
+# Bounded-poke (T-1363/T-6179) — stop re-poking when the prior action had no
+# observable effect, then classify the current state before naming a remedy.
 # A poke that LANDS makes the session take a turn → its main jsonl mtime
-# advances. A poke that does NOT advance the jsonl was ineffective → the session
-# is stuck (capped / cyber-blocked / wedged), not idle, so re-poking just burns
-# tokens. After MAX_INEFFECTIVE_POKES consecutive ineffective pokes, SUPPRESS +
-# escalate instead of re-poking. The poke-once-vs-skip design fork (T-1363) is
-# exactly this parameter: N=1 = poke-once-then-escalate; N=0 = skip pokes
-# entirely (straight to escalate). Ship-dark: bounded behavior is active only
+# advances. No advance proves only that the poke was ineffective; it does not
+# prove why. After MAX_INEFFECTIVE_POKES consecutive ineffective pokes, suppress
+# another poke and ground-truth the pane: idle alerts once as a submission/queue
+# mismatch, busy defers without alert, unknown alerts without claiming a wedge,
+# and the earlier cap/modal/cyber/wedge gates retain their specific remedies.
+# The poke-once-vs-skip design fork (T-1363) is exactly this parameter: N=1 =
+# poke once then classify; N=0 = skip the poke and classify immediately.
+# Ship-dark: bounded behavior is active only
 # when ACTIVITY_MONITOR_BOUNDED_POKE_ENABLED is truthy — otherwise the legacy
 # unbounded (cooldown-only) behavior is unchanged.
 MAX_INEFFECTIVE_POKES_DEFAULT = 1
@@ -165,6 +169,48 @@ P1B_LOG_QUIET_SECONDS = 15 * 60
 # pane gate before a text poke. Read per run, so a unit drop-in flips it.
 IDLE_SOURCE_ENV = "ACTIVITY_MONITOR_IDLE_SOURCE"
 INTERACTIVE_AWAIT_PREDICATE = "p1b-interactive"
+# T-5868 (notes s10 C3): a HALTED run_state pause is an incident. It re-alerts on this cadence
+# until the record clears (rollback completes or the operator escape); it is NOT one-shot.
+# Its own state file, so the alert cadence never gates the poke / wedge predicates.
+HALTED_PREDICATE = "halted"
+HALTED_VOCAB = "halted-mid-pause"
+HALTED_REALERT_SECONDS = ACTIVITY_MONITOR_COOLDOWN_SECONDS
+
+
+def _halted_state_path(agent: str) -> Path:
+    return _state_path_for_agent(agent).with_name(f"activity_monitor_{agent}_halted_alert.json")
+
+
+def _halted_alert(agent: str, hold) -> bool:
+    """Alert (to Recovery via _route_failure_alert) that `agent` is halted mid-pause, with the
+    rollback command; at most once per HALTED_REALERT_SECONDS. Returns True if sent.
+    Never raises: an alert fault must not wedge the monitor."""
+    try:
+        every = int(os.environ.get("ACTIVITY_MONITOR_HALTED_REALERT_SECONDS", HALTED_REALERT_SECONDS))
+        path = _halted_state_path(agent)
+        now = int(time.time())
+        try:
+            last = int(json.loads(path.read_text(encoding="utf-8")).get("ts", 0))
+        except (OSError, ValueError, TypeError, AttributeError):
+            last = 0
+        if now - last < every:
+            _log(agent, "halted mid-pause: within re-alert cadence; not re-alerting yet")
+            return False
+        msg = (f"\U0001F6D1 [halted] {agent} is HALTED mid-pause ({hold.owner or '?'}: "
+               f"{hold.reason or '-'}). Intake blocked, repair withheld. Roll back with: "
+               f"{hold.rollback_cmd or '(see the seat-state record)'}. Re-alerts every "
+               f"{every // 60}min until the record clears.")
+        _route_failure_alert(agent, msg, HALTED_VOCAB)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps({"ts": now, "agent": agent, "predicate": HALTED_PREDICATE}),
+                       encoding="utf-8")
+        os.replace(tmp, path)  # atomic, same dir; written only after the send
+        _log(agent, f"halted mid-pause: ALERTED (rollback: {hold.rollback_cmd or '-'})")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        _log(agent, f"halted mid-pause: alert failed {exc!r}")
+        return False
 INTERACTIVE_AWAIT_VOCAB = "interactive-await"
 
 
@@ -231,6 +277,11 @@ AGENT_CONFIG: dict[str, dict] = {
                                      "role:head_engineering_orchestrator"}),
         "pantheon_config_path": Path("/home/claude/pantheon-config"),
         "bridge_inbound_key": "orchestrator",
+        # Controller Codex fallbacks consume the primary ChatGPT subscription. The
+        # quota exporter names that account's app-server seat (consultant), never this
+        # persona. Keep the account explicit so a runtime swap does not infer billing
+        # identity from the persona or its historical Claude unix account.
+        "codex_subscription_account": "codex",
         # P1.c (ORG-037 Layer 3): the session's team root (T-1290). active-team
         # is signalled by `<teams_dir>/*/inboxes` existing. Only agents with a
         # teams_dir configured are eligible for the Layer-3 backstop.
@@ -256,6 +307,7 @@ AGENT_CONFIG: dict[str, dict] = {
         "ticket_targets": frozenset({"artisan"}),
         "pantheon_config_path": Path("/home/suborch2/pantheon-config"),
         "bridge_inbound_key": "artisan",
+        "codex_subscription_account": "codex",
         # T-3557(e): sub-orch seats count ACTIVE tickets only. An unclaimed
         # inbox ticket is undispatched/pending for a scope-managed seat, not
         # work it could be stuck on — counting it false-fired p1a/p1b on
@@ -270,6 +322,7 @@ AGENT_CONFIG: dict[str, dict] = {
         "ticket_targets": frozenset({"mason"}),
         "pantheon_config_path": Path("/home/suborch1/pantheon-config"),
         "bridge_inbound_key": "mason",
+        "codex_subscription_account": "codex",
         # T-3557(e): sub-orch seats count ACTIVE tickets only (see artisan note).
         "queue_states": ("active",),
     },
@@ -332,6 +385,7 @@ def write_poke_state(
     consecutive_ineffective: int = 0,
     escalated: bool = False,
     modal_dismissals: int = 0,
+    provider_hold: str | None = None,
 ) -> None:
     """Persist the last-poke state. The bounded-poke fields (T-1363) are optional
     and backward-compatible: legacy callers omit them and the file is unchanged
@@ -340,10 +394,14 @@ def write_poke_state(
     - pre_poke_jsonl_mtime: the main jsonl mtime captured RIGHT BEFORE this poke,
       so the NEXT cycle can tell whether this poke advanced the session (worked).
     - consecutive_ineffective: running count of pokes that did NOT advance.
-    - escalated: this fire suppressed the poke + escalated (stuck, not idle).
+    - escalated: this fire suppressed the poke and emitted its one transition
+      alert (specific classified fault, idle mismatch, or unknown pane state).
     - modal_dismissals: Enter-confirms sent at the cap modal (T-1369), which is
       what bounds that remediation across cycles. Written only when non-zero so
       every existing state file and its assertions keep their exact shape.
+    - provider_hold: the provider-specific hold already reported while another
+      runtime remains active.  It keeps that advisory transition-bounded without
+      marking the available persona itself escalated.
     """
     data = {
         "ts": int(time.time()),
@@ -357,6 +415,8 @@ def write_poke_state(
         data["escalated"] = True
     if modal_dismissals:
         data["modal_dismissals"] = int(modal_dismissals)
+    if provider_hold:
+        data["provider_hold"] = provider_hold
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(data) + "\n", encoding="utf-8")
 
@@ -383,7 +443,8 @@ def poke_effectiveness_decision(
     advances its newest timestamped jsonl entry (`latest_jsonl_activity`, T-5367; the
     state key keeps its historical name pre_poke_jsonl_mtime). So if the prior poke (SAME predicate) recorded
     a pre-poke mtime and the jsonl has NOT advanced past it, that poke was
-    ineffective — the session is stuck, not idle.
+    ineffective. The caller must then ground-truth the current pane/state gates;
+    frozen activity alone does not establish a wedge or its remedy.
 
     NAME COLLISION NOTE (T-1950): this `consecutive_ineffective` is a
     DIFFERENT metric from tools/keep_going.py's same-named counter. This one
@@ -394,11 +455,12 @@ def poke_effectiveness_decision(
 
     Returns (suppress, consecutive_ineffective, reason), where
     consecutive_ineffective is the UPDATED count to persist with this fire.
-    suppress=True → do NOT poke; escalate instead.
+    suppress=True → do NOT poke; ground-truth the pane, then defer or emit the
+    classification-specific one-shot alert.
 
     The poke-once-vs-skip fork (T-1363) is the max_ineffective parameter:
-      N=1 → poke once, suppress on the next ineffective cycle (poke-once-then-escalate).
-      N=0 → suppress immediately, never poke (skip pokes, straight to escalate).
+      N=1 → poke once, suppress and classify on the next ineffective cycle.
+      N=0 → suppress immediately, never poke, and classify the current state.
     """
     consecutive = 0
     if (
@@ -416,7 +478,7 @@ def poke_effectiveness_decision(
             True,
             consecutive,
             f"{consecutive} consecutive ineffective poke(s) >= {max_ineffective}; "
-            "session stuck not idle → suppress + escalate",
+            "bounded attempt exhausted → suppress and ground-truth pane",
         )
     return (False, consecutive, f"poke (consecutive_ineffective={consecutive})")
 
@@ -2034,6 +2096,26 @@ def p1b_idle_reading(cfg: dict, agent: str | None = None) -> "harness_idle.IdleR
         claude_projects_dir=str(cfg["jsonl_dir"]))
 
 
+def _poke_activity_marker(cfg: dict, agent: str, predicate: str,
+                          active_harness: str | None = None) -> int:
+    """Newest activity for the runtime a poke would actually reach.
+
+    Claude's transcript remains the historical marker for every legacy path.
+    P1.b on a controller-selected fallback is different: its upstream idle
+    decision came from that runtime's own log, so judging a Codex poke against
+    the stale, capped Claude transcript would immediately call a successful
+    fallback poke ineffective.  Fail closed to zero when the live log cannot be
+    read; bounded-poke still prevents churn.
+    """
+    harness = active_harness or _active_runtime_harness(agent, cfg)
+    if predicate == "p1b" and harness != "claude-code":
+        reading = p1b_idle_reading(cfg, agent)
+        if reading.harness == harness and reading.last_event_ts is not None:
+            return int(reading.last_event_ts)
+        return 0
+    return latest_jsonl_activity(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
+
+
 def check_p1b(
     cfg: dict,
     bridge_url: str,
@@ -2479,16 +2561,18 @@ def _soft_defer_or_fail(cfg: dict, agent: str, predicate: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Escalation (T-1363 inc.3): when a poke is SUPPRESSED because the session is
-# stuck (cyber-blocked, or N ineffective pokes with a frozen jsonl), don't just
-# log — route the stuck-remedy to Recovery. Bounded: alert ONCE per escalation episode
+# Escalation (T-1363 inc.3/T-6179): when a poke is suppressed, route the
+# classification-specific result to Recovery when it needs attention. Known
+# cap/modal/cyber/wedge states carry their real remedy; exhausted effectiveness
+# with an idle or unknown pane carries only that narrower diagnosis. A busy pane
+# self-clears and does not alert. Bounded: alert ONCE per escalation episode
 # (on the False->True escalated transition), NOT every cycle (else the alert
 # becomes the same unbounded-repeat the poke bounding was meant to kill).
 # ---------------------------------------------------------------------------
 
 
 def _route_failure_alert(agent: str, msg: str, vocab: str) -> None:
-    """Route a stuck-session failure to Recovery (others->Recovery per
+    """Route a classified monitor failure to Recovery (others->Recovery per
     feedback_failure_alert_routing_recovery_vs_self). Import-wrapped so tests patch it."""
     try:
         from tools.inbox_consumer import route_failure_alert  # run-as-package / tests
@@ -2567,7 +2651,8 @@ def _capture_wedge_specimen(cfg: dict, agent: str, vocab: str) -> tuple[Path | N
 
 
 def _escalate_stuck(cfg: dict, agent: str, predicate: str, msg: str, vocab: str,
-                    state_path: Path, cur_mtime: int, consecutive: int) -> None:
+                    state_path: Path, cur_mtime: int, consecutive: int,
+                    provider_hold: str | None = None) -> None:
     """Suppress-and-escalate: record the escalated state and, ONLY on the
     transition into escalated (not on every subsequent cycle), route the alert to
     Recovery. Alert-routing failure never raises (must not wedge the monitor)."""
@@ -2612,6 +2697,7 @@ def _escalate_stuck(cfg: dict, agent: str, predicate: str, msg: str, vocab: str,
         state_path, agent, predicate,
         pre_poke_jsonl_mtime=cur_mtime,
         consecutive_ineffective=consecutive, escalated=True,
+        provider_hold=provider_hold,
     )
 
 
@@ -2793,6 +2879,33 @@ def _active_runtime_harness(agent: str, cfg: dict) -> str:
     return profile
 
 
+def _send_usage_trip_mail(sender: str, recipient: str, subject: str, body: str) -> None:
+    """One internal mailbox delivery. Split out as a hermetic test seam."""
+    from tools import mailbox
+
+    mailbox.send(
+        Path(agent_role_map.mailbox_hub()) / recipient,
+        body,
+        sender=sender,
+        subject=subject,
+    )
+
+
+def _notify_usage_trip(agent: str, decision) -> None:
+    """T-4889: mail Orchestrator and the affected seat once per pacing band/window.
+
+    Delivery is advisory and fail-open: a mailbox fault must never break the monitor or
+    turn a pacing read into a recovery outage. Per-recipient receipts are written only
+    after a successful send, so partial failure retries without duplicating delivered mail.
+    """
+    fleet_usage_gate.notify_usage_trip_once(
+        agent, decision,
+        lambda recipient, subject, body: _send_usage_trip_mail(
+            agent, recipient, subject, body),
+        log=lambda message: _log(agent, message),
+    )
+
+
 def _poke_suppressed_by_usage(
     agent: str, predicate: str, now: float | None = None, *, cfg: dict | None = None,
 ) -> bool:
@@ -2803,12 +2916,25 @@ def _poke_suppressed_by_usage(
     Fails OPEN: any gate error means the poke proceeds (today's behaviour)."""
     if predicate not in USAGE_GATED_PREDICATES:
         return False
-    if cfg is not None and _active_runtime_harness(agent, cfg) == "codex":
-        return False
     try:
-        decision = fleet_usage_gate.evaluate(now)
+        active = _active_runtime_harness(agent, cfg or {}) if cfg is not None else "claude-code"
+        harness = "codex" if active == "codex" else "claude"
+        # T-4889: Codex quota records are keyed by the authoritative app-server
+        # subscription seat (codex -> consultant, codex-fallback -> watchman), not by
+        # the activity-monitor persona. Missing/ambiguous mapping raises inside
+        # this fail-open boundary, preserving the pre-gate poke behaviour.
+        seat = (
+            _appserver_seats.appserver_seat_for_account(
+                _REPO_ROOT, str((cfg or {})["codex_subscription_account"])
+            )
+            if harness == "codex" else None
+        )
+        decision = fleet_usage_gate.evaluate(
+            now, harness=harness, seat=seat
+        )
         if not decision.suppress:
             return False
+        _notify_usage_trip(agent, decision)
         if fleet_usage_gate.should_log_once(
                 f"activity_monitor:{agent}:{predicate}", decision.window_key):
             _log(agent, f"{predicate}: poke SUPPRESSED by the fleet usage gate — {decision.reason}; "
@@ -2828,9 +2954,10 @@ def _dispatch_poke(
     bounded_enabled: bool,
     max_ineffective: int,
 ) -> int:
-    """Send a poke for `predicate` — or, in bounded mode (T-1363), SUPPRESS it
-    and escalate when prior pokes weren't advancing the session (stuck, not
-    idle). Returns the main() exit code (0 = poked or cleanly suppressed; 1 =
+    """Send a poke for `predicate` — or, in bounded mode (T-1363/T-6179),
+    suppress it after ineffective attempts and ground-truth the live pane before
+    deferring or emitting a classification-specific alert. Returns the main()
+    exit code (0 = poked or cleanly suppressed; 1 =
     poke send failed) — or USAGE_SUPPRESSED (T-4510) when the fleet usage gate
     skipped the content poke, which is NOT an exit code: main() falls through to
     P1.d/P1.c instead of ending the cycle.
@@ -2938,10 +3065,49 @@ def _dispatch_poke(
                 consecutive=int(prior.get("consecutive_ineffective", 0) or 0),
             )
             return 0
+        provider_hold = None
+        active_harness = None
         cap = _session_cap_state(cfg)
         if cap is not None:
             kind, reset_hint = cap
-            if kind == "session_limit":
+            # T-5758: the cap probe is Claude-transcript-specific, while P1.b is
+            # now live-runtime-specific.  Once the controller has selected a
+            # healthy Codex fallback, an old Claude spend error describes a held
+            # PROVIDER, not an unavailable persona.  Report that distinction once
+            # and continue to the ordinary P1.b path, which can safely nudge only
+            # the selected fallback.  Nothing here pokes or restarts Claude.
+            if kind == "spend_limit" and predicate == "p1b":
+                active_harness = _active_runtime_harness(agent, cfg)
+                if active_harness != "claude-code":
+                    provider_hold = f"claude-code:spend_limit->{active_harness}"
+                    prior = read_poke_state(state_path) or {}
+                    if prior.get("provider_hold") != provider_hold:
+                        msg = (
+                            f"⚠️ [{predicate}] {agent}'s Claude provider is SPEND-CAPPED "
+                            f"and remains held, but the persona is available through its "
+                            f"healthy Codex fallback ({active_harness}). Do not poke or restart "
+                            f"the capped Claude runtime; P1.b will act only on the active fallback."
+                        )
+                        try:
+                            _route_failure_alert(agent, msg, "provider-hold-fallback")
+                            # Persist the advisory latch immediately.  If a later
+                            # pane/usage gate defers the fallback poke, the next
+                            # monitor cycle still does not repeat this alert.
+                            write_poke_state(
+                                state_path, agent, predicate,
+                                consecutive_ineffective=int(
+                                    prior.get("consecutive_ineffective", 0) or 0),
+                                provider_hold=provider_hold,
+                            )
+                        except Exception as exc:  # fail-open for the fallback poke
+                            _log(agent, f"{predicate}: provider-hold alert routing failed {exc!r}")
+                    _log(
+                        agent,
+                        f"{predicate}: Claude provider SPEND-CAPPED and held; "
+                        f"healthy {active_harness} fallback remains available — "
+                        "continuing fallback-only P1.b",
+                    )
+            if provider_hold is None and kind == "session_limit":
                 # SELF-CLEARS at the time printed in the message — verified live
                 # (cap said 09:40, first good turn minutes after, no intervention).
                 # So: no poke (futile), and NO escalation either — paging a human
@@ -2953,30 +3119,31 @@ def _dispatch_poke(
                             f"{reset_hint or 'per message'}) — NOT poking; "
                             f"self-clears, no escalation (T-1369)")
                 return 0
-            # spend_limit: self-clears at the PRINTED reset (T-2290: the "monthly"
-            # text is really the current usage window). The wait is usually hours but
-            # CAN be long — artisan sat ~48h erroring every turn (T-2387: a far window /
-            # exhausted budget), which is why we hold + escalate ONCE (transition-gated
-            # inside _escalate_stuck) and never poke (futile until the window rolls) or
-            # restart (re-hits it). It is NOT permanent and needs no raise; a raise
-            # (the operator's lane) only shortens a long wait. The escalation records the
-            # seat-state, it does not ask for a raise.
-            cur_mtime = latest_jsonl_activity(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
-            prior = read_poke_state(state_path) or {}
-            _log(agent, f"{predicate}: session CAPPED (spend limit) — NOT poking; "
-                        f"holds until raised, escalating once (T-1369)")
-            _escalate_stuck(
-                cfg, agent, predicate,
-                msg=(f"⛔ [{predicate}] {agent} is SPEND-CAPPED — every turn errors. "
-                     f"It self-clears at the printed reset (T-2290: the current usage "
-                     f"window), but the wait can be long — artisan sat ~48h (T-2387). "
-                     f"Poking/restarting suppressed (futile until the window rolls). A "
-                     f"raise (the operator's lane) only shortens the wait; this alert records "
-                     f"the seat-state, it is not a raise request."),
-                vocab="spend-cap", state_path=state_path, cur_mtime=cur_mtime,
-                consecutive=int(prior.get("consecutive_ineffective", 0) or 0),
-            )
-            return 0
+            elif provider_hold is None:
+                # spend_limit: self-clears at the PRINTED reset (T-2290: the "monthly"
+                # text is really the current usage window). The wait is usually hours but
+                # CAN be long — artisan sat ~48h erroring every turn (T-2387: a far window /
+                # exhausted budget), which is why we hold + escalate ONCE (transition-gated
+                # inside _escalate_stuck) and never poke (futile until the window rolls) or
+                # restart (re-hits it). It is NOT permanent and needs no raise; a raise
+                # (the operator's lane) only shortens a long wait. The escalation records the
+                # seat-state, it does not ask for a raise.
+                cur_mtime = latest_jsonl_activity(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
+                prior = read_poke_state(state_path) or {}
+                _log(agent, f"{predicate}: session CAPPED (spend limit) — NOT poking; "
+                            f"holds until raised, escalating once (T-1369)")
+                _escalate_stuck(
+                    cfg, agent, predicate,
+                    msg=(f"⛔ [{predicate}] {agent} is SPEND-CAPPED — every turn errors. "
+                         f"It self-clears at the printed reset (T-2290: the current usage "
+                         f"window), but the wait can be long — artisan sat ~48h (T-2387). "
+                         f"Poking/restarting suppressed (futile until the window rolls). A "
+                         f"raise (the operator's lane) only shortens the wait; this alert records "
+                         f"the seat-state, it is not a raise request."),
+                    vocab="spend-cap", state_path=state_path, cur_mtime=cur_mtime,
+                    consecutive=int(prior.get("consecutive_ineffective", 0) or 0),
+                )
+                return 0
         if _session_cyber_blocked(cfg):
             cur_mtime = latest_jsonl_activity(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
             prior = read_poke_state(state_path) or {}
@@ -2992,22 +3159,41 @@ def _dispatch_poke(
                 consecutive=int(prior.get("consecutive_ineffective", 0) or 0),
             )
             return 0
-        cur_mtime = latest_jsonl_activity(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
+        cur_mtime = _poke_activity_marker(cfg, agent, predicate, active_harness)
         suppress, consecutive, reason = poke_effectiveness_decision(
             read_poke_state(state_path), cur_mtime, predicate, max_ineffective
         )
         if suppress:
-            # Stuck (N ineffective pokes, jsonl frozen) — route the remedy to Recovery
-            # ONCE (transition-gated inside _escalate_stuck), not every cycle.
-            _log(agent, f"{predicate}: {reason}; NOT poking (stuck, not idle) — escalating")
+            # Ground-truth the pane at the decision boundary.  Frozen JSONL proves
+            # only that the poke was ineffective; it does NOT prove the seat is
+            # wedged.  A seat that finished its work and rests at a clean composer
+            # has this exact shape (T-6179).  Keep the one-poke bound in every
+            # branch, but reserve STUCK/restart language for separately classified
+            # cap/modal/cyber/wedge states above.
+            pane_idle = _pane_idle_probe(cfg)
+            if pane_idle is False:
+                _log(agent, f"{predicate}: {reason}; pane is now BUSY — "
+                            "NOT poking and not escalating; busy state self-clears")
+                return 0
+            if pane_idle is True:
+                _log(agent, f"{predicate}: {reason}; pane confirmed IDLE — "
+                            "NOT poking; escalating as submission/queue mismatch, not wedge")
+                msg = (f"🟨 [{predicate}] {agent} had {consecutive} ineffective poke(s), "
+                       f"but a fresh pane capture is confirmed IDLE. Poking remains bounded "
+                       f"and suppressed; this is not evidence of a wedge. Inspect the poke "
+                       f"submission and actionable-queue signal before any recovery action.")
+                vocab = "ineffective-poke-idle"
+            else:
+                _log(agent, f"{predicate}: {reason}; pane state UNKNOWN — "
+                            "NOT poking; escalating without a wedge claim")
+                msg = (f"🟨 [{predicate}] {agent} had {consecutive} ineffective poke(s), "
+                       f"and the fresh pane state is unknown. Poking remains bounded and "
+                       f"suppressed; investigate the pane/capture path before choosing a remedy.")
+                vocab = "ineffective-poke-unknown"
             _escalate_stuck(
                 cfg, agent, predicate,
-                msg=(f"⛔ [{predicate}] {agent} appears STUCK: {consecutive} consecutive "
-                     f"ineffective poke(s) — its main jsonl didn't advance after the poke, so "
-                     f"it's not idle-recoverable (capped / wedged / blocked). Poking suppressed; "
-                     f"needs investigation/restart, not another poke."),
-                vocab="stuck-poke", state_path=state_path, cur_mtime=cur_mtime,
-                consecutive=consecutive,
+                msg=msg, vocab=vocab, state_path=state_path, cur_mtime=cur_mtime,
+                consecutive=consecutive, provider_hold=provider_hold,
             )
             return 0
         if _poke_suppressed_by_usage(agent, predicate, cfg=cfg):  # T-4510: after recovery
@@ -3015,11 +3201,24 @@ def _dispatch_poke(
         harness = _gate_text_poke(cfg, agent, predicate)  # T-5793: positive pane gate
         if harness is None:
             return 0
+        if provider_hold is not None and harness != active_harness:
+            # T-5758 reviewer adversarial: the controller may change runtimes
+            # between the provider-hold snapshot and this final send boundary.
+            # Never let a fallback-only decision authorize text to the capped
+            # Claude runtime (or any different runtime).  Re-evaluate next cycle.
+            _log(
+                agent,
+                f"{predicate}: active runtime changed {active_harness}->{harness} "
+                "after provider-hold classification — deferring, not sending",
+            )
+            _record_fire(agent, predicate, deferred=True)
+            return 0
         if send_poke(cfg, prompt, harness=harness):
             _log(agent, f"{predicate} poke sent (bounded; consecutive_ineffective={consecutive})")
             write_poke_state(
                 state_path, agent, predicate,
                 pre_poke_jsonl_mtime=cur_mtime, consecutive_ineffective=consecutive,
+                provider_hold=provider_hold,
             )
             _record_fire(agent, predicate)
             return 0
@@ -3250,6 +3449,12 @@ def main(argv: list[str] | None = None) -> int:
     # stops NEW work: a paused seat is alive and must stay watched, so liveness, wedge and
     # modal predicates keep running and just the queue pokes (P1.a / P1.b) are skipped.
     hold = _seat_hold(agent)
+    if hold is not None and getattr(hold, "alertable", False) is True:
+        # T-5868 (review A): halted is an INCIDENT and pages regardless of any other source.
+        # _combine ORs alertable, so a maintenance window or OOM hold (which only outranks it
+        # for DISPLAY) must not silence the page or its re-alerts. Intake stays held and the
+        # liveness predicates below still run; the early return below is unchanged.
+        _halted_alert(agent, hold)
     if hold is not None and (hold.remediation_vetoed or hold.launch_blocked):
         if "maintenance" in hold.sources:
             _log(agent, "seat-maintenance ACTIVE: skipping all predicates (T-5244)")

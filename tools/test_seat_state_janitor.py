@@ -102,6 +102,38 @@ class TestPreExpiry(JanitorBase):
         self.assertFalse(self.load()["pre_expiry_notified"])
 
 
+class TestExtendAdvice(JanitorBase):
+    """T-5623: the extend line follows the record's state (pause would downgrade a deep sleep)."""
+
+    def _sleep(self, **kw):
+        rec = record(**kw)
+        rec.update(state="deep-sleep", phase="asleep")
+        return rec
+
+    def test_deep_sleep_pre_expiry_says_sleep(self):
+        self.put(self._sleep(expires=NOW + timedelta(minutes=30)))
+        self.assertEqual(self.tick(), ["pre_expiry_notice"])
+        text = self.mail.sent[0][2]
+        self.assertIn("harness specialist sleep --for", text)
+        self.assertNotIn("pause --for", text)
+
+    def test_deep_sleep_indefinite_says_sleep(self):
+        self.put(self._sleep(indefinite=True, set_ts=NOW - timedelta(days=8)))
+        self.assertEqual(self.tick(), ["indefinite_nag"])
+        text = self.mail.sent[0][2]
+        self.assertIn("harness specialist sleep --for", text)
+        self.assertNotIn("pause --for", text)
+
+    def test_paused_indefinite_keeps_pause(self):
+        self.put(record(indefinite=True, set_ts=NOW - timedelta(days=8)))
+        self.tick()
+        self.assertIn("harness specialist pause --for", self.mail.sent[0][2])
+
+    def test_halted_gets_no_extend_line(self):
+        self.assertNotIn("extend", sj._how_to_extend("specialist", "halted"))
+        self.assertIn("wake", sj._how_to_extend("specialist", "paused-intake"))
+
+
 class TestExpiry(JanitorBase):
     def test_expired_tombstoned_removed_notified(self):
         rec = record(expires=NOW - timedelta(minutes=1), set_ts=NOW - timedelta(hours=5))

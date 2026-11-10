@@ -307,6 +307,112 @@ class TestValidateSemanticDrift(_PriorityListValidateTestBase):
         self.assertNotIn("T-2000", err)
 
 
+class TestExpectedBroad(_PriorityListValidateTestBase):
+    """T-6239: optional `expected-broad:` exemption + young-label skip."""
+
+    _OLD = "2026-05-01T00:00:00Z"
+    _NEW = "2026-09-01T00:00:00Z"
+    _RECENT_NOW = "2026-09-15T00:00:00Z"
+
+    def _validate_at_now(self):
+        from datetime import datetime as _dt
+        with patch("tools.ticket.datetime") as dt:
+            dt.now.return_value = _dt.fromisoformat(
+                self._RECENT_NOW.replace("Z", "+00:00")
+            )
+            dt.fromisoformat = _dt.fromisoformat
+            return self._run_validate()
+
+    def _seed_busy(self, label: str) -> None:
+        for i in range(ticket.PRIORITY_LIST_HIGH_VOLUME_THRESHOLD + 1):
+            self._seed(tid=f"T-1{i:03d}", labels=[label])
+
+    # -- parser --
+    def test_parse_without_key_returns_empty_exemptions(self) -> None:
+        text = _wrap("priority-1:\n  - alpha\n")
+        self.assertEqual(priority_list_parse.parse_expected_broad(text), {})
+        self.assertEqual(priority_list_parse.parse(text), {"alpha": 1})
+
+    def test_parse_with_key_is_not_a_tier_and_leaves_rank_map(self) -> None:
+        text = _wrap(
+            "priority-1:\n  - alpha\nexpected-broad:\n  alpha: project label\n"
+        )
+        self.assertEqual(priority_list_parse.parse(text), {"alpha": 1})
+        self.assertEqual(
+            priority_list_parse.parse_expected_broad(text),
+            {"alpha": "project label"},
+        )
+
+    def test_parse_expected_broad_bad_shape_is_schema_error(self) -> None:
+        for body in ("expected-broad:\n  - alpha\n", "expected-broad:\n  alpha: 3\n"):
+            with self.assertRaises(priority_list_parse.PriorityListParseError) as cm:
+                priority_list_parse.parse_expected_broad(_wrap(body))
+            self.assertTrue(str(cm.exception).startswith("schema:"))
+
+    # -- exemptions --
+    def test_high_volume_exempted(self) -> None:
+        self._set_priority_list(
+            "priority-1:\n  - busy-label\nexpected-broad:\n  busy-label: project label\n"
+        )
+        self._seed_busy("busy-label")
+        rc, out, err = self._run_validate()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("high-volume", err)
+
+    def test_semantic_drift_exempted(self) -> None:
+        self._set_priority_list(
+            "priority-1:\n  - narrow-label\nexpected-broad:\n  narrow-label: arc family\n"
+        )
+        self._seed(tid="T-1000", labels=["narrow-label"], created=self._OLD)
+        self._seed(tid="T-2000", labels=["narrow-label"], created=self._NEW)
+        rc, _, err = self._validate_at_now()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("semantic-drift", err)
+
+    def test_dead_label_still_warns_when_exempt(self) -> None:
+        self._set_priority_list(
+            "priority-1:\n  - ghost\nexpected-broad:\n  ghost: reason\n"
+        )
+        rc, _, err = self._run_validate()
+        self.assertEqual(rc, 2)
+        self.assertIn("probably-dead", err)
+
+    def test_stale_exemption_warns(self) -> None:
+        self._set_priority_list(
+            "priority-1:\n  - alpha\nexpected-broad:\n  gone-label: reason\n"
+        )
+        self._seed(tid="T-0001", labels=["alpha"])
+        rc, _, err = self._run_validate()
+        self.assertEqual(rc, 2)
+        self.assertIn("gone-label", err)
+        self.assertIn("stale exemption", err)
+
+    def test_absent_key_output_unchanged(self) -> None:
+        self._set_priority_list("priority-1:\n  - busy-label\n")
+        self._seed_busy("busy-label")
+        rc, _, err = self._run_validate()
+        self.assertEqual(rc, 2)
+        self.assertIn("high-volume", err)
+        self.assertNotIn("stale exemption", err)
+
+    # -- young-label skip --
+    def test_young_label_with_empty_history_does_not_fire(self) -> None:
+        self._set_priority_list("priority-1:\n  - young-label\n")
+        self._seed(tid="T-2000", labels=["young-label"], created=self._NEW)
+        self._seed(tid="T-2001", labels=["young-label"], created=self._NEW)
+        rc, _, err = self._validate_at_now()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("semantic-drift", err)
+
+    def test_label_with_history_still_fires(self) -> None:
+        self._set_priority_list("priority-1:\n  - narrow-label\n")
+        self._seed(tid="T-1000", labels=["narrow-label"], created=self._OLD)
+        self._seed(tid="T-2000", labels=["narrow-label"], created=self._NEW)
+        rc, _, err = self._validate_at_now()
+        self.assertEqual(rc, 2)
+        self.assertIn("semantic-drift", err)
+
+
 class TestValidateSampleMatching(_PriorityListValidateTestBase):
     def test_sample_output_includes_ids_and_titles(self) -> None:
         self._set_priority_list("priority-1:\n  - alpha\n")

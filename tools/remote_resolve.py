@@ -98,6 +98,9 @@ class RepoManifestEntry:
 
     name: str
     remotes: tuple[RemoteEntry, ...]
+    # ORG-081 §7 (T-5113): the ratified commit an external component's contract is resolved at.
+    # A full 40-hex sha or None; a tag or branch moves, so it is not a pin.
+    revision: str | None = None
 
 
 @dataclass(frozen=True)
@@ -319,6 +322,18 @@ def _parse_remote(repo_name: str, r: dict) -> RemoteEntry:
     return RemoteEntry(role=r["role"], url=r["url"], auth_ref=r["auth"], writable=writable)
 
 
+_REVISION_PIN_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _parse_revision(repo_name: str, entry: dict) -> str | None:
+    if "revision" not in entry:
+        return None
+    rev = entry["revision"]
+    if not (isinstance(rev, str) and _REVISION_PIN_RE.match(rev)):
+        raise ManifestIntegrityError(f"repo {repo_name!r}: revision {rev!r} is not a 40-hex commit sha")
+    return rev
+
+
 def load_manifest(path: Path, *, signature_verifier: SignatureVerifier) -> Manifest:
     """Parse an ORG-046 §1-shaped manifest YAML file into a Manifest.
 
@@ -339,7 +354,9 @@ def load_manifest(path: Path, *, signature_verifier: SignatureVerifier) -> Manif
     repos: dict[str, RepoManifestEntry] = {}
     for repo_entry in data.get("repos") or []:
         remotes = tuple(_parse_remote(repo_entry["name"], r) for r in (repo_entry.get("remotes") or []))
-        repos[repo_entry["name"]] = RepoManifestEntry(name=repo_entry["name"], remotes=remotes)
+        repos[repo_entry["name"]] = RepoManifestEntry(
+            name=repo_entry["name"], remotes=remotes, revision=_parse_revision(repo_entry["name"], repo_entry)
+        )
 
     return Manifest(repos=repos, auth_refs=auth_refs, signature_verified=verified)
 

@@ -13,6 +13,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tools import recovery_continuity_bundle as wcb
 from tools import persona_continuity as pc
@@ -42,6 +43,15 @@ class RecoveryContinuityBundleTests(unittest.TestCase):
             read_source=self._read_source,
             pinned_revision="deadbeef" * 5,
         )
+
+    def test_cli_home_defaults_are_resolved_when_parser_is_built(self) -> None:
+        state_dir = self.root / "redirected-state"
+        with mock.patch.dict(os.environ, {"PANTHEON_STATE_DIR": str(state_dir)}):
+            args = wcb.build_parser().parse_args(["build"])
+        state = state_dir / "personas"
+        self.assertEqual(Path(args.home), wcb.RECOVERY_HOME)
+        self.assertEqual(Path(args.state_root), state)
+        self.assertEqual(Path(args.continuity_root), state / "recovery/continuity")
 
     def test_build_produces_resolvable_bundle_and_verified_checkpoint(self) -> None:
         cont = self.root / "continuity"
@@ -129,6 +139,37 @@ class RecoveryContinuityBundleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._build(self.root / "continuity")
 
+
+
+class PersonaStateDirResolutionTests(unittest.TestCase):
+    """T-6285: resolve the personas dir exactly as the runtime planes do
+    (harness_state.state_root_from_env), not PANTHEON_STATE_DIR alone."""
+
+    def _env(self, **kv):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("PANTHEON_STATE_DIR", "PANTHEON_PERSONA_STATE_DIR")}
+        env.update(kv)
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    def test_persona_state_dir_alone_is_honoured(self) -> None:
+        with self._env(PANTHEON_PERSONA_STATE_DIR="/tmp/t6285-root/personas"):
+            self.assertEqual(wcb._default_state_root(), Path("/tmp/t6285-root/personas"))
+
+    def test_both_set_and_agreeing(self) -> None:
+        with self._env(PANTHEON_PERSONA_STATE_DIR="/tmp/t6285-root/personas",
+                       PANTHEON_STATE_DIR="/tmp/t6285-root"):
+            self.assertEqual(wcb._default_state_root(), Path("/tmp/t6285-root/personas"))
+
+    def test_disagreeing_env_is_refused(self) -> None:
+        with self._env(PANTHEON_PERSONA_STATE_DIR="/tmp/a/personas",
+                       PANTHEON_STATE_DIR="/tmp/b"):
+            with self.assertRaises(Exception):
+                wcb._default_state_root()
+
+    def test_default_is_recovery_home(self) -> None:
+        with self._env():
+            self.assertEqual(wcb._default_state_root(),
+                             wcb.RECOVERY_HOME / ".local/state/pantheon/personas")
 
 if __name__ == "__main__":
     unittest.main()

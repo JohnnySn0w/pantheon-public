@@ -42,13 +42,14 @@ lock file (Base engine mechanics L318-319: only root, only at
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 from .exceptions import AdmissionRefused, ClaimHolderMismatch, PrimitiveUnavailable
 
@@ -107,12 +108,14 @@ def read_claim(system_dir: Path, instance: str, component: str) -> dict[str, Any
 
     Raises ``PrimitiveUnavailable`` if the claim path is unreachable in
     a way that is NOT simply "no claim yet" (e.g. the gate tree root was
-    renamed out from under a live invocation -- the C4-1 scenario).
+    renamed out from under a live invocation -- the C4-1 scenario), or if
+    the claim file exists but is not a JSON object (``null`` included,
+    T-5826): a corrupt claim is never read as unclaimed.
     """
 
     claim_path = _claim_path(system_dir, instance, component)
     try:
-        raw = claim_path.read_text(encoding="utf-8")
+        raw = claim_path.read_bytes()
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -120,12 +123,31 @@ def read_claim(system_dir: Path, instance: str, component: str) -> dict[str, Any
             PRIMITIVE_NAME, f"claim unreadable at {claim_path}: {exc}"
         ) from exc
 
+    return _parse_claim(raw, claim_path)
+
+
+def _parse_claim(raw: bytes, canonical: Path) -> dict[str, Any]:
+    """The ONE claim parser (T-5826), shared by ``read_claim``, ``claim`` (via
+    ``read_claim``) and ``release`` (via ``_read_claim_at``).
+
+    Returns the claim object. Anything else -- not UTF-8, not JSON, or JSON
+    that is not an object (``null`` included) -- raises ``PrimitiveUnavailable``
+    (fail closed, C4). It never returns ``None``: ``None`` is reserved for an
+    ABSENT claim file, decided by the callers before they reach this parser.
+    """
+
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PrimitiveUnavailable(
-            PRIMITIVE_NAME, f"claim malformed at {claim_path}: {exc}"
+            PRIMITIVE_NAME, f"claim malformed at {canonical}: {exc}"
         ) from exc
+    if not isinstance(payload, dict):
+        raise PrimitiveUnavailable(
+            PRIMITIVE_NAME,
+            f"claim malformed at {canonical}: expected a JSON object, got {type(payload).__name__}",
+        )
+    return payload
 
 
 def claim(
@@ -188,8 +210,8 @@ def claim(
     try:
         os.link(tmp_path, canonical)
     except FileExistsError:
+        _best_effort_unlink(tmp_path)  # before the read: a malformed claim raises below (T-5826)
         holder = read_claim(system_dir, instance, component)
-        _best_effort_unlink(tmp_path)
         reason = (
             f"(instance={instance}, component={component}) already held by "
             f"run_id={holder.get('run_id')!r} scope={holder.get('scope')!r} "
@@ -277,6 +299,103 @@ def release(system_dir: Path, instance: str, component: str, *, expected_run_id:
         os.close(lock_fd)  # closing the fd drops the flock
 
 
+@contextlib.contextmanager
+def claim_lock(system_dir: Path, instance: str, component: str) -> Iterator[None]:
+    """Hold the component's leaf-directory flock: the ONE lock ``release`` and ``takeover`` take (T-5875).
+
+    A caller that must make a check-and-transition mutually exclusive with a takeover
+    (the engine's ``rollback``) does it inside this. Fails closed: a busy lock past
+    ``_RELEASE_LOCK_WAIT_S``, or an unopenable leaf, is ``PrimitiveUnavailable``. Not reentrant
+    (a second open of the leaf conflicts with the first, even in one process).
+    """
+
+    leaf = _leaf_dir(system_dir, instance, component)
+    try:
+        lock_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise PrimitiveUnavailable(PRIMITIVE_NAME, f"claim lock unopenable at {leaf}: {exc}") from exc
+    try:
+        _lock_leaf(lock_fd, leaf)
+        yield
+    finally:
+        os.close(lock_fd)  # closing the fd drops the flock
+
+
+def takeover(
+    system_dir: Path,
+    instance: str,
+    component: str,
+    *,
+    expected_run_id: str,
+    run_id: str,
+    scope: str,
+    uid: int,
+    verb: str,
+    before_swap: Callable[[], None] | None = None,
+    already_locked: bool = False,
+) -> None:
+    """Atomically hand the claim from ``expected_run_id`` to ``run_id`` (T-5875, ORG-080 D-Y).
+
+    Compare-and-swap under the SAME leaf-directory flock ``release`` takes: the
+    canonical claim is replaced in one ``rename`` only if it still names
+    ``expected_run_id``, so it is never absent (no other admission can slip in
+    between a release and a re-claim) and never swapped from under a different
+    holder. ``claim()`` takes no lock, but it can only create the name when it is
+    absent, and it never is during the swap, so admission semantics are unchanged.
+
+    - claim absent or naming another run -> ``ClaimHolderMismatch``, nothing changed;
+    - ``before_swap`` runs INSIDE the locked section, after the holder check and before the swap:
+      the caller re-checks its own precondition there (and may write a fence). Whatever it
+      raises propagates and nothing is swapped;
+    - claim unreadable / malformed -> ``PrimitiveUnavailable`` (fail closed, C4);
+    - lock busy past ``_RELEASE_LOCK_WAIT_S`` -> ``PrimitiveUnavailable``.
+
+    The engine decides WHEN a takeover is admissible (a gated remove over a
+    ROLLBACK_INCOMPLETE holder); this primitive only makes the swap atomic.
+    """
+
+    leaf = _leaf_dir(system_dir, instance, component)
+    try:
+        lock_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as exc:
+        raise PrimitiveUnavailable(PRIMITIVE_NAME, f"takeover lock unopenable at {leaf}: {exc}") from exc
+    tmp_name = f".claim-tmp-{uuid.uuid4().hex}"
+    try:
+        if not already_locked:  # the caller holds ``claim_lock`` (a second flock would block on the first)
+            _lock_leaf(lock_fd, leaf)
+        holder = _read_claim_at(lock_fd, leaf / _CLAIM_LEAF_NAME)
+        actual = None if holder is None else holder.get("run_id")
+        if actual != expected_run_id:
+            raise ClaimHolderMismatch(component, expected_run_id, actual)
+        if before_swap is not None:
+            before_swap()
+        payload = {
+            "run_id": run_id,
+            "instance": instance,
+            "component": component,
+            "scope": scope,
+            "uid": uid,
+            "verb": verb,
+            "claimed_at": time.time(),
+        }
+        try:
+            fd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _CLAIM_FILE_MODE, dir_fd=lock_fd)
+            try:
+                os.write(fd, json.dumps(payload).encode("utf-8"))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(tmp_name, _CLAIM_LEAF_NAME, src_dir_fd=lock_fd, dst_dir_fd=lock_fd)
+        except OSError as exc:
+            try:
+                os.unlink(tmp_name, dir_fd=lock_fd)
+            except OSError:
+                pass
+            raise PrimitiveUnavailable(PRIMITIVE_NAME, f"takeover failed at {leaf}: {exc}") from exc
+    finally:
+        os.close(lock_fd)
+
+
 def _read_claim_at(dir_fd: int, canonical: Path) -> dict[str, Any] | None:
     """Read the claim relative to the locked leaf fd (T-5819 L1).
 
@@ -306,18 +425,7 @@ def _read_claim_at(dir_fd: int, canonical: Path) -> dict[str, Any] | None:
         ) from exc
     finally:
         os.close(fd)
-    try:
-        payload = json.loads(b"".join(chunks).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise PrimitiveUnavailable(
-            PRIMITIVE_NAME, f"claim malformed at {canonical}: {exc}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise PrimitiveUnavailable(
-            PRIMITIVE_NAME,
-            f"claim malformed at {canonical}: expected a JSON object, got {type(payload).__name__}",
-        )
-    return payload
+    return _parse_claim(b"".join(chunks), canonical)
 
 
 #: Bound on waiting for the release critical section. The section is a

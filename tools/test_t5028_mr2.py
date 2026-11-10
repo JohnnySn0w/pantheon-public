@@ -25,6 +25,10 @@ from unittest import mock
 
 from tools import harness
 from tools import harness_state as hs
+try:
+    from tools import _seat_state_isolation
+except ImportError:  # pragma: no cover
+    import _seat_state_isolation  # type: ignore[no-redef]
 from tools import persona_bringup
 from tools import proactive_swap_init
 from tools import runtime_controller as rc
@@ -32,6 +36,14 @@ from tools import session_chronicle
 from tools import subscription_usability
 from tools import test_runtime_controller as trc
 from tools import test_t5021_runtime_hold_both_planes as t5021
+
+
+def setUpModule() -> None:
+    _seat_state_isolation.start()
+
+
+def tearDownModule() -> None:
+    _seat_state_isolation.stop()
 
 
 def _me() -> str:

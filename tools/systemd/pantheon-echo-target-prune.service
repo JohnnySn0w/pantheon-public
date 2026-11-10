@@ -12,7 +12,8 @@ WorkingDirectory=%h/pantheon-config
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # --superseded-hours 6 (T-5249): echo crates rebuild under a new hash per commit, so the
 # 7-day age floor alone could not keep up (35G target, all used within a day, 2026-10-20).
-ExecStart=/usr/bin/python3 %h/pantheon-config/tools/echo_target_prune.py --superseded-hours 6
+# --max-gb 16 (T-6121): whole-profile clear when over 16G and no build holds a .cargo-lock.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/echo_target_prune.py --superseded-hours 6 --max-gb 16
 SuccessExitStatus=0
 StandardOutput=journal
 StandardError=journal

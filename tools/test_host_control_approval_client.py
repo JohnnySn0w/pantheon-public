@@ -39,16 +39,26 @@ HOST_CONTROL = REPO_ROOT / "tools" / "host_control"
 SUBJECT = SubjectContext(uid=1003, seat_id="alpha", persona="alpha", role="worker", instance="t")
 OTHER = SubjectContext(uid=1004, seat_id="bravo", persona="bravo", role="worker", instance="t")
 HANDLE = "a" * 64
+PLAN = "e" * 64
+OTHER_PLAN = "f" * 64
 
 
-def _status_json(handle: str, state: str = "issued") -> str:
+def _status_json(
+    handle: str,
+    state: str = "issued",
+    *,
+    plan_handle: str = PLAN,
+    plan_owner: str = "alpha",
+) -> str:
     return json.dumps(
         {
-            "schema": "pantheon-approval-status/v1",
+            "schema": "pantheon-approval-status/v2",
             "approval_handle": handle,
             "state": state,
             "expires_at": "2026-10-10T01:00:00+00:00",
             "summary": "bounded",
+            "plan_handle": plan_handle,
+            "plan_owner": plan_owner,
         },
         sort_keys=True,
     )
@@ -68,11 +78,18 @@ class FakeTransport:
 
 
 class FakeOwnership:
-    def __init__(self, owned: set[tuple[int, str]]) -> None:
-        self.owned = owned
+    """``owned`` holds ``(uid, approval_handle)`` or, for the plan-bound
+    seam, ``(uid, approval_handle, plan_handle)`` triples. A 2-tuple entry
+    is shorthand for "carried by an operation on PLAN"."""
+
+    def __init__(self, owned: set[tuple]) -> None:
+        self.owned = {entry if len(entry) == 3 else (entry[0], entry[1], PLAN) for entry in owned}
 
     def subject_references_approval(self, *, subject, approval_handle):
-        return (subject.uid, approval_handle) in self.owned
+        return any(uid == subject.uid and h == approval_handle for uid, h, _ in self.owned)
+
+    def subject_operation_binds_plan(self, *, subject, approval_handle, plan_handle):
+        return (subject.uid, approval_handle, plan_handle) in self.owned
 
 
 class TranscriptionPinTests(unittest.TestCase):
@@ -90,6 +107,7 @@ class TranscriptionPinTests(unittest.TestCase):
             approval_wire.METADATA_UNAVAILABLE_ERROR,
         )
         self.assertEqual(client_module.APPROVAL_STATUS_SCHEMA, approval_wire.APPROVAL_STATUS_SCHEMA)
+        self.assertEqual(client_module.APPROVAL_STATUS_SCHEMA, "pantheon-approval-status/v2")
         self.assertEqual(client_module.GRANT_STATES, approval_contracts.GRANT_STATES)
         self.assertEqual(
             client_module.BIND_DENIAL_REASON_CODES,
@@ -194,6 +212,66 @@ class ClientTests(unittest.TestCase):
             client.approval_status(SUBJECT, "approval-x")
         self.assertEqual(transport.calls, [("ApprovalStatus", "s", (HANDLE,))])
 
+    def test_self_attach_of_a_foreign_handle_is_refused(self) -> None:
+        # T-4875 / P10: SUBJECT attaches a handle whose grant belongs to
+        # another seat's plan to SUBJECT's own throwaway Apply (own plan).
+        foreign = _status_json(HANDLE, plan_handle=OTHER_PLAN, plan_owner="bravo")
+        transport = FakeTransport(reply=("issued", foreign))
+        client = ApprovalConsumerClient(
+            transport=transport, ownership=FakeOwnership({(SUBJECT.uid, HANDLE, PLAN)})
+        )
+        with self.assertRaises(UnknownHandle) as attached:
+            client.approval_status(SUBJECT, HANDLE)
+        # the refusal is textually identical to a nonexistent handle (gate 15)
+        with self.assertRaises(UnknownHandle) as nonexistent:
+            client.approval_status(SUBJECT, "approval-x")
+        self.assertEqual(str(attached.exception), str(nonexistent.exception))
+        with self.assertRaises(UnknownHandle) as stranger:
+            client.approval_status(OTHER, HANDLE)
+        self.assertEqual(str(attached.exception), str(stranger.exception))
+
+    def test_owner_match_alone_is_not_enough_without_the_plan_binding(self) -> None:
+        # the grant is for SUBJECT's plan, but the carrying operation is on a
+        # different plan: still refused.
+        transport = FakeTransport(reply=("issued", _status_json(HANDLE, plan_handle=PLAN, plan_owner="alpha")))
+        client = ApprovalConsumerClient(
+            transport=transport, ownership=FakeOwnership({(SUBJECT.uid, HANDLE, OTHER_PLAN)})
+        )
+        with self.assertRaises(UnknownHandle):
+            client.approval_status(SUBJECT, HANDLE)
+
+    def test_plan_binding_without_owner_match_is_refused(self) -> None:
+        transport = FakeTransport(reply=("issued", _status_json(HANDLE, plan_owner="bravo")))
+        client = ApprovalConsumerClient(
+            transport=transport, ownership=FakeOwnership({(SUBJECT.uid, HANDLE, PLAN)})
+        )
+        with self.assertRaises(UnknownHandle):
+            client.approval_status(SUBJECT, HANDLE)
+
+    def test_approval_get_without_any_local_reference_never_calls_the_authority(self) -> None:
+        transport = FakeTransport(reply=("issued", _status_json(HANDLE)))
+        client = ApprovalConsumerClient(transport=transport, ownership=FakeOwnership(set()))
+        with self.assertRaises(UnknownHandle):
+            client.approval_status(SUBJECT, HANDLE)
+        self.assertEqual(transport.calls, [])
+
+    def test_v1_or_unbound_status_payload_fails_closed(self) -> None:
+        v1 = json.loads(_status_json(HANDLE))
+        v1["schema"] = "pantheon-approval-status/v1"
+        del v1["plan_handle"], v1["plan_owner"]
+        missing = json.loads(_status_json(HANDLE))
+        del missing["plan_owner"]
+        badplan = json.loads(_status_json(HANDLE))
+        badplan["plan_handle"] = "nothex"
+        for payload in (v1, missing, badplan):
+            with self.subTest(payload=sorted(payload)):
+                client = ApprovalConsumerClient(
+                    transport=FakeTransport(reply=("issued", json.dumps(payload))),
+                    ownership=FakeOwnership({(SUBJECT.uid, HANDLE, PLAN)}),
+                )
+                with self.assertRaises(HostControlError):
+                    client.approval_status(SUBJECT, HANDLE)
+
     def test_approval_get_maps_errors_and_validates_payload(self) -> None:
         ownership = FakeOwnership({(SUBJECT.uid, HANDLE)})
         cases = {
@@ -216,6 +294,7 @@ class ClientTests(unittest.TestCase):
             ("issued", _status_json(HANDLE, state="bound")),
             ("issued", "not json"),
             ("issued", json.dumps({"schema": "other"})),
+            ("issued", _status_json(HANDLE).replace("v2", "v1")),
             ("issued", "x" * 70000),
         ):
             with self.subTest(reply=str(reply)[:60]):
@@ -242,6 +321,17 @@ class JournalOwnershipTests(unittest.TestCase):
                 self.assertTrue(journal.subject_references_approval(subject=alpha, approval_handle=HANDLE))
                 self.assertFalse(journal.subject_references_approval(subject=bravo, approval_handle=HANDLE))
                 self.assertFalse(journal.subject_references_approval(subject=alpha, approval_handle="b" * 64))
+                # T-4875: plan-bound variant
+                own = plan.plan_handle
+                self.assertTrue(
+                    journal.subject_operation_binds_plan(subject=alpha, approval_handle=HANDLE, plan_handle=own)
+                )
+                self.assertFalse(
+                    journal.subject_operation_binds_plan(subject=alpha, approval_handle=HANDLE, plan_handle="9" * 64)
+                )
+                self.assertFalse(
+                    journal.subject_operation_binds_plan(subject=bravo, approval_handle=HANDLE, plan_handle=own)
+                )
             finally:
                 fixture.journal.close()
                 fixture.files.close()
@@ -339,6 +429,13 @@ class ConsumerTransportPrivateBusTests(unittest.TestCase):
         state, payload = client.approval_status(SUBJECT, fake.BOUND)
         self.assertEqual(state, "bound")
         self.assertEqual(json.loads(payload)["approval_handle"], fake.BOUND)
+        with self.assertRaises(UnknownHandle):
+            client.approval_status(OTHER, fake.BOUND)
+
+    def test_self_attach_is_refused_over_the_bus(self) -> None:
+        # the fake consumer's grant is for plan fake.PLAN owned by "alpha";
+        # bravo's own operation carries the handle on bravo's own plan
+        client = self._client({(OTHER.uid, fake.BOUND, "9" * 64)})
         with self.assertRaises(UnknownHandle):
             client.approval_status(OTHER, fake.BOUND)
 

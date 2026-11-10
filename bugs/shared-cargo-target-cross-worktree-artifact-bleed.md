@@ -28,4 +28,6 @@ Cargo's build-dir lock serializes the two builds but doesn't separate them: it p
 
 **General rule:** a shared build cache keyed on something other than the content of the inputs is a cross-talk channel. Relocatable artifact names plus mtime freshness means "same crate name" gets treated as "same crate".
 
-Sibling: `bugs/` entry from c63768cec (shared CARGO_TARGET_DIR fs::copy EPERM on a foreign-owned OUT dir) covers the permissions face of the same shared dir.
+Sibling: `bugs/shared-cargo-target-fs-copy-eperm-foreign-owned-out-dir.md` (shared CARGO_TARGET_DIR fs::copy EPERM on a foreign-owned OUT dir) covers the permissions face of the same shared dir.
+
+Contradicts: `notes/echo-cargo-target-sharing-eval.md` (T-3550), which presents cross-clone workspace-crate reuse as a win and calls the corrupts/churns fear falsified. That holds for byte-identical source only; across worktrees with differing source, mtime freshness makes the reuse silently wrong (this entry, T-4122).

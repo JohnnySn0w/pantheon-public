@@ -376,6 +376,7 @@ from tools import live_harness  # noqa: E402  (T-4792)
 from tools.notify_policy import is_muted as _persona_is_muted  # noqa: E402  (ORG-076 §7 / T-2978)
 from tools import seat_state as _seat_state  # noqa: E402  (ORG-106 L2 / T-5525: the one seat-state reader)
 from tools.kick_verify import _spinner_above_composer  # noqa: E402  (T-4193 spinner rule, T-4284)
+from tools.inject_sanitize import neutralize_at_mentions  # noqa: E402  (T-4382 @path residual)
 
 # ORG-026 Path A hub, from instance.yaml (T-4096). Same value keep_going.py and
 # mailbox_wake.py resolve — one canonical source, no hand-carried duplicate.
@@ -1430,6 +1431,95 @@ def _preflight_stamp_registry(ticket: TicketInfo, agent: str | None = None) -> s
     return None
 
 
+def _on_non_main_branch(repo_root: Path) -> bool:
+    """True iff `repo_root` has a NAMED branch other than `main` checked out (T-5750).
+
+    On such a clone, committing the stamp onto HEAD and pushing HEAD:main would
+    carry every unrelated code commit on that branch to main, which the seat
+    pre-push CODE-path guard correctly refuses. Those clones publish through
+    tools/_git_publish (a main-based plumbing commit) instead. On `main`, or on
+    a detached HEAD (the with_worktree cron shape), the classic add/commit/push
+    path is already safe and is kept unchanged. Fail-closed to False (classic
+    path) on any probe error.
+    """
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(repo_root), "symbolic-ref", "--short", "-q", "HEAD"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    branch = (res.stdout or "").strip() if res.returncode == 0 else ""
+    return bool(branch) and branch != "main"
+
+
+def _publish_edit_via_main(ticket: TicketInfo, rel_path, mutate, message: str, direct: bool,
+                           repo_root: Path):
+    """Publish `mutate` of the ticket file to origin/main without pushing the
+    checked-out branch (T-5750), under the same git_mutation_lock the classic path
+    takes. Returns the PublishResult; raises GitMutationLockTimeout (or whatever
+    `mutate` raises on origin's blob; callers classify it).
+
+    On success, still under the lock, the local clone is reconciled to the
+    published state in two steps:
+      1. the EXACT published blob bytes are written to the working-tree file;
+      2. a ticket-only commit with that content is made on the checked-out
+         branch (pathspec-scoped to this one file; NEVER pushed).
+    Step 2 is what keeps a later `git merge origin/main` / `git pull --rebase`
+    clean: an unstaged modification blocks both ("commit your changes or stash
+    them") even when byte-identical to main's blob, whereas a local commit makes
+    the same change on both sides (merge is clean; rebase drops it as already
+    applied). The commit also keeps this consumer's own local mutex read intact.
+
+    The local commit is best-effort: origin already holds the mutex, so an
+    add/commit failure (index.lock contention included) is logged and the
+    publish result stays OK. On any non-OK publish the caller's earlier local
+    write stands, uncommitted, as before."""
+    from tools._git_publish import PublishKind, publish_file_edit_to_main
+    with git_mutation_lock(label=f"publish {ticket.id} via origin/main"):
+        result = publish_file_edit_to_main(
+            repo_root, str(rel_path), mutate, message, use_sg=not direct,
+        )
+        if result.kind is PublishKind.OK and result.published is not None:
+            _sync_local_to_published(ticket, rel_path, result.published, message, direct,
+                                     repo_root)
+    return result
+
+
+def _sync_local_to_published(ticket: TicketInfo, rel_path, published: bytes, message: str,
+                             direct: bool, repo_root: Path) -> None:
+    """Write `published` to the local file and commit it on the current branch,
+    file-scoped, unpushed. Never raises; failures are logged (see caller)."""
+    try:
+        ticket.path.write_bytes(published)
+    except OSError as exc:
+        print(f"[inbox_consumer] {ticket.id}: published, but could not sync the local"
+              f" copy to the published blob: {exc}", file=sys.stderr)
+        return
+
+    def _cmd(*args: str) -> list[str]:
+        if direct:
+            return ["git", "-C", str(repo_root), *args]
+        return ["sg", "pantheon-shared", "-c",
+                f"git -C {repo_root} " + subprocess.list2cmdline(list(args))]
+
+    try:
+        # Nothing to commit when the branch already holds this exact content.
+        if subprocess.run(_cmd("diff", "--quiet", "--", str(rel_path)),
+                          capture_output=True, text=True, check=False).returncode == 0:
+            return
+        res = _run_git_stamp_step(_cmd("add", "--", str(rel_path)))
+        if res.returncode == 0:
+            res = _run_git_stamp_step(_cmd("commit", "-m", message, "--", str(rel_path)))
+        if res.returncode != 0:
+            print(f"[inbox_consumer] {ticket.id}: published to origin/main, but the local"
+                  f" ticket-only commit failed (file synced, uncommitted; a later merge of"
+                  f" main may need it committed or reset): {res.stderr}", file=sys.stderr)
+    except Exception as exc:  # origin holds the mutex; local bookkeeping is best-effort
+        print(f"[inbox_consumer] {ticket.id}: published, local commit error: {exc!r}",
+              file=sys.stderr)
+
+
 def _stamp_auto_delivered(ticket: TicketInfo, agent: str | None = None) -> StampResult:
     """Write auto_delivered: true + auto_delivered_at: <ISO-ts> (+ T-4695
     delivered_to: <agent> when *agent* is given: the seat that took the ticket,
@@ -1501,13 +1591,15 @@ def _stamp_auto_delivered(ticket: TicketInfo, agent: str | None = None) -> Stamp
     )
     from tools._git_utils import REPO_ROOT
 
-    try:
-        text = ticket.path.read_text(encoding="utf-8")
+    def _mutate(text: str) -> str:
         fields, body = parse_front_matter(text)
         old_fields = _fm_snapshot(fields)
         _apply_stamp_fields(fields, agent)
-        new_text = _build_ticket_text(fields, body, old_fields=old_fields)
-        ticket.path.write_text(new_text, encoding="utf-8")
+        return _build_ticket_text(fields, body, old_fields=old_fields)
+
+    try:
+        text = ticket.path.read_text(encoding="utf-8")
+        ticket.path.write_text(_mutate(text), encoding="utf-8")
     except TicketRefusal as exc:
         # T-4760: an ORG-021 registry refusal (refuse mode) — raised by the
         # build, BEFORE the write, so nothing was written. Classified on its
@@ -1551,6 +1643,37 @@ def _stamp_auto_delivered(ticket: TicketInfo, agent: str | None = None) -> Stamp
     #      files cannot enter this commit even if a writer bypasses the lock;
     #   2. add+commit+push run under git_mutation_lock, serializing with every
     #      lock-taking writer (ticket.py, grooming, watch_runner).
+    if _on_non_main_branch(REPO_ROOT):
+        # T-5750: dev-branch clone: publish a ticket-only commit built on
+        # origin/main; never commit onto, or push, the checked-out branch.
+        from tools._git_publish import PublishKind
+        try:
+            pub = _publish_edit_via_main(ticket, rel_path, _mutate, commit_msg, direct, REPO_ROOT)
+        except TicketRefusal as exc:
+            print(f"[inbox_consumer] _stamp_auto_delivered REGISTRY REFUSED for {ticket.id} "
+                  f"(nothing published): {exc}", file=sys.stderr)
+            return StampResult.REGISTRY_REFUSED
+        except GitMutationLockTimeout as exc:
+            print(f"[inbox_consumer] _stamp_auto_delivered lock timeout (stamp written locally;"
+                  f" NOT published — mutex not visible to other readers): {exc}",
+                  file=sys.stderr)
+            return StampResult.FAILED
+        except Exception as exc:  # e.g. UnicodeDecodeError from mutate on origin's blob
+            print(f"[inbox_consumer] _stamp_auto_delivered publish ERROR (stamp written"
+                  f" locally; NOT published — mutex not visible to other readers): {exc!r}",
+                  file=sys.stderr)
+            return StampResult.FAILED
+        if pub.kind is PublishKind.ABSENT:
+            print(f"[inbox_consumer] _stamp_auto_delivered: {ticket.id} is not on origin/main"
+                  f" (claimed/resolved elsewhere) — stamp moot: {pub.detail}", file=sys.stderr)
+            return StampResult.TICKET_GONE
+        if pub.kind is not PublishKind.OK:
+            print(f"[inbox_consumer] _stamp_auto_delivered publish FAILED (stamp written"
+                  f" locally; NOT pushed — mutex not visible to other readers): {pub.detail}",
+                  file=sys.stderr)
+            return StampResult.FAILED
+        return StampResult.OK
+
     try:
         with git_mutation_lock(label=f"stamp auto_delivered {ticket.id}"):
             # add + commit each retry on transient .git/index.lock contention
@@ -1653,8 +1776,9 @@ def _clear_auto_delivered(ticket: TicketInfo, decline_agent: str | None = None) 
     from tools.ticket import parse_front_matter, _build_ticket_text, _fm_snapshot
     from tools._git_utils import REPO_ROOT, push_with_retry
 
-    try:
-        text = ticket.path.read_text(encoding="utf-8")
+    in_inbox = ticket.path.parent.name == "inbox"
+
+    def _mutate(text: str) -> str:
         fields, body = parse_front_matter(text)
         # T-4760: remove-only write — it can never yield a registry finding.
         old_fields = _fm_snapshot(fields)
@@ -1663,7 +1787,7 @@ def _clear_auto_delivered(ticket: TicketInfo, decline_agent: str | None = None) 
         # T-4695: the stamp's taker goes with it, but only while the ticket is still
         # undelivered work in inbox/. T-4698: in active/ the taker has CLAIMED it and
         # still holds live work (ticket_holder: WIP cap + dispatch mutex).
-        if ticket.path.parent.name == "inbox":
+        if in_inbox:
             fields.pop("delivered_to", None)
             # T-5049: record the offer-and-not-taken outcome in the same write.
             if decline_agent:
@@ -1673,8 +1797,11 @@ def _clear_auto_delivered(ticket: TicketInfo, decline_agent: str | None = None) 
                 if decline_agent not in declined:
                     declined = list(declined) + [decline_agent]
                 fields["auto_declined_by"] = declined
-        new_text = _build_ticket_text(fields, body, old_fields=old_fields)
-        ticket.path.write_text(new_text, encoding="utf-8")
+        return _build_ticket_text(fields, body, old_fields=old_fields)
+
+    try:
+        text = ticket.path.read_text(encoding="utf-8")
+        ticket.path.write_text(_mutate(text), encoding="utf-8")
     except Exception as exc:
         print(f"[inbox_consumer] _clear_auto_delivered write failed for {ticket.id}: {exc}",
               file=sys.stderr)
@@ -1689,6 +1816,23 @@ def _clear_auto_delivered(ticket: TicketInfo, decline_agent: str | None = None) 
     if decline_agent and ticket.path.parent.name == "inbox":
         commit_msg = (f"tickets: clear stale auto_delivered + record auto_declined_by"
                       f" {decline_agent} on {ticket.id}")
+    if _on_non_main_branch(REPO_ROOT):
+        # T-5750: same dev-branch isolation as the stamp; best-effort as ever.
+        from tools._git_publish import PublishKind
+        try:
+            pub = _publish_edit_via_main(ticket, rel_path, _mutate, commit_msg, direct, REPO_ROOT)
+            if pub.kind is not PublishKind.OK:
+                print(f"[inbox_consumer] _clear_auto_delivered publish {pub.kind.value}"
+                      f" (cleared locally; deferred to a later cycle): {pub.detail}",
+                      file=sys.stderr)
+        except GitMutationLockTimeout as exc:
+            print(f"[inbox_consumer] _clear_auto_delivered lock timeout (cleared locally;"
+                  f" publish deferred to a later cycle): {exc}", file=sys.stderr)
+        except Exception as exc:  # best-effort release side (T-3325 asymmetry)
+            print(f"[inbox_consumer] _clear_auto_delivered publish error (cleared locally): {exc}",
+                  file=sys.stderr)
+        return True
+
     # T-2336: pathspec-scoped commit + git_mutation_lock — same two defenses and
     # the same best-effort degradation as _stamp_auto_delivered above.
     try:
@@ -1782,11 +1926,15 @@ def _ask_body(body: str) -> str:
 
 
 def format_prompt(ticket: TicketInfo, agent: str) -> str:
-    ask = _ask_body(ticket.body)
+    # T-4382: title, Ask and serves are filer-authored free text (an automated filer
+    # can carry web/watch text into them), and this prompt is pasted into a live
+    # composer, where an '@<path>' token loads the file pre-model with no tool call.
+    # Neutralize those fields only; the locked INJECT_PROMPT text stays byte-exact.
+    ask = neutralize_at_mentions(_ask_body(ticket.body))
     base = (
         INJECT_PROMPT
         .replace("T-NNNN", ticket.id)
-        .replace("<title>", ticket.title)
+        .replace("<title>", neutralize_at_mentions(ticket.title))
         .replace("<agent>", agent)
         .replace("<body>", ask)
     )
@@ -1795,7 +1943,7 @@ def format_prompt(ticket: TicketInfo, agent: str) -> str:
     # byte-exact INJECT_PROMPT constant unchanged (the constant guards autonomy-
     # policy text, not metadata — changing it would break test_inject_prompt_matches_locked_text).
     if ticket.serves:
-        return f"Serves: {ticket.serves}\n{base}"
+        return f"Serves: {neutralize_at_mentions(str(ticket.serves))}\n{base}"
     return base
 
 
@@ -2222,6 +2370,17 @@ def _list_active_tickets_for_agent(agent: str) -> list[TicketInfo]:
         target = fields.get("target")
         if not _target_addresses_seat(target, agent, audit_role, functional):
             continue
+        # T-6292: a merge-wait is not a stall (same substate T-4119 excludes from
+        # the WIP cap and the dispatch mutex), so no ">24h" reminder for anyone.
+        if fields.get("substate") == "awaiting-merge":
+            continue
+        # T-6292: a role:<R> pool ticket matches every member of R, but only its
+        # stamped taker (`delivered_to`, via the shared ticket_holder) should be
+        # reminded. No taker stamped -> unchanged target-based behaviour.
+        if isinstance(target, str) and target.startswith("role:"):
+            holder = ticket_holder(fields)
+            if holder and holder != agent:
+                continue
         tickets.append(TicketInfo(
             id=fields.get("id", path.stem),
             title=t.title,
@@ -2236,11 +2395,12 @@ def _list_active_tickets_for_agent(agent: str) -> list[TicketInfo]:
 
 def _format_active_surface_prompt(ticket: TicketInfo, agent: str) -> str:
     """Format the check-in nudge prompt for an already-active ticket."""
-    ask = _ask_body(ticket.body)
+    # T-4382: same untrusted fields as format_prompt, same pane destination.
+    ask = neutralize_at_mentions(_ask_body(ticket.body))
     return (
         ACTIVE_SURFACE_PROMPT
         .replace("T-NNNN", ticket.id)
-        .replace("<title>", ticket.title)
+        .replace("<title>", neutralize_at_mentions(ticket.title))
         .replace("<agent>", agent)
         .replace("<body>", ask)
     )
@@ -2546,6 +2706,12 @@ def _send_to_recovery_pane_diagnosed(text: str) -> tuple[bool, str]:
         blocker = None
     if blocker:
         return False, f"target={recovery_target} refused: {blocker} (T-4591)"
+    # T-4382: every Recovery-bound alert from ~40 fleet callers lands here, and many
+    # interpolate untrusted text (mail subjects and senders, ticket titles, pane
+    # captures) into a message pasted into Recovery's live composer, where an '@<path>'
+    # token loads the file pre-model. Alerts are machine-composed and never mean an
+    # @-mention, so the whole text is neutralized at this one pane boundary.
+    text = neutralize_at_mentions(str(text))
     try:
         result = subprocess.run(
             [str(_SEND_KEYS_HELPER), recovery_target, text],

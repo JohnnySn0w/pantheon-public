@@ -1,0 +1,36 @@
+# action-broker component contract (ORG-080 §2; T-5948).
+#
+# WRAPS the legacy T-2920 install (tools/host_broker_install.py plan,
+# tools/host_broker_install_apply.py apply/verify/rollback) without rewriting it
+# (ORG-080 A-5). The install leg is OBSERVE-AND-ATTEST: the planner
+# (action-broker.py) reads the legacy receipt + verify result the handler
+# (action-broker_handlers.py) observed, refuses unless they show a healthy
+# install, and plans one seat op that attests that evidence (the only mutation is
+# an attestation entry in the handler's own state). The engine never installs the
+# broker: the live install stays the head role's supervised root run
+# (T-2920 / T-2925). Only the SIMULATED handler is registered; there is no live
+# evidence reader yet, so on a real host the leg refuses (the broker is not
+# installed). No broker_runtime kinds here (the ORG-082 gate-32a subset is
+# broker-daemon work).
+component:
+  id: action-broker
+  steward: codex
+  version: 1
+  planner_kind: python
+  contract_digest: sha256:8ad04c575ae36d6b145bb9fcbbfa18e0fc6e5c5757b1b84fd5f4b1f4d6c94e29
+  handlers_digest: sha256:0f0d95a9445e80932c653cd2862fe5a853bd2971745d5ce584cbeaf3cd9f530b
+  # Empty on purpose (T-5948 D3). The broker's substrate family entries go through
+  # host-substrate's RootHelper INSIDE the T-2920 supervised run, not through an
+  # engine host-substrate install. Declaring host-substrate now would make
+  # action-broker unplannable until host-substrate has its own engine install
+  # record. Follow-up T-5953 adds host-substrate here once that record exists.
+  depends_on: []
+  scopes: [system]
+  privilege:
+    seat: [action-broker.adopt-attest]
+  legs:
+    install: plan_install
+  gates:
+    - {id: adopt-legacy-install, irreversible: false, note: "attest an existing healthy T-2920 install; the engine installs nothing", approval: {class: operator}}
+  receipts:
+    schema: pantheon-receipt/v1

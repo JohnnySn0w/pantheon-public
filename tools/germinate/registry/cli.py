@@ -8,9 +8,12 @@ import sys
 from pathlib import Path
 from typing import TextIO
 
+import yaml
+
 from tools.germinate.registry import adr_link, render
 from tools.germinate.registry.load import RegistryLoadError, load_file
 from tools.germinate.registry.validate import REGISTRY_REL, Finding, errors, validate_repo
+from tools.remote_resolve import RemoteResolveError, load_production_manifest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -43,10 +46,28 @@ def _load(registry: Path) -> dict | None:
     return doc
 
 
+def _git_resolver(root: Path):
+    """The opt-in ORG-081 §7 resolver: URLs come through ``resolve_remote`` (seat pin, host binding)."""
+    from tools.germinate.registry.git_resolver import GitExternalResolver
+    from tools.remote_resolve import resolve_remote
+
+    manifest = load_production_manifest(repo_root=root)
+    return GitExternalResolver(lambda repo: resolve_remote(repo, manifest=manifest).url)
+
+
 def _cmd_validate(args: argparse.Namespace) -> int:
     root, registry = _paths(args)
     today = _dt.date.fromisoformat(args.today) if args.today else None
-    findings = validate_repo(root, registry=registry, today=today)
+    if getattr(args, "resolve_external", False):
+        try:
+            resolver = _git_resolver(root)
+        except (RemoteResolveError, OSError, yaml.YAMLError) as exc:
+            print(f"error: --resolve-external: cannot load the repos.yaml manifest: {exc}", file=sys.stderr)
+            return 1
+        with resolver:
+            findings = validate_repo(root, registry=registry, today=today, resolver=resolver)
+    else:
+        findings = validate_repo(root, registry=registry, today=today, resolver=None)
     rc = _report(findings, sys.stderr)
     if rc == 0:
         print(f"ok: {registry} is valid ({len(findings)} warning(s))")
@@ -158,6 +179,12 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     p = sub.add_parser("validate", help="schema, enum, evidence, reference and alias checks")
     common(p)
     p.add_argument("--today", help="YYYY-MM-DD used for alias expiry (default: today)")
+    p.add_argument(
+        "--resolve-external",
+        action="store_true",
+        help="fetch each external contract at its repos.yaml revision pin (network; needs the seat manifest pin, "
+        "ORG-081 §7). Default off: every external row stays fail-closed",
+    )
     p.set_defaults(func=_cmd_validate)
 
     p = sub.add_parser("render", help="print the ORG-068 coverage matrix as markdown")
@@ -185,3 +212,9 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     mode.add_argument("--tree", action="store_true", help="state check over every ORG ADR (the default)")
     mode.add_argument("--diff", metavar="FILE", help="creation check over a unified diff (FILE, or - for stdin)")
     p.set_defaults(func=_cmd_lint_adrs)
+
+
+if __name__ == "__main__":  # T-5989: the module form runs the `registry` group, never a silent exit 0
+    from tools.germinate.cli import main as _germinate_main
+
+    sys.exit(_germinate_main(["registry", *sys.argv[1:]]))

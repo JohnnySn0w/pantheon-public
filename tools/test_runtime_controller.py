@@ -41,6 +41,7 @@ from tools.harness_adapter.types import (
     HarnessLaunchConfig,
     PostStartAssessment,
     PostStartCommand,
+    ProviderCompletionAssessment,
     RuntimeControllerConfig,
     TmuxTarget,
 )
@@ -54,6 +55,10 @@ from tools.harness_adapter.types import (
 )
 from tools import codex_modal
 from tools import runtime_controller as rc
+try:
+    from tools import _seat_state_isolation
+except ImportError:  # pragma: no cover
+    import _seat_state_isolation  # type: ignore[no-redef]
 from tools.harness_adapter import claude as claude_adapter_module
 from tools.harness_adapter import codex as codex_adapter_module
 from tools import mailbox
@@ -433,6 +438,38 @@ class ReceiverHandoffTests(unittest.TestCase):
 
             self.assertEqual(adapter.launch_cwd, root)
             self.assertEqual(observed["cwd"], root)
+
+    def _launch_argv(self, root: Path, harness: str) -> tuple[str, ...]:
+        binding = _binding(root, harness=harness)
+        observed: dict[str, tuple[str, ...]] = {}
+
+        def start_new_server(target, *, cwd, command_argv, scope_unit, account_home, context=None):
+            del target, cwd, scope_unit, account_home, context
+            observed["argv"] = tuple(command_argv)
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+        with mock.patch.object(rc, "_default_tmux_server_pid", return_value=None), mock.patch.object(
+            rc, "_prepare_runtime_scope"
+        ), mock.patch.object(rc, "_start_new_server_in_scope", side_effect=start_new_server):
+            rc._start_runtime(binding, _RecordingAdapter(binding), replace=False)
+        return observed["argv"]
+
+    def test_start_runtime_injects_fleet_usage_mod_env_for_claude_seat(self) -> None:
+        # T-4533: the mod loads structurally; the seat name is the persona, not the unix user.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pantheon-config" / "tools" / "mods" / "fleet-usage").mkdir(parents=True)
+            argv = self._launch_argv(root, "claude")
+            self.assertIn("PANTHEON_FLEET_USAGE_SEAT=recovery", argv)
+            # T-4643 step 4: the mod loads from managed settings; no sideload env.
+            self.assertFalse([a for a in argv if a.startswith("CLAUDE_CODE_PLUGIN_DIRS=")], argv)
+
+    def test_start_runtime_does_not_inject_fleet_usage_env_for_codex_seat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pantheon-config" / "tools" / "mods" / "fleet-usage").mkdir(parents=True)
+            argv = self._launch_argv(root, "codex")
+            self.assertFalse([a for a in argv if a.startswith(("PANTHEON_FLEET_USAGE_SEAT=", "CLAUDE_CODE_PLUGIN_DIRS="))])
 
 
 def _binding(
@@ -1179,7 +1216,26 @@ class _PollerBackend(_ViabilityBackend):
         return ReceiverStateProof(state, {"harness": "codex"})
 
 
+@contextmanager
+def _provable_pane_extinct():
+    """T-6194: seam for failed-start cleanup (T-6180 pidfd-pinned shutdown).
+
+    Fixtures that legitimately reach ``_cleanup_failed_created_runtime`` have no
+    real tmux session, so inject a provable pane identity and an extinction
+    receipt.  ``_stop_created_scope*`` is deliberately NOT patched here.
+    """
+    with mock.patch("tools.harness._tmux_pane_identity",
+                    return_value=(4321, "appserver_supervise.py --controller-owned")), \
+            mock.patch("tools.harness._graceful_controller_owned_shutdown"):
+        yield
+
+
 class InitialViabilityTests(unittest.TestCase):
+    def setUp(self):
+        cm = _provable_pane_extinct()
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+
     def _selected_viability_receipt(self, *, persona: str = "recovery", runtime: str = "claude/primary") -> rc.RuntimeViabilityReceipt:
         harness, _, profile = runtime.partition("/")
         binding = _binding(Path("/tmp/runtime-fixture"), harness=harness, profile=profile)
@@ -4230,6 +4286,9 @@ class CandidateReceiverWindowT4332Tests(unittest.TestCase):
     LAUNCH = datetime(2026, 9, 29, 20, 0, 0, tzinfo=timezone.utc)
 
     def setUp(self):
+        cm = _provable_pane_extinct()
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
@@ -4727,7 +4786,8 @@ class ScopeStopT4338Tests(unittest.TestCase):
             binding = _binding(root, harness="codex")
             started = rc.RuntimeStart(self.SCOPE, True)
             not_ready = rc.RuntimeInputReadiness(False, "a" * 64, "not ready")
-            with mock.patch.object(rc, "_wait_for_runtime_input_ready", return_value=not_ready), \
+            with _provable_pane_extinct(), \
+                    mock.patch.object(rc, "_wait_for_runtime_input_ready", return_value=not_ready), \
                     mock.patch.object(rc, "_stop_created_scope", side_effect=rc.ScopeStopRefused("denied")):
                 with self.assertRaises(rc.RuntimeOperationalFailure) as caught:
                     rc._verify_runtime_input_ready(binding, started, state_root=root)
@@ -8332,12 +8392,14 @@ class RuntimeLifecycleTests(unittest.TestCase):
         argv = run.call_args.args
         self.assertEqual(argv[:6], ("respawn-pane", "-k", "-t", "pantheon-recovery:harness.0", "-c", "/tmp/cwd with space"))
         self.assertEqual(
-            argv[-8:],
+            argv[-10:],
             (
                 "/usr/bin/env",
                 "--unset=PANTHEON_INSTANCE_MANIFEST",
+                "--unset=CLAUDE_CODE_RETRY_WATCHDOG",
                 "--",
                 "PATH=/tmp/t2950-account/.bun/bin:/tmp/t2950-account/.npm-global/bin:/usr/local/bin:/usr/bin:/bin",
+                "PANTHEON_FLEET_USAGE_SEAT=recovery",  # T-4643 step 4: injected whenever the persona is known
                 "PANTHEON_TEST=env value with space",
                 "/usr/bin/claude",
                 "--model",
@@ -8358,7 +8420,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
 
         argv = run.call_args.args
         self.assertEqual(argv[:6], ("respawn-pane", "-k", "-t", "pantheon-recovery:harness.0", "-c", "/tmp/t2950-replace-account"))
-        self.assertEqual(argv[6:10], ("/usr/bin/env", "--unset=PANTHEON_INSTANCE_MANIFEST", "--", "PATH=/tmp/t2950-replace-account/.bun/bin:/tmp/t2950-replace-account/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"))
+        self.assertEqual(argv[6:11], ("/usr/bin/env", "--unset=PANTHEON_INSTANCE_MANIFEST", "--unset=CLAUDE_CODE_RETRY_WATCHDOG", "--", "PATH=/tmp/t2950-replace-account/.bun/bin:/tmp/t2950-replace-account/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"))
 
     def test_codex_harness_ensures_project_trusted_with_resolved_cwd(self) -> None:
         # T-2594: the TRUST-modal-safety config lever. Must be called with
@@ -8588,7 +8650,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
         self.assertFalse(started.created_scope)
         argv = tmux.call_args.args
         self.assertEqual(argv[:8], ("new-session", "-d", "-s", "pantheon-recovery", "-n", "harness", "-c", "/tmp/t2950-new-session-account"))
-        self.assertEqual(argv[8:12], ("/usr/bin/env", "--unset=PANTHEON_INSTANCE_MANIFEST", "--", "PATH=/tmp/t2950-new-session-account/.bun/bin:/tmp/t2950-new-session-account/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"))
+        self.assertEqual(argv[8:13], ("/usr/bin/env", "--unset=PANTHEON_INSTANCE_MANIFEST", "--unset=CLAUDE_CODE_RETRY_WATCHDOG", "--", "PATH=/tmp/t2950-new-session-account/.bun/bin:/tmp/t2950-new-session-account/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"))
         scoped_start.assert_not_called()
 
     def test_existing_scoped_server_new_window_injects_scope_path(self) -> None:
@@ -8611,7 +8673,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
         self.assertFalse(started.created_scope)
         argv = tmux.call_args.args
         self.assertEqual(argv[:8], ("new-window", "-d", "-t", "pantheon-recovery", "-n", "harness", "-c", "/tmp/t2950-new-window-account"))
-        self.assertEqual(argv[8:12], ("/usr/bin/env", "--unset=PANTHEON_INSTANCE_MANIFEST", "--", "PATH=/tmp/t2950-new-window-account/.bun/bin:/tmp/t2950-new-window-account/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"))
+        self.assertEqual(argv[8:13], ("/usr/bin/env", "--unset=PANTHEON_INSTANCE_MANIFEST", "--unset=CLAUDE_CODE_RETRY_WATCHDOG", "--", "PATH=/tmp/t2950-new-window-account/.bun/bin:/tmp/t2950-new-window-account/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"))
 
     def test_new_server_uses_exact_scope_and_direct_runtime_argv(self) -> None:
         binding = _binding(Path("/tmp"))
@@ -8646,10 +8708,11 @@ class RuntimeLifecycleTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            argv[-7:],
+            argv[-8:],
             [
                 "/usr/bin/env",
                 "--unset=PANTHEON_INSTANCE_MANIFEST",
+                "--unset=CLAUDE_CODE_RETRY_WATCHDOG",
                 "--",
                 "PANTHEON_TEST=env value with space",
                 "/usr/bin/codex",
@@ -8701,8 +8764,19 @@ class RuntimeLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(
             argv,
-            ("/usr/bin/env", "--", "PANTHEON_INSTANCE_MANIFEST=/chosen/instance.yaml", "/usr/bin/true"),
+            ("/usr/bin/env", "--unset=CLAUDE_CODE_RETRY_WATCHDOG", "--",
+             "PANTHEON_INSTANCE_MANIFEST=/chosen/instance.yaml", "/usr/bin/true"),
         )
+
+    def test_runtime_command_argv_strips_inherited_retry_watchdog(self) -> None:
+        # T-5584: watchdog mode hides the cap modal, so a launched seat must never inherit it.
+        argv = rc._runtime_command_argv(
+            ("/usr/bin/python3", "-c", "import os; print(os.environ.get('CLAUDE_CODE_RETRY_WATCHDOG', 'unset'))"),
+            {},
+        )
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_RETRY_WATCHDOG": "1"}):
+            out = subprocess.run(argv, capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out.strip(), "unset")
 
     def test_runtime_command_argv_inherits_scope_path_in_child_process(self) -> None:
         argv = rc._runtime_command_argv(
@@ -9654,6 +9728,348 @@ class RuntimeLifecycleTests(unittest.TestCase):
             load.assert_called_once_with(
                 root / "instance.yaml", primary, "codex/fallback"
             )
+
+    def test_stale_planned_quota_preparing_selects_live_cap_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            primary = _binding(
+                root,
+                harness="claude",
+                profile="primary",
+                fallbacks=("codex/fallback",),
+            )
+            fallback = _binding(root, harness="codex", profile="fallback")
+            now = datetime(2099, 11, 1, tzinfo=timezone.utc)
+            cooldown_until = now + timedelta(days=2)
+            rc.record_last_attempt(
+                primary.persona,
+                primary,
+                outcome="failed",
+                failure_class="subscription_cap",
+                state_root=root,
+                now=now,
+                cooldown_until_override=cooldown_until,
+            )
+            rc._atomic_json(
+                rc._transition_path(primary.persona, root),
+                {
+                    "schema": "pantheon-runtime-transition/v1",
+                    "transition_id": "stale-planned-quota",
+                    "phase": "preparing",
+                    "trigger": "planned-quota",
+                    "runtime_swapped": False,
+                    "outgoing_harness": "claude",
+                    "outgoing_profile": "primary",
+                    "incoming_harness": "codex",
+                    "incoming_profile": "fallback",
+                },
+            )
+
+            with mock.patch.object(
+                persona_bringup,
+                "configured_runtime_bindings",
+                return_value=(primary, fallback),
+            ), mock.patch.object(
+                rc,
+                "_match_live_binding",
+                return_value=(fallback, 1795681, ["/usr/bin/codex"]),
+            ):
+                selected = persona_bringup.select_recorded_runtime_binding(
+                    root / "instance.yaml",
+                    primary,
+                    state_dir=root,
+                )
+
+            self.assertIs(selected, fallback)
+            attempt = rc.load_last_attempt(
+                primary.persona,
+                "claude--primary",
+                state_root=root,
+            )
+            self.assertEqual(attempt["cooldown_until"], "2099-11-03T00:00:00Z")
+            state = rc.transition_state(primary.persona, state_root=root)
+            self.assertEqual(state["phase"], "completed")
+            self.assertEqual(
+                state["reconciliation_reason"],
+                "stale-preparing-live-runtime-mismatch",
+            )
+            self.assertTrue(state["runtime_reconciled"])
+            self.assertFalse(state["runtime_swapped"])
+            self.assertTrue(state["fallback_active"])
+            self.assertEqual(state["reconciled_live_runtime"], "codex/fallback")
+            quota_result = persona_bringup.quota_check(
+                primary,
+                adapter=_Adapter(primary),
+                fallback_binding=fallback,
+                primary_binding=primary,
+                state_dir=root,
+                cwd=root,
+                now=now,
+                manifest_path=root / "instance.yaml",
+            )
+            self.assertEqual(quota_result.decision, "fallback-active-noop")
+            self.assertFalse(quota_result.acted)
+            evidence = [
+                json.loads(line)
+                for line in rc._evidence_log_path(primary.persona, root)
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(evidence[-1]["event"], "stale_preparing_transition_reconciled")
+            self.assertEqual(evidence[-1]["recorded_outgoing"], "claude/primary")
+            self.assertEqual(evidence[-1]["live_runtime"], "codex/fallback")
+            with mock.patch.object(
+                persona_bringup,
+                "load_runtime_reference",
+                return_value=fallback,
+            ) as load:
+                selected_again = persona_bringup.select_recorded_runtime_binding(
+                    root / "instance.yaml",
+                    primary,
+                    state_dir=root,
+                )
+            self.assertIs(selected_again, fallback)
+            load.assert_called_once_with(
+                root / "instance.yaml", primary, "codex/fallback"
+            )
+
+    def test_stale_preparing_with_unresolved_runtime_mutation_is_not_cleaned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            primary = _binding(
+                root,
+                harness="claude",
+                profile="primary",
+                fallbacks=("codex/fallback",),
+            )
+            fallback = _binding(root, harness="codex", profile="fallback")
+            transition = {
+                "schema": "pantheon-runtime-transition/v1",
+                "transition_id": "possibly-mutated",
+                "phase": "preparing",
+                "trigger": "planned-quota",
+                "runtime_swapped": False,
+                "outgoing_harness": "claude",
+                "outgoing_profile": "primary",
+                "incoming_harness": "codex",
+                "incoming_profile": "fallback",
+                "runtime_mutation": {
+                    "status": "started-unverified",
+                    "pane_may_be_mutated": True,
+                },
+            }
+            rc._atomic_json(rc._transition_path(primary.persona, root), transition)
+            rc.record_last_attempt(
+                primary.persona,
+                primary,
+                outcome="failed",
+                failure_class="subscription_cap",
+                state_root=root,
+                now=datetime(2099, 11, 1, tzinfo=timezone.utc),
+                cooldown_until_override=datetime(2099, 11, 3, tzinfo=timezone.utc),
+            )
+
+            with mock.patch.object(
+                persona_bringup,
+                "configured_runtime_bindings",
+                return_value=(primary, fallback),
+            ), mock.patch.object(
+                rc,
+                "_match_live_binding",
+                return_value=(fallback, 1795681, ["/usr/bin/codex"]),
+            ):
+                selected = persona_bringup.select_recorded_runtime_binding(
+                    root / "instance.yaml",
+                    primary,
+                    state_dir=root,
+                )
+
+            self.assertIs(selected, primary)
+            self.assertEqual(
+                rc.transition_state(primary.persona, state_root=root),
+                transition,
+            )
+            self.assertFalse(rc._evidence_log_path(primary.persona, root).exists())
+
+    def test_stale_planned_quota_reconcile_guards_fail_closed(self) -> None:
+        """Each guard of the stale planned-quota repair, flipped alone, leaves the
+        transition record and evidence untouched and falls to normal selection."""
+
+        far = "2099-11-03T00:00:00Z"
+
+        def refused(_candidates):
+            raise rc._ReconcileRefused("ambiguous")
+
+        def probe_failed(_candidates):
+            raise RuntimeError("tmux pane probe failed (rc 1): boom")
+
+        # name -> (transition overrides, attempt overrides | None to drop attempt,
+        #          outgoing/incoming overrides handled via transition, live ref,
+        #          expected: "primary" | "no-longer-allowed")
+        cases = {
+            "cooldown-expired": ({}, {"cooldown_until": "2000-01-01T00:00:00Z"}, "fallback", "primary"),
+            "cooldown-naive": ({}, {"cooldown_until": "2099-11-03T00:00:00"}, "fallback", "primary"),
+            "cooldown-missing": ({}, {"cooldown_until": None}, "fallback", "primary"),
+            "outcome-not-failed": ({}, {"outcome": "success"}, "fallback", "primary"),
+            "failure-class-not-cap": ({}, {"failure_class": "runtime_blocked"}, "fallback", "primary"),
+            "no-last-attempt": ({}, None, "fallback", "primary"),
+            "handoff-requested": ({"handoff_requested": True}, {}, "fallback", "primary"),
+            "trigger-not-planned-quota": ({"trigger": "forced-cap"}, {}, "fallback", "primary"),
+            "runtime-swapped": ({"runtime_swapped": True}, {}, "fallback", "primary"),
+            "phase-not-preparing": ({"phase": "recovered"}, {}, "fallback", "primary"),
+            "outgoing-differs-from-binding": (
+                {"outgoing_harness": "codex", "outgoing_profile": "other"},
+                {},
+                "fallback",
+                "no-longer-allowed",
+            ),
+            "live-equals-outgoing": (
+                {"incoming_harness": "claude", "incoming_profile": "primary"},
+                {},
+                "primary",
+                "primary",
+            ),
+            "live-matches-neither": ({}, {}, "third", "primary"),
+            "live-match-refused": ({}, {}, refused, "primary"),
+            "live-probe-runtime-error": ({}, {}, probe_failed, "primary"),
+        }
+
+        for name, (t_over, a_over, live, expected) in cases.items():
+            with self.subTest(guard=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                primary = _binding(
+                    root, harness="claude", profile="primary", fallbacks=("codex/fallback",)
+                )
+                fallback = _binding(root, harness="codex", profile="fallback")
+                third = _binding(root, harness="codex", profile="third")
+                persona = primary.persona
+                # Real writer: the planned-quota barrier exactly as quota-check opens it.
+                rc.begin_planned_transition(
+                    persona,
+                    outgoing_harness="claude",
+                    outgoing_profile="primary",
+                    incoming_harness="codex",
+                    incoming_profile="fallback",
+                    message_id="msg-1",
+                    primary_resets_at=far,
+                    quota_evidence={"source": "test"},
+                    state_root=root,
+                )
+                state = rc.transition_state(persona, state_root=root)
+                state.update(t_over)
+                rc._atomic_json(rc._transition_path(persona, root), state)
+                if a_over is not None:
+                    now = datetime(2099, 11, 1, tzinfo=timezone.utc)
+                    rc.record_last_attempt(
+                        persona,
+                        primary,
+                        outcome="failed",
+                        failure_class="subscription_cap",
+                        state_root=root,
+                        now=now,
+                        cooldown_until_override=datetime(2099, 11, 3, tzinfo=timezone.utc),
+                    )
+                    path = rc._last_attempt_path(persona, "claude--primary", state_root=root)
+                    record = json.loads(path.read_text(encoding="utf-8"))
+                    record.update(a_over)
+                    path.write_text(json.dumps(record), encoding="utf-8")
+
+                tpath = rc._transition_path(persona, root)
+                epath = rc._evidence_log_path(persona, root)
+                before_bytes = tpath.read_bytes()
+                before_evidence = epath.read_bytes()
+
+                if callable(live):
+                    live_patch = mock.patch.object(rc, "_match_live_binding", side_effect=live)
+                else:
+                    live_binding = {"fallback": fallback, "primary": primary, "third": third}[live]
+                    live_patch = mock.patch.object(
+                        rc,
+                        "_match_live_binding",
+                        return_value=(live_binding, 1795681, ["/usr/bin/x"]),
+                    )
+                with mock.patch.object(
+                    persona_bringup,
+                    "configured_runtime_bindings",
+                    return_value=(primary, fallback, third),
+                ), live_patch, mock.patch.object(
+                    persona_bringup, "load_runtime_reference", return_value=fallback
+                ):
+                    if expected == "no-longer-allowed":
+                        with self.assertRaisesRegex(ValueError, "no longer allowed"):
+                            persona_bringup.select_recorded_runtime_binding(
+                                root / "instance.yaml", primary, state_dir=root
+                            )
+                    else:
+                        selected = persona_bringup.select_recorded_runtime_binding(
+                            root / "instance.yaml", primary, state_dir=root
+                        )
+                        self.assertIs(selected, primary if expected == "primary" else fallback)
+
+                self.assertEqual(tpath.read_bytes(), before_bytes)
+                self.assertEqual(epath.read_bytes(), before_evidence)
+                self.assertNotIn(b"stale_preparing_transition_reconciled", epath.read_bytes())
+
+    def test_stale_planned_quota_reconcile_busy_lock_is_non_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            primary = _binding(
+                root, harness="claude", profile="primary", fallbacks=("codex/fallback",)
+            )
+            fallback = _binding(root, harness="codex", profile="fallback")
+            persona = primary.persona
+            rc.begin_planned_transition(
+                persona,
+                outgoing_harness="claude",
+                outgoing_profile="primary",
+                incoming_harness="codex",
+                incoming_profile="fallback",
+                message_id="msg-1",
+                primary_resets_at="2099-11-03T00:00:00Z",
+                quota_evidence={"source": "test"},
+                state_root=root,
+            )
+            rc.record_last_attempt(
+                persona,
+                primary,
+                outcome="failed",
+                failure_class="subscription_cap",
+                state_root=root,
+                now=datetime(2099, 11, 1, tzinfo=timezone.utc),
+                cooldown_until_override=datetime(2099, 11, 3, tzinfo=timezone.utc),
+            )
+            tpath = rc._transition_path(persona, root)
+            epath = rc._evidence_log_path(persona, root)
+            before_bytes = tpath.read_bytes()
+            before_evidence = epath.read_bytes()
+            real_lock = rc.persona_operation_lock
+            seen: list[object] = []
+
+            def bounded_lock(*args, **kwargs):
+                seen.append(kwargs.get("blocking", True))
+                # Bound the wait so a regression to blocking=True fails instead of hanging.
+                return real_lock(*args, **{**kwargs, "timeout_seconds": 0.3})
+
+            with real_lock(persona, state_root=root, blocking=False):
+                with mock.patch.object(
+                    rc, "persona_operation_lock", side_effect=bounded_lock
+                ), mock.patch.object(
+                    persona_bringup,
+                    "configured_runtime_bindings",
+                    return_value=(primary, fallback),
+                ), mock.patch.object(
+                    rc,
+                    "_match_live_binding",
+                    return_value=(fallback, 1795681, ["/usr/bin/codex"]),
+                ):
+                    selected = persona_bringup.select_recorded_runtime_binding(
+                        root / "instance.yaml", primary, state_dir=root
+                    )
+
+            self.assertEqual(seen, [False])
+            self.assertIs(selected, primary)
+            self.assertEqual(tpath.read_bytes(), before_bytes)
+            self.assertEqual(epath.read_bytes(), before_evidence)
 
     def test_primary_recovery_requires_reset_and_fresh_post_reset_health(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -10743,10 +11159,10 @@ class VerifyRuntimeInputReadyTests(unittest.TestCase):
             )
             with mock.patch.object(
                 rc, "_wait_for_runtime_input_ready", return_value=readiness
-            ), mock.patch.object(rc, "_stop_created_scope") as stop:
+            ), mock.patch.object(rc, "_cleanup_failed_created_runtime") as cleanup:
                 with self.assertRaisesRegex(RuntimeError, "input readiness"):
                     rc._verify_runtime_input_ready(binding, started, state_root=root)
-            stop.assert_called_once_with(rc.TMUX_RUNTIME_SCOPE_UNIT)
+            cleanup.assert_called_once_with(binding, started, context=None)
             records = _read_jsonl(
                 root / "recovery" / "runtime-controller" / "controller-evidence.jsonl"
             )
@@ -10765,10 +11181,83 @@ class VerifyRuntimeInputReadyTests(unittest.TestCase):
             )
             with mock.patch.object(
                 rc, "_wait_for_runtime_input_ready", return_value=readiness
-            ), mock.patch.object(rc, "_stop_created_scope") as stop:
+            ), mock.patch.object(rc, "_cleanup_failed_created_runtime") as cleanup:
                 with self.assertRaises(RuntimeError):
                     rc._verify_runtime_input_ready(binding, started, state_root=root)
+            cleanup.assert_not_called()
+
+    def test_failed_created_runtime_proves_wrapper_extinct_before_scope_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binding = _binding(Path(tmp))
+            started = rc.RuntimeStart("created.scope", True)
+            order = []
+            with mock.patch("tools.harness._tmux_pane_identity",
+                            side_effect=lambda session: order.append("identity") or
+                            (4321, "appserver_supervise.py --controller-owned")), \
+                    mock.patch("tools.harness._graceful_controller_owned_shutdown",
+                               side_effect=lambda *a: order.append("extinct")), \
+                    mock.patch.object(rc, "_stop_created_scope_best_effort",
+                                      side_effect=lambda unit: order.append("scope")):
+                rc._cleanup_failed_created_runtime(binding, started)
+            self.assertEqual(order, ["identity", "extinct", "scope"])
+
+    def test_failed_created_runtime_timeout_never_stops_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binding = _binding(Path(tmp))
+            started = rc.RuntimeStart("created.scope", True)
+            with mock.patch("tools.harness._tmux_pane_identity", return_value=(
+                    4321, "appserver_supervise.py --controller-owned")), \
+                    mock.patch("tools.harness._graceful_controller_owned_shutdown",
+                               side_effect=RuntimeError("pinned wrapper remained live")), \
+                    mock.patch.object(rc, "_stop_created_scope_best_effort") as stop:
+                with self.assertRaisesRegex(RuntimeError, "remained live"):
+                    rc._cleanup_failed_created_runtime(binding, started)
             stop.assert_not_called()
+
+    def test_failed_created_runtime_unprovable_identity_never_kills_or_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binding = _binding(Path(tmp))
+            started = rc.RuntimeStart("created.scope", True)
+            from tools.harness_state import HarnessStateError
+            with mock.patch("tools.harness._tmux_pane_identity",
+                            side_effect=HarnessStateError("cannot prove pane identity")), \
+                    mock.patch("tools.harness._graceful_controller_owned_shutdown") as shutdown, \
+                    mock.patch.object(rc, "_stop_created_scope_best_effort") as stop, \
+                    mock.patch.object(rc, "_stop_created_scope") as stop_hard, \
+                    mock.patch.object(rc, "_run_tmux") as tmux, \
+                    mock.patch("subprocess.run") as sub:
+                with self.assertRaisesRegex(Exception, "cannot prove pane identity"):
+                    rc._cleanup_failed_created_runtime(binding, started)
+            shutdown.assert_not_called()
+            stop.assert_not_called()
+            stop_hard.assert_not_called()
+            tmux.assert_not_called()
+            sub.assert_not_called()
+
+    def test_appserver_readiness_behavior_survives_past_bare_deadline(self) -> None:
+        self.assertGreaterEqual(rc.APP_SERVER_INPUT_READY_TIMEOUT_SECONDS, 2 * 30 + 10)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binding = _binding(root, harness="codex")
+            adapter = mock.Mock()
+            adapter.appserver_input_readiness_enabled.return_value = True
+            adapter.appserver_input_ready.side_effect = [False, True]
+            with mock.patch.object(rc, "_runtime_alive", return_value=True), \
+                    mock.patch.object(rc.time, "monotonic", side_effect=[0.0, 71.0]), \
+                    mock.patch.object(rc.time, "sleep"):
+                rc._verify_runtime_input_ready(
+                    binding, rc.RuntimeStart("scope", False), state_root=root, adapter=adapter,
+                )
+            self.assertEqual(adapter.appserver_input_ready.call_count, 2)
+
+    def test_bare_readiness_still_times_out_at_twenty_seconds(self) -> None:
+        target = rc.TmuxTarget("pantheon-recovery", "harness", "0")
+        with mock.patch.object(rc, "_capture_visible_runtime_pane", return_value="not ready"), \
+                mock.patch.object(rc.time, "monotonic", side_effect=[0.0, 21.0]), \
+                mock.patch.object(rc.time, "sleep"):
+            result = rc._wait_for_runtime_input_ready(target)
+        self.assertFalse(result.ready)
+        self.assertEqual(result.reason, "runtime input readiness timed out")
 
     def test_subscription_cap_evidence_includes_reset_at_and_cap_kind(self) -> None:
         """T-4047: the derived (never-raw-text) reset_at/cap_kind fields
@@ -10858,12 +11347,12 @@ class RuntimeInputReadinessControllerWiringTests(unittest.TestCase):
             ), mock.patch.object(
                 rc.time, "monotonic", side_effect=[0.0, 100.0]
             ), mock.patch.object(rc.time, "sleep"), mock.patch.object(
-                rc, "_stop_created_scope"
-            ) as stop, _provenance_patch():
+                rc, "_cleanup_failed_created_runtime"
+            ) as cleanup, _provenance_patch():
                 with self.assertRaisesRegex(RuntimeError, "input readiness"):
                     rc.ensure_runtime(binding, _Adapter(binding), state_root=root)
             self.assertFalse(state_path.exists())
-            stop.assert_called_once_with(rc.TMUX_RUNTIME_SCOPE_UNIT)
+            cleanup.assert_called_once_with(binding, mock.ANY, context=None)
 
     def test_replace_runtime_publishes_after_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -10902,11 +11391,11 @@ class RuntimeInputReadinessControllerWiringTests(unittest.TestCase):
             ), mock.patch.object(
                 rc.time, "monotonic", side_effect=[0.0, 100.0]
             ), mock.patch.object(rc.time, "sleep"), mock.patch.object(
-                rc, "_stop_created_scope"
-            ) as stop, _provenance_patch():
+                rc, "_cleanup_failed_created_runtime"
+            ) as cleanup, _provenance_patch():
                 with self.assertRaisesRegex(RuntimeError, "input readiness"):
                     rc._replace_runtime(target, state_root=root)
-            stop.assert_called_once_with(rc.TMUX_RUNTIME_SCOPE_UNIT)
+            cleanup.assert_called_once_with(target, mock.ANY, context=None)
             self.assertTrue(state_path.exists())
             self.assertEqual(json.loads(state_path.read_text()), {})
 
@@ -12649,6 +13138,35 @@ class DurableStateHelperTests(unittest.TestCase):
             # clearing twice must not raise (spec: cleared on tmux-death observation)
             rc.clear_active_runtime("orchestrator", state_root=root)
 
+    def test_owned_clear_removes_only_the_exact_runtime_incarnation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binding = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            old = rc.RuntimeHandle(
+                binding.launch, binding.controller.tmux, None,
+                datetime(2026, 10, 30, 10, 0, tzinfo=timezone.utc), pid=1033767,
+            )
+            restarted = rc.RuntimeHandle(
+                binding.launch, binding.controller.tmux, None,
+                datetime(2026, 10, 30, 10, 1, tzinfo=timezone.utc), pid=1038879,
+            )
+
+            rc.write_active_runtime("orchestrator", binding, old, pid=old.pid, state_root=root)
+            self.assertTrue(rc.clear_active_runtime_if_owned(
+                "orchestrator", binding, old, state_root=root,
+            ))
+            self.assertEqual(rc.read_active_runtime("orchestrator", state_root=root), {})
+
+            rc.write_active_runtime(
+                "orchestrator", binding, restarted, pid=restarted.pid, state_root=root,
+            )
+            self.assertFalse(rc.clear_active_runtime_if_owned(
+                "orchestrator", binding, old, state_root=root,
+            ))
+            cache = rc.read_active_runtime("orchestrator", state_root=root)
+            self.assertEqual(cache["runtime"], "claude/anthropic-code")
+            self.assertEqual(cache["pid"], 1038879)
+
     def test_last_attempt_missing_returns_none(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             self.assertIsNone(rc.load_last_attempt("orchestrator", "codex--interactive", state_root=Path(tmp)))
@@ -13301,14 +13819,153 @@ class ControllerStartRuntimePostStartTests(unittest.TestCase):
             with stack, mock.patch.object(
                 rc, "_verify_runtime_input_ready"
             ) as ready, mock.patch.object(
+                rc, "_assess_provider_completion_after_input_ready",
+                return_value=SimpleNamespace(status="provider-completed"),
+            ) as assess_provider, mock.patch.object(
+                rc, "_raise_for_provider_completion_assessment"
+            ) as require_provider, mock.patch.object(
                 rc, "_run_and_assess_post_start"
             ) as helper, mock.patch.object(rc, "_pane_process_pid", return_value=9) as pid:
                 manager.attach_mock(ready, "ready")
+                manager.attach_mock(assess_provider, "assess_provider")
+                manager.attach_mock(require_provider, "require_provider")
                 manager.attach_mock(helper, "post_start")
                 manager.attach_mock(pid, "pid")
                 runtime_start, _handle = rc._controller_start_runtime(binding, state_root=root)
-            self.assertEqual([c[0] for c in manager.mock_calls], ["ready", "post_start", "pid"])
+            self.assertEqual(
+                [c[0] for c in manager.mock_calls],
+                ["ready", "assess_provider", "require_provider", "post_start", "pid"],
+            )
+            assess_provider.assert_called_once_with(binding, mock.ANY, state_root=root)
+            require_provider.assert_called_once_with(binding, runtime_start, mock.ANY)
             helper.assert_called_once_with(binding, runtime_start, mock.ANY, state_root=root)
+
+    def test_provider_completion_cap_rejects_start_before_hooks_and_pid_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binding = self._post_start_binding(root)
+            assessment = ProviderCompletionAssessment(
+                schema="pantheon-harness-provider-completion/v1",
+                harness="claude",
+                profile="anthropic-code",
+                status="subscription-cap",
+                cause="provider-completion-subscription-cap",
+                pattern_id="claude-monthly-spend-limit-modal",
+                nonce_sha256="a" * 64,
+                prompt_sha256="b" * 64,
+                statusline_baseline_sha256=None,
+                statusline_observed_sha256=None,
+                capture_count=1,
+                changed_capture_indices=(),
+                cap_kind="monthly-spend-limit",
+                reset_at=datetime(2026, 11, 8, 17, 0, tzinfo=timezone.utc),
+            )
+            stack, _start, _capture = self._start_patches(binding)
+            with stack, mock.patch.object(
+                rc, "_assess_provider_completion_after_input_ready", return_value=assessment
+            ) as assess_provider, mock.patch.object(
+                rc, "_run_and_assess_post_start"
+            ) as post_start, mock.patch.object(
+                rc, "_pane_process_pid"
+            ) as pid, self.assertRaises(rc.RuntimeOperationalFailure) as raised:
+                rc._controller_start_runtime(binding, state_root=root)
+
+            self.assertEqual(raised.exception.failure_class, "subscription-cap")
+            self.assertEqual(
+                raised.exception.readiness_evidence["pattern_id"],
+                "claude-monthly-spend-limit-modal",
+            )
+            self.assertEqual(
+                raised.exception.readiness_evidence["reset_at"],
+                "2026-11-08T17:00:00Z",
+            )
+            assess_provider.assert_called_once()
+            post_start.assert_not_called()
+            pid.assert_not_called()
+
+    def test_existing_spend_modal_is_classified_before_probe_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binding = self._post_start_binding(root, post_start=())
+            modal = (
+                REPO_ROOT / "tools" / "testdata" / "orchestrator_spend_limit_modal_pane.txt"
+            ).read_text(encoding="utf-8").replace("Sep 27", "Nov 8")
+            adapter = ClaudeHarnessAdapter(
+                binding.role,
+                claude_home=binding.account_home,
+                launch=binding.launch,
+            )
+            with mock.patch.object(
+                rc, "_capture_visible_runtime_pane", return_value=modal
+            ), mock.patch.object(rc, "submit_to_runtime") as submit:
+                assessment = rc._assess_provider_completion_after_input_ready(
+                    binding,
+                    adapter,
+                    state_root=root,
+                    sleep=lambda _seconds: None,
+                )
+
+            self.assertEqual(assessment.status, "subscription-cap")
+            self.assertEqual(assessment.pattern_id, "claude-monthly-spend-limit-modal")
+            submit.assert_not_called()
+
+    def test_provider_completion_cap_reselects_fallback_in_same_invocation(self) -> None:
+        """T-6235: no systemd restart/operator repair gap after modal return."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = self._post_start_binding(root, post_start=())
+            codex = _binding(root, harness="codex", profile="interactive-chatgpt")
+            reset_at = datetime(2026, 11, 8, 17, 0, tzinfo=timezone.utc)
+            selected: list[str] = []
+
+            def start(binding):
+                runtime_ref = rc._binding_runtime_ref(binding)
+                selected.append(runtime_ref)
+                if binding.launch.harness == "claude":
+                    raise rc.RuntimeOperationalFailure(
+                        "monthly spend modal",
+                        failure_class="subscription-cap",
+                        cause="provider-completion-subscription-cap",
+                        binding_runtime=runtime_ref,
+                        runtime_start=rc.RuntimeStart(rc.TMUX_RUNTIME_SCOPE_UNIT, False),
+                        created_scope=False,
+                        pane_may_be_mutated=True,
+                        readiness_evidence={
+                            "event": "provider_completion_assessment",
+                            "provider_completion_status": "subscription-cap",
+                            "pattern_id": "claude-monthly-spend-limit-modal",
+                            "cap_kind": "monthly-spend-limit",
+                            "reset_at": rc._iso(reset_at),
+                        },
+                    )
+                return (
+                    rc.RuntimeStart(rc.TMUX_RUNTIME_SCOPE_UNIT, False),
+                    rc.RuntimeHandle(binding.launch, binding.controller.tmux, None, rc._utc_now()),
+                )
+
+            with mock.patch.object(rc, "_notify_runtime_swap") as notify:
+                result = rc.controller_main(
+                    "recovery",
+                    candidates=[claude, codex],
+                    state_root=root,
+                    now=lambda: datetime(2026, 11, 6, 1, 0, tzinfo=timezone.utc),
+                    sleep=lambda _seconds: None,
+                    start_runtime_fn=start,
+                    block_until_death_fn=lambda _binding: None,
+                    persist_record_fn=lambda *args, **kwargs: "persisted",
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                selected,
+                ["claude/anthropic-code", "codex/interactive-chatgpt"],
+            )
+            failed = rc.load_last_attempt(
+                "recovery", "claude--anthropic-code", state_root=root
+            )
+            self.assertEqual(failed["failure_class"], "subscription_cap")
+            self.assertEqual(failed["cooldown_until"], rc._iso(reset_at))
+            notify.assert_called_once()
 
     def test_attach_branch_runs_no_post_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -15112,6 +15769,62 @@ class ControllerStartCodexOverClaudeReceiverTests(unittest.TestCase):
                 "controller_start_selected_receiver_started", [e["event"] for e in self._events(root)]
             )
 
+    def test_provider_cap_return_to_codex_finishes_with_one_receiver(self) -> None:
+        """T-6235: rejected Claude return immediately restores Codex topology."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._record(root, "codex")
+            backend = _CodexSeatBackend(
+                watchdog=False,
+                poller=True,
+                snapshot={"watchdog": True, "complete": False},
+            )
+            claude = self._claude(root)
+            cap = ProviderCompletionAssessment(
+                schema="pantheon-harness-provider-completion/v1",
+                harness="claude",
+                profile="anthropic-code",
+                status="subscription-cap",
+                cause="provider-completion-subscription-cap",
+                pattern_id="claude-monthly-spend-limit-modal",
+                nonce_sha256="a" * 64,
+                prompt_sha256="b" * 64,
+                statusline_baseline_sha256=None,
+                statusline_observed_sha256=None,
+                capture_count=0,
+                changed_capture_indices=(),
+                cap_kind="monthly-spend-limit",
+                reset_at=datetime(2026, 11, 8, 17, 0, tzinfo=timezone.utc),
+            )
+            stack, _start, _capture = self._patches(claude)
+            with stack, mock.patch.object(
+                rc, "_assess_provider_completion_after_input_ready", return_value=cap
+            ), self.assertRaises(rc.RuntimeOperationalFailure):
+                rc._controller_start_runtime(
+                    claude, state_root=root, receiver_backend=backend
+                )
+
+            # The return attempt stopped the fallback poller but never committed
+            # a Claude receiver.  The same controller invocation's next cycle
+            # respawns the one pane as Codex and completes its receiver POST.
+            self.assertFalse(backend.poller)
+            self.assertFalse(backend.claude_present)
+            backend.events.clear()
+            (_runtime_start, _handle), start = self._start(
+                self._codex(root),
+                root,
+                backend,
+                alive=True,
+                pids=(5555, 7777),
+                cmdline=["/usr/bin/claude"],
+            )
+
+            self.assertTrue(start.call_args.kwargs["replace"])
+            self.assertTrue(backend.poller)
+            self.assertFalse(backend.claude_present)
+            self.assertEqual(int(backend.poller) + int(backend.claude_present), 1)
+            self.assertEqual(backend.events, self.PRE_OPS + self.POST_OPS)
+
     def test_codex_over_codex_with_pending_snapshot_skips_pre_but_runs_post(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -15796,6 +16509,44 @@ class ObserveAndPublishMidSessionCapTests(unittest.TestCase):
             state = rc.read_mid_session_cap_state("recovery", state_root=root)
             self.assertTrue(state["modal_present"])
             self.assertIsNone(state["candidate_text_sha256"])
+
+    def test_archivist_spend_modal_with_task_tail_publishes_authoritative_state(self) -> None:
+        """T-5757: the exact live mismatch composed two individually-tested
+        boundaries: Claude's modal-owned background-task row must still classify,
+        and the second identical sample must publish the actionable state."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            binding = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            binding.persona = "archivist"
+            text = (
+                self._spend_limit_text()
+                + "\nBackground task update waiting while this panel is open\n"
+            )
+            first = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+            second = first + timedelta(seconds=60)
+
+            candidate = rc._observe_and_publish_mid_session_cap(
+                binding, capture_pane_fn=lambda: text, now=first, state_root=root,
+            )
+            confirmed = rc._observe_and_publish_mid_session_cap(
+                binding, capture_pane_fn=lambda: text, now=second, state_root=root,
+            )
+
+            self.assertFalse(candidate.modal_present)
+            self.assertEqual(candidate.candidate_modal_kind, "monthly-spend-limit")
+            self.assertTrue(confirmed.modal_present)
+            self.assertEqual(confirmed.modal_kind, "monthly-spend-limit")
+            self.assertEqual(
+                confirmed.reset_at,
+                datetime(2026, 9, 27, 17, 0, 0, tzinfo=timezone.utc),
+            )
+            state = rc.read_mid_session_cap_state("archivist", state_root=root)
+            self.assertTrue(state["modal_present"])
+            self.assertEqual(state["modal_kind"], "monthly-spend-limit")
+            self.assertEqual(state["detected_at"], rc._iso(first))
+            self.assertEqual(state["observed_at"], rc._iso(second))
+            self.assertEqual(state["reset_at"], "2026-09-27T17:00:00Z")
+            self.assertIsNone(state["candidate_modal_kind"])
 
     def test_two_classifying_but_different_samples_do_not_confirm(self) -> None:
         """A pane that CHANGES between samples resets the candidate rather
@@ -17355,6 +18106,273 @@ class ControllerMainCycleTests(unittest.TestCase):
                 )
             self.assertEqual(result, 0)
             self.assertIsNotNone(rc.load_last_attempt("orchestrator", "claude--anthropic-code", state_root=root))
+
+    # --- T-4817: a controller launch records initial-viability.json -------------------
+    def _viability_path(self, root, binding) -> Path:
+        return rc._initial_viability_path(binding.persona, root)
+
+    def _controller_launch(self, root, binding, **overrides):
+        with mock.patch.object(rc, "_controller_source_provenance", side_effect=self._fake_provenance):
+            return self._run_t4035(root, binding, **overrides)
+
+    def _evidence_rows(self, root, binding) -> list[dict]:
+        # controller_main("orchestrator", ...) logs under the controller's persona (the fixture
+        # binding is "recovery"; in production they agree)
+        path = rc._evidence_log_path("orchestrator", root)
+        return _read_jsonl(path) if path.exists() else []
+
+    def _consume(self, root, binding):
+        with mock.patch.object(rc, "pane_exists", return_value=True), mock.patch.object(
+            rc, "_default_tmux_server_pid", return_value=123
+        ), mock.patch.object(rc, "_pid_in_scope", return_value=True), mock.patch.object(
+            rc, "_read_only_receiver_present", return_value={"ok": True, "state": "absent-not-required"}
+        ), mock.patch.object(
+            rc, "_controller_source_provenance", side_effect=self._fake_provenance
+        ), mock.patch.object(
+            rc, "_validated_current_source_hashes", side_effect=lambda cur: dict(cur.source_hashes)
+        ), mock.patch.object(
+            rc, "_validated_source_hashes_from_state", side_effect=lambda st: dict(st["controller_source_hashes"])
+        ):
+            return rc._matching_recorded_runtime_selection(
+                (binding,),
+                adapter_factory=lambda b: _Adapter(b),
+                state_root=root, backend=None, context=None,
+                now=datetime(2026, 11, 4, 12, 0, 0, tzinfo=timezone.utc),
+                manifest_order=(rc._runtime_ref(binding),), attempt_limit=1,
+            )
+
+    def test_t4817_controller_launch_records_selected_initial_viability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            result, _record, _err = self._controller_launch(root, claude)
+            self.assertEqual(result, 0)
+            path = self._viability_path(root, claude)
+            state = json.loads(path.read_text())
+            self.assertEqual(state["schema"], "pantheon-runtime-initial-viability/v1")
+            self.assertEqual(state["status"], "selected")
+            self.assertEqual(state["persona"], claude.persona)
+            self.assertEqual(state["selected_runtime"], "claude/anthropic-code")
+            self.assertEqual(state["selected_harness"], "claude")
+            self.assertEqual(state["selected_profile"], "anthropic-code")
+            self.assertEqual(state["manifest_order"], ["claude/anthropic-code"])
+            self.assertEqual(state["attempt_limit"], 1)
+            self.assertEqual(len(state["attempts"]), 1)
+            self.assertEqual(state["attempts"][0]["status"], "selected")
+            self.assertEqual(state["attempts"][0]["cause"], "controller-launch")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            verdict = rc.validate_initial_viability_state(
+                claude.persona, state_root=root, expect_selected="claude/anthropic-code",
+                require_source_provenance=True,
+            )
+            self.assertTrue(verdict["ok"], verdict["errors"])
+
+    def test_t4817_record_differs_from_ensure_viable_runtime_only_in_cause_and_receiver(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            controller_root, consume_root = Path(tmp) / "c", Path(tmp) / "e"
+            claude = _stateless_binding(Path(tmp), harness="claude", profile="anthropic-code")
+            self._controller_launch(controller_root, claude)
+            helper = InitialViabilityTests()
+            events: list[str] = []
+            with contextlib.ExitStack() as stack:
+                for patch in helper._selector_patches(events):
+                    stack.enter_context(patch)
+                rc.ensure_viable_runtime(
+                    (claude,), adapter_factory=lambda b: _Adapter(b), state_root=consume_root,
+                    backend=_ViabilityBackend(events),
+                )
+            got = json.loads(self._viability_path(controller_root, claude).read_text())
+            want = json.loads(self._viability_path(consume_root, claude).read_text())
+            got_attempt, want_attempt = got["attempts"][0], want["attempts"][0]
+            self.assertEqual(got_attempt["cause"], "controller-launch")
+            self.assertEqual(want_attempt["cause"], "runtime-ready")
+            self.assertEqual(got_attempt["receiver"], {})
+            self.assertTrue(want_attempt["receiver"])
+            for doc, attempt in ((got, got_attempt), (want, want_attempt)):
+                doc["recorded_at"] = "T"  # per-run timestamp
+                attempt["cause"] = "C"  # the sanctioned difference
+                attempt["receiver"] = "R"  # the sanctioned difference
+            # everything else at the top level (persona/status/selected_*/manifest_order/
+            # attempt_limit/attempt count) is identical
+            self.assertEqual({k: v for k, v in got.items() if k != "attempts"},
+                             {k: v for k, v in want.items() if k != "attempts"})
+            self.assertEqual(len(got["attempts"]), len(want["attempts"]))
+            self.assertEqual(set(got_attempt), set(want_attempt))
+            for key, value in want_attempt.items():
+                if key == "readiness":
+                    # The consume path adds its provider-completion probe evidence (read back
+                    # from runtime.json); the controller launch runs no such probe and must not
+                    # invent it. Same event, and nothing the consume record lacks.
+                    self.assertEqual(got_attempt[key]["event"], value["event"])
+                    self.assertTrue(set(got_attempt[key]) <= set(value), key)
+                elif key == "precheck_source_provenance":
+                    # consume takes a fresh pre-launch controller-source check; a controller
+                    # launch makes none and must not present runtime.json's values as one
+                    self.assertEqual(got_attempt[key], {})
+                    self.assertTrue(value)
+                elif key == "source_provenance":
+                    # same key set; leaf values (timestamps, revisions) are per-run
+                    self.assertEqual(set(got_attempt[key]), set(value), key)
+                else:
+                    self.assertEqual(got_attempt[key], value, key)
+
+    def test_t4817_consume_accepts_a_controller_launched_live_pane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            self._controller_launch(root, claude)
+            selection = self._consume(root, claude)
+            self.assertIsNotNone(selection)
+            self.assertEqual(selection.receipt.status, "reused-recorded")
+            self.assertEqual(rc._runtime_ref(selection.binding), "claude/anthropic-code")
+
+    def test_t4817_consume_without_the_record_still_blocks_a_live_pane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            self._controller_launch(root, claude)
+            self._viability_path(root, claude).unlink()
+            with self.assertRaises(rc.RuntimeViabilityBlocked) as caught:
+                self._consume(root, claude)
+            self.assertEqual(caught.exception.reason, "initial-viability-state-not-selected")
+
+    def test_t4817_live_pane_not_matching_runtime_state_still_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            self._controller_launch(root, claude)
+            rc._atomic_json(self._record_path(root, claude), self.STALE)  # the pane runs something else
+            with self.assertRaises(rc.RuntimeViabilityBlocked) as caught:
+                self._consume(root, claude)
+            self.assertEqual(caught.exception.reason, "runtime-state-missing-or-mismatched")
+
+    def test_t4817_failed_start_records_nothing_and_keeps_the_old_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(root, harness="claude", profile="anthropic-code")
+
+            def boom(_binding):
+                raise rc.RuntimeOperationalFailure(
+                    "launch failed", failure_class="operational-launch", cause="launch-failed",
+                    binding_runtime="claude/anthropic-code",
+                )
+
+            def run():
+                with mock.patch.object(rc, "_controller_source_provenance", side_effect=self._fake_provenance):
+                    return rc.controller_main(
+                        claude.persona, candidates=[claude], state_root=root, sleep=lambda s: None,
+                        start_runtime_fn=boom, block_until_death_fn=lambda b: None,
+                    )
+
+            self.assertEqual(run(), 1)
+            self.assertFalse(self._viability_path(root, claude).exists())
+            old = {"schema": "pantheon-runtime-initial-viability/v1", "status": "exhausted"}
+            rc._atomic_json(self._viability_path(root, claude), old)
+            run()
+            self.assertEqual(json.loads(self._viability_path(root, claude).read_text()), old)
+
+    def test_t4817_record_for_a_different_binding_is_replaced_by_the_truth(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            codex = _stateless_binding(root, harness="codex", profile="interactive")
+            self._controller_launch(root, claude)
+            self.assertEqual(json.loads(self._viability_path(root, claude).read_text())["selected_runtime"],
+                             "claude/anthropic-code")
+            self._controller_launch(root, codex)
+            state = json.loads(self._viability_path(root, codex).read_text())
+            self.assertEqual(state["selected_runtime"], "codex/interactive")
+            self.assertEqual(state["selected_harness"], "codex")
+            self.assertEqual(state["status"], "selected")
+
+    def test_t4817_same_runtime_record_is_left_byte_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            rich = {
+                "schema": "pantheon-runtime-initial-viability/v1", "status": "selected",
+                "persona": claude.persona, "selected_runtime": "claude/anthropic-code",
+                "attempts": [{"status": "selected", "receiver": {"ok": True, "operations": ["x"]}}],
+            }
+            rc._atomic_json(self._viability_path(root, claude), rich)
+            before = self._viability_path(root, claude).read_bytes()
+            result, _record, _err = self._controller_launch(root, claude)
+            self.assertEqual(result, 0)
+            self.assertEqual(self._viability_path(root, claude).read_bytes(), before)
+
+    def test_t4817_attach_shape_with_no_matching_record_records_one(self) -> None:
+        # _fake_start returns created_scope=False: the T-4101 attach shape
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            result, _record, _err = self._controller_launch(root, claude)
+            self.assertEqual(result, 0)
+            self.assertEqual(json.loads(self._viability_path(root, claude).read_text())["status"], "selected")
+
+    def test_t4817_unpersisted_runtime_record_writes_no_viability_and_logs_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            for outcome in ("skipped: source provenance unavailable (x)", "persisted"):
+                with self.subTest(outcome=outcome):
+                    # "persisted" with no runtime.json on disk: provenance cannot be read back
+                    result, _record, _err = self._controller_launch(
+                        root, claude, persist_record_fn=lambda *a, _o=outcome, **k: _o)
+                    self.assertEqual(result, 0)  # a launch is never failed by the record
+                    self.assertFalse(self._viability_path(root, claude).exists())
+                    events = [r["event"] for r in self._evidence_rows(root, claude)]
+                    self.assertIn("runtime_viability_not_recorded", events)
+
+    def test_t4817_skipped_persist_never_records_a_previous_launchs_valid_runtime_json(self) -> None:
+        # The case the persist_outcome gate exists for: THIS launch persisted nothing, but a
+        # fully valid runtime.json (with controller-source provenance) from a PREVIOUS launch
+        # is on disk. Without the gate its provenance would be recorded as this launch's.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            self._controller_launch(root, claude)  # previous launch: real runtime.json
+            self._viability_path(root, claude).unlink()
+            stale = json.loads(self._record_path(root, claude).read_text())
+            self.assertTrue(rc._state_matches(claude, stale))
+            self.assertTrue(stale["controller_source_manifest_sha256"])
+            result, _record, _err = self._controller_launch(
+                root, claude, persist_record_fn=lambda *a, **k: "skipped: source provenance unavailable (x)")
+            self.assertEqual(result, 0)
+            self.assertFalse(self._viability_path(root, claude).exists())
+            rows = [r for r in self._evidence_rows(root, claude) if r["event"] == "runtime_viability_not_recorded"]
+            self.assertEqual(len(rows), 1)
+            self.assertIn("not persisted", rows[0]["outcome"])
+
+    def test_t4817_record_write_failure_never_fails_the_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            with mock.patch.object(rc, "_record_initial_viability", side_effect=OSError("disk full")):
+                result, _record, _err = self._controller_launch(root, claude)
+            self.assertEqual(result, 0)
+            self.assertIsNotNone(rc.load_last_attempt("orchestrator", "claude--anthropic-code", state_root=root))
+            rows = [r for r in self._evidence_rows(root, claude) if r["event"] == "runtime_viability_not_recorded"]
+            self.assertEqual(len(rows), 1)
+
+    def test_t4817_held_runtime_is_never_launched_or_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            rc._atomic_json(
+                rc._holds_path(claude.persona, state_root=root),
+                {"schema": "pantheon-persona-runtime-holds/v1",
+                 "holds": {"claude/anthropic-code": {"set_ts": "x", "set_by": "operator:t", "reason": "r"}}},
+            )
+            started: list[str] = []
+            with mock.patch.object(rc, "_controller_source_provenance", side_effect=self._fake_provenance):
+                rc.controller_main(
+                    claude.persona, candidates=[claude], state_root=root, sleep=lambda s: None,
+                    max_reselect_cycles=1,
+                    start_runtime_fn=lambda b: started.append("x") or self._fake_start(b),
+                    block_until_death_fn=lambda b: None,
+                )
+            self.assertEqual(started, [])
+            self.assertFalse(self._viability_path(root, claude).exists())
 
     def test_selects_starts_blocks_and_records_success_when_sustained_alive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -19011,6 +20029,10 @@ _REAL_CLEAR = rc._clear_runtime_pane_for_launch  # bound at import, before setUp
 
 
 def setUpModule() -> None:
+    # T-6118: plain `python3 -m unittest` never loads tools/conftest.py, so without this the
+    # death / cap-swap / fallback-return tests ran the REAL session_chronicle subprocess against
+    # the account's real Chronicle. Same isolation conftest applies under pytest.
+    _seat_state_isolation.start()
     for name, kwargs in (
         ("_capture_runtime_pane_history", {"return_value": None}),
         ("_clear_runtime_pane_for_launch", {}),
@@ -19023,6 +20045,7 @@ def setUpModule() -> None:
 def tearDownModule() -> None:
     while _MCP_WATCH_MODULE_PATCHES:
         _MCP_WATCH_MODULE_PATCHES.pop().stop()
+    _seat_state_isolation.stop()  # T-6118
 
 
 class _FakeClock:
@@ -19345,6 +20368,20 @@ class CompensateCreatedScopeT5167Tests(unittest.TestCase):
         self.assertEqual(teardown["scope_stopped"], "true")
         self.assertNotIn("scope_stop_skipped", teardown)
 
+
+
+class FreshRuntimeRenderWaitSourceTest(unittest.TestCase):
+    """T-6293: fresh-runtime submits read their render bound from the submit_verify profile."""
+
+    def test_bound_follows_the_harness_profile(self):
+        from tools import submit_verify as sv
+        self.assertEqual(rc._fresh_runtime_render_wait("claude"), sv.first_paste_render_wait("claude-code"))
+        with mock.patch.dict(sv.PROFILES["claude-code"], {"render_wait_s": 3.0}):
+            self.assertEqual(rc._fresh_runtime_render_wait("claude"), 3.0)
+
+    def test_unmapped_harness_raises_instead_of_guessing(self):
+        with self.assertRaises(ValueError):
+            rc._fresh_runtime_render_wait("unknown-harness")
 
 if __name__ == "__main__":
     unittest.main()

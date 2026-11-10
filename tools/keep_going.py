@@ -129,6 +129,13 @@ try:
 except ImportError:  # bare run with cwd=tools/
     import fleet_usage_gate as _fug  # type: ignore
 
+# T-4889: Codex quota records are keyed by the app-server seat (consultant/watchman),
+# not by the Pantheon persona that keep-going nudges (codex/watchman).
+try:
+    from tools import appserver_seats as _appserver_seats
+except ImportError:  # bare run with cwd=tools/
+    import appserver_seats as _appserver_seats  # type: ignore
+
 # T-5793: harness-neutral idle from the harness's own session log. Stdlib-only module
 # that never raises; same dual-import shape as the imports above.
 try:
@@ -262,6 +269,7 @@ DELIVERY_MODE = {
 # ORG-026 Path A hub — instance.yaml's mailbox.hub via agent_role_map (T-4096), the
 # same value mailbox_wake.MAILBOX_HUB resolves, so an ORG-087 move is a manifest flip.
 MAILBOX_HUB = Path(agent_role_map.mailbox_hub())
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Adaptive-backoff knobs (env-overridable). Default ON per the operator's TG 3508.
 ADAPTIVE = os.environ.get("KEEP_GOING_ADAPTIVE", "1") != "0"
@@ -903,16 +911,18 @@ def cap_or_usage_gate(cfg: dict, agent: str, now_ts: int,
     2. Then T-2024's HIT-cap check, `is_usage_capped`, unchanged: returns True/False.
 
     do_fleet_gate is an injection seam for testing (called with now_ts)."""
-    # The fleet gate measures the shared Claude subscription. A controller-swapped
-    # Codex runtime must keep progressing; charging Claude's scarcity to another
-    # provider is the live T-5748 failure mode.
-    if active_harness(agent, cfg) == "codex":
-        # Both cap detectors consume Claude transcript/status records. Once the
-        # selected runtime is Codex those records describe the unavailable primary,
-        # not the live provider, and must not park the fallback.
-        return False
-
-    gate = do_fleet_gate or _fug.evaluate
+    harness = active_harness(agent, cfg)
+    # T-4889: Claude remains a shared pool; each Codex seat reads only the app-server
+    # record for its own subscription/account. The injection seam keeps its one-arg
+    # contract so fault tests and alternate policy probes stay cheap.
+    gate = do_fleet_gate or (
+        lambda instant: _fug.evaluate(
+            instant, harness="codex" if harness == "codex" else "claude",
+            seat=_appserver_seats.appserver_seat_for_account(
+                REPO_ROOT, str(cfg["unix_user"])
+            ) if harness == "codex" else None,
+        )
+    )
     try:
         decision = gate(now_ts)
     except Exception as exc:  # any surprise → fail open (fall through to the hit-cap check)
@@ -921,7 +931,27 @@ def cap_or_usage_gate(cfg: dict, agent: str, now_ts: int,
         decision = None
     if decision is not None and decision.suppress:
         return decision
+    if harness == "codex":
+        # The legacy hit-cap detectors below consume Claude transcript/status
+        # records. The Codex app-server percentage gate above is the only valid
+        # subscription signal for a Codex runtime.
+        return False
     return is_usage_capped(cfg, agent, now_ts, do_read_records, do_find_jsonl)
+
+
+def _send_usage_trip_mail(sender: str, recipient: str, subject: str, body: str) -> None:
+    """Internal mailbox delivery, split out as a hermetic test seam."""
+    mailbox.send(MAILBOX_HUB / recipient, body, sender=sender, subject=subject)
+
+
+def _notify_usage_trip(agent: str, decision) -> None:
+    """Keep-going is a first-class consumer; it cannot rely on P1.a/P1.b also firing."""
+    _fug.notify_usage_trip_once(
+        agent, decision,
+        lambda recipient, subject, body: _send_usage_trip_mail(
+            agent, recipient, subject, body),
+        log=lambda message: print(f"[keep_going] {agent}: {message}", file=sys.stderr),
+    )
 
 
 def _seat_hold(agent: str):
@@ -960,6 +990,12 @@ def run(agent: str, *, prompt: str = DEFAULT_PROMPT,
     # maintenance, OOM hold) gets no nudge. First gate, before any pane capture, so a held
     # seat costs nothing. Fail-open inside _seat_hold.
     held = (do_seat_hold or _seat_hold)(agent)
+    if held and getattr(held, "alertable", False) is True:
+        # T-5868: a HALTED run_state pause is an incident, not a quiet authorised pause.
+        # Intake stays blocked; activity_monitor owns the alert and its re-alerts (C3).
+        print(f"[keep_going] {agent}: HALTED ({', '.join(held.sources)}) — INCIDENT, nudge "
+              f"skipped; rollback: {held.rollback_cmd or '(see seat-state record)'} (T-5868)")
+        return 0
     if held:
         print(f"[keep_going] {agent}: seat held ({', '.join(held.sources)}) — nudge skipped "
               f"(ORG-106 L2)")
@@ -1052,6 +1088,7 @@ def run(agent: str, *, prompt: str = DEFAULT_PROMPT,
             # T-4510: the fleet pre-cap gate (a GateDecision), not a HIT cap. Logged ONCE per
             # window, not once per 15-min tick; nothing consumed, so nudging resumes at once
             # when the window rolls or usage falls.
+            _notify_usage_trip(agent, capped)
             try:
                 first = _fug.should_log_once(f"keep_going:{agent}", getattr(capped, "window_key", None))
             except Exception:  # noqa: BLE001 — best-effort marker (e.g. Path.home() RuntimeError):

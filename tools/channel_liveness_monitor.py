@@ -61,6 +61,7 @@ import os
 import subprocess
 import sys
 import re
+import shlex
 import time
 from pathlib import Path
 
@@ -282,6 +283,26 @@ def _run(cmd: list[str]) -> tuple[int, str]:
     return r.returncode, r.stdout.strip()
 
 
+def _absence_probe_script(path: str) -> str:
+    """Shell that prints PRESENT, ABSENT or UNKNOWN for `path` (T-2359, T-6038).
+
+    ABSENT is printed only when absence is PROVEN: walk up from dirname(path) to
+    the nearest ancestor that exists, and require it to be a directory the probing
+    user can read AND search. Then a missing next component is a real absence.
+    That covers a seat with no ~/.claude/channels/telegram at all (mason/artisan
+    have no bridge; before T-6038 this read UNKNOWN forever, so the T-6000
+    detector would open false unknown episodes). It also stops a present path
+    under an existing but NON-traversable parent being reported ABSENT: a failed
+    stat there is EACCES, not absence. Any unreadable ancestor -> UNKNOWN.
+    """
+    q = shlex.quote(path)
+    return (f'p={q}; if [ -e "$p" ]; then echo PRESENT; exit 0; fi; '
+            'd=$(dirname "$p"); '
+            'while [ ! -e "$d" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; '
+            'if [ -d "$d" ] && [ -r "$d" ] && [ -x "$d" ]; then echo ABSENT; '
+            'else echo UNKNOWN; fi')
+
+
 def _pidfile_is_provably_absent(cfg: dict, sudo: list[str]) -> bool | None:
     """True if bot.pid provably does not exist, False if it EXISTS but was
     unreadable, None if the probe could not tell (T-2359).
@@ -293,10 +314,7 @@ def _pidfile_is_provably_absent(cfg: dict, sudo: list[str]) -> bool | None:
     a non-traversable parent all return rc=0 out=MISSING — byte-identical.
     """
     p = _bot_pid_path_for(cfg)
-    rc, out = _run(sudo + ["bash", "-c",
-                           f'if [ -e {p} ]; then echo PRESENT; '
-                           f'elif [ -d "$(dirname {p})" ]; then echo ABSENT; '
-                           f'else echo UNKNOWN; fi'])
+    rc, out = _run(sudo + ["bash", "-c", _absence_probe_script(p)])
     if rc != 0:
         return None
     if out == "ABSENT":
@@ -812,6 +830,24 @@ def _sleep_breach(agent: str, detail: str, seat, *, now: int, dry_run: bool) -> 
     return "sleep_breach"
 
 
+def _org076_emit(agent: str, status: str, detail: str, now: int, dry_run: bool) -> None:
+    """ORG-076 BT5b (T-6000): hand one RAW probe result to the episode-store writer. Dark unless
+    PANTHEON_ORG076_TELEGRAM_INBOUND_DETECTOR is exactly "1"; fail-safe (never raises, never alters
+    alerting/remediation). A muted seat gets no verdict of any kind (_seat_muted, fail-open); dry-run writes
+    nothing. Called only at the points where check_agent has not suppressed the read."""
+    try:
+        from tools import org076_telegram_inbound as tgi
+        if dry_run or not tgi.enabled():
+            return
+        if _seat_muted(agent):
+            _log(agent, "org076: suppressed (muted) -- no verdict written")
+            return
+        from datetime import datetime, timezone
+        tgi.feed_safely(agent, status, detail, now=datetime.fromtimestamp(now, timezone.utc))
+    except Exception as exc:  # fail-safe: the detector must never change the monitor
+        _log(agent, f"org076 emit failed (ignored): {exc!r}")
+
+
 def check_agent(agent: str, *, dry_run: bool = False, now: int | None = None) -> str:
     """Probe one agent and alert on a fresh DOWN. Returns the probe status.
 
@@ -841,10 +877,15 @@ def check_agent(agent: str, *, dry_run: bool = False, now: int | None = None) ->
         # draining toward sleep: the session is being wound down on purpose.
         _log(agent, "seat is draining toward deep-sleep — not alerting/remediating this poll")
         return "asleep"
+    if seat is not None and seat.alertable is True:
+        _log(agent, f"seat is HALTED (INCIDENT; {seat.owner or '?'}: {seat.reason or '-'}; "
+                    f"rollback: {seat.rollback_cmd or '-'}) — judged normally, NOT treated as an "
+                    f"authorised pause (T-5868)")
     if seat is not None and seat.state == seat_state.STATE_PAUSED_INTAKE:
         _log(agent, f"seat is paused-intake ({seat.owner or '?'}: {seat.reason or '-'}; "
                     f"until {seat.expires or 'no expiry'}) — the seat is up, judged normally")
     if status != "down":
+        _org076_emit(agent, status, detail, now, dry_run)  # up -> healthy, inconclusive -> unknown, no_bridge -> none
         return status
     # Seat-maintenance precondition (T-2984) — the strongest "leave this seat alone"
     # signal, checked first among the down-path preconditions. During a runtime-
@@ -882,6 +923,7 @@ def check_agent(agent: str, *, dry_run: bool = False, now: int | None = None) ->
             return status
         _log(agent, f"down inside the restart grace, but {crash_loop_deaths} session deaths in "
                     f"{RESPAWN_LOOP_WINDOW_SECONDS}s: crash loop — alerting, not remediating")
+    _org076_emit(agent, status, detail, now, dry_run)  # down outside the grace (or crash-loop): broken
     if dry_run:
         _log(agent, "DRY-RUN: would alert + (if enabled) remediate (bridge down)")
         return status

@@ -30,6 +30,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 from tools import runtime_controller as rc
+try:
+    from tools import _seat_state_isolation
+except ImportError:  # pragma: no cover
+    import _seat_state_isolation  # type: ignore[no-redef]
 from tools.bringup_acceptance import harness_codex_rc_ready as m
 from tools.bringup_acceptance.types import HardStop
 from tools.harness_adapter.types import TmuxTarget
@@ -42,6 +46,7 @@ _converge_patches = [mock.patch.object(m, "converge_worker_guard_hook")]
 
 
 def setUpModule() -> None:
+    _seat_state_isolation.start()  # T-6118 (plain-unittest isolation)
     for p in _converge_patches:
         p.start()
 
@@ -49,6 +54,7 @@ def setUpModule() -> None:
 def tearDownModule() -> None:
     for p in reversed(_converge_patches):
         p.stop()
+    _seat_state_isolation.stop()  # T-6118
 
 
 def _skip_unless_disposable_tmux_available(test: unittest.TestCase) -> None:

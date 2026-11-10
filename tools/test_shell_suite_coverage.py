@@ -115,6 +115,7 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 TOOLS = REPO / "tools"
 WORKFLOWS = REPO / ".github" / "workflows"
 CI = WORKFLOWS / "ci.yml"
+DBUS_TIERS = WORKFLOWS / "dbus-tiers.yml"
 WRAPPER = TOOLS / "test_shell_suites.py"
 
 _WRAPPER_REL = "tools/test_shell_suites.py"
@@ -717,6 +718,24 @@ class TheSurvivingPathIsWiredOnce(unittest.TestCase):
         doc = yaml.safe_load(CI.read_text(encoding="utf-8"))
         self.assertEqual(_events_missing_tools_trigger(doc), [],
                          "ci.yml no longer triggers on tools/** for the listed event(s)")
+
+    def test_ci_path_filters_cover_governance_inputs_read_by_the_tools_suite(self):
+        """T-5691: governance documents are runtime inputs, not inert docs.
+
+        The whole tools suite parses the priority list, goal registry and ADR corpus. A PR
+        changing only one of those inputs must therefore trigger the suite just like a
+        tools/** change does.
+        """
+        required = {"rulebook/**", "architecture/adr/**"}
+        for workflow in (CI, DBUS_TIERS):
+            with self.subTest(workflow=workflow.name):
+                doc = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+                pull_request = _on_block(doc).get("pull_request") or {}
+                paths = set(pull_request.get("paths") or [])
+                self.assertTrue(
+                    required.issubset(paths),
+                    f"{workflow.name} must run for rulebook/** and architecture/adr/** changes",
+                )
 
 
 class TheGuardLogic(unittest.TestCase):

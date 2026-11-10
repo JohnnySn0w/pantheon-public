@@ -12,6 +12,7 @@ import json
 import os
 import re
 import selectors
+import ssl
 import stat
 import subprocess
 import time
@@ -1067,6 +1068,8 @@ def _iso(value: datetime) -> str:
 DEEPSEEK_BALANCE_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_BALANCE_PATH = "/user/balance"
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
+DEEPSEEK_PROXY_BASE_URL = "https://deepseek-proxy.invalid:8448/v1"
+DEEPSEEK_PROXY_DUMMY_KEY = "proxy-held-dummy"
 DEEPSEEK_CURRENCIES = frozenset({"CNY", "USD"})
 _DEEPSEEK_BODY_CAP = 64 * 1024
 
@@ -1113,10 +1116,19 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def build_deepseek_opener(*extra_handlers: urllib.request.BaseHandler) -> urllib.request.OpenerDirector:
+def build_deepseek_opener(
+    *extra_handlers: urllib.request.BaseHandler,
+    ca_file: Path | None = None,
+) -> urllib.request.OpenerDirector:
     """The balance client's opener: redirects refused. ``extra_handlers`` is a
-    test seam (fake transports); production passes none."""
-    return urllib.request.build_opener(_RefuseRedirects(), *extra_handlers)
+    test seam (fake transports). ``ca_file`` pins the local proxy trust root
+    for callers that must not inherit ambient TLS configuration."""
+    handlers: list[urllib.request.BaseHandler] = [_RefuseRedirects()]
+    if ca_file is not None:
+        context = ssl.create_default_context(cafile=str(ca_file))
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    handlers.extend(extra_handlers)
+    return urllib.request.build_opener(*handlers)
 
 
 def read_deepseek_balance(
@@ -1125,6 +1137,8 @@ def read_deepseek_balance(
     base_url: str = DEEPSEEK_BALANCE_BASE_URL,
     timeout: float = 10.0,
     opener: Callable[..., Any] | None = None,
+    key_holding_proxy: bool = False,
+    ca_file: Path | None = None,
 ) -> Mapping[str, Any]:
     """GET /user/balance with the key from ``env_file`` and return the JSON body.
 
@@ -1135,15 +1149,23 @@ def read_deepseek_balance(
 
     if not base_url.startswith("https://"):
         raise DeepSeekBalanceReadError("balance base_url must be https")
-    key = _read_env_key(env_file, DEEPSEEK_API_KEY_ENV)
-    if key is None:
-        raise DeepSeekBalanceReadError("api key missing from env file")
+    if key_holding_proxy:
+        if base_url != DEEPSEEK_PROXY_BASE_URL:
+            raise DeepSeekBalanceReadError("key-holding proxy base_url invalid")
+        key = DEEPSEEK_PROXY_DUMMY_KEY
+    else:
+        key = _read_env_key(env_file, DEEPSEEK_API_KEY_ENV)
+        if key is None:
+            raise DeepSeekBalanceReadError("api key missing from env file")
     request = urllib.request.Request(
         base_url.rstrip("/") + DEEPSEEK_BALANCE_PATH,
         headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
         method="GET",
     )
-    open_request = opener if opener is not None else build_deepseek_opener().open
+    try:
+        open_request = opener if opener is not None else build_deepseek_opener(ca_file=ca_file).open
+    except (OSError, ssl.SSLError):
+        raise DeepSeekBalanceReadError("balance CA invalid") from None
     raw: bytes | None = None
     failure: str | None = None
     try:

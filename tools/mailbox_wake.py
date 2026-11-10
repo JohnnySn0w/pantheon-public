@@ -68,6 +68,10 @@ try:  # T-4792: the live harness comes from the controller's runtime.json.
     from tools import live_harness
 except ImportError:
     import live_harness  # type: ignore
+try:  # T-4382: neutralize '@<path>' mentions in mail-derived kick fields.
+    from tools.inject_sanitize import neutralize_at_mentions
+except ImportError:
+    from inject_sanitize import neutralize_at_mentions  # type: ignore
 
 # Per-agent substrate (pane + owning account). Kept as a small explicit map rather
 # than importing inbox_consumer — that module carries live-Telegram/tmux side-effect
@@ -328,8 +332,12 @@ def _read_marker(marker: Path) -> dict | None:
     try:
         state = json.loads(raw)
         if isinstance(state, dict) and isinstance(state.get("newest"), str):
-            return {"newest": state["newest"], "session": state.get("session"),
-                    "ts": state.get("ts"), "idle_kicked": bool(state.get("idle_kicked"))}
+            parsed = {"newest": state["newest"], "session": state.get("session"),
+                      "ts": state.get("ts"),
+                      "idle_kicked": bool(state.get("idle_kicked"))}
+            if state.get("delivery") == "appserver":
+                parsed["delivery"] = "appserver"
+            return parsed
     except (json.JSONDecodeError, ValueError):
         pass
     # legacy plain-text form
@@ -337,11 +345,12 @@ def _read_marker(marker: Path) -> dict | None:
 
 
 def _write_marker(marker: Path, newest: str, session_key: str | None, now: float,
-                  idle_kicked: bool = False) -> None:
-    payload = json.dumps(
-        {"newest": newest, "session": session_key, "ts": now,
-         "idle_kicked": idle_kicked},
-    ) + "\n"
+                  idle_kicked: bool = False, delivery: str | None = None) -> None:
+    state = {"newest": newest, "session": session_key, "ts": now,
+             "idle_kicked": idle_kicked}
+    if delivery == "appserver":
+        state["delivery"] = "appserver"
+    payload = json.dumps(state) + "\n"
     descriptor, temporary = tempfile.mkstemp(
         prefix=f"{marker.name}.",
         dir=marker.parent,
@@ -969,10 +978,14 @@ def _queued_subjects(new_dir: Path, names: list[str], cap: int = 8) -> list[str]
     for n in names[:cap]:
         try:
             rec = json.loads((new_dir / n).read_text(encoding="utf-8"))
-            sender = rec.get("sender") or "?"
+            sender = neutralize_at_mentions(str(rec.get("sender") or "?"))  # str(): r1 F2
             subj = (rec.get("subject") or "(no subject)").strip().replace("\n", " ")
         except (OSError, json.JSONDecodeError, ValueError, AttributeError):
             continue
+        # T-4382: neutralize BEFORE the 110-char slice. A slice keeps a prefix, so it
+        # can drop the '@' after a '\' but never the '\' before an '@': it cannot
+        # recreate a bare token-initial '@'.
+        subj = neutralize_at_mentions(subj)
         out.append(f"{sender}: {subj[:110]}")
     return out
 
@@ -987,8 +1000,10 @@ def _senders(new_dir: Path, names: list[str]) -> list[str]:
             s = json.loads((new_dir / n).read_text(encoding="utf-8")).get("sender")
         except (OSError, json.JSONDecodeError, ValueError, AttributeError):
             s = None
-        if isinstance(s, str) and s not in seen:
-            seen.append(s)
+        if isinstance(s, str):
+            s = neutralize_at_mentions(s)  # T-4382: sender is peer-set free text
+            if s not in seen:
+                seen.append(s)
     return seen
 
 
@@ -1010,6 +1025,11 @@ def build_persona_kick(
     them back through a second persona map would make a manifest-only harness
     swap impossible.
     """
+    # T-4382: senders and subjects are peer-authored and this text is pasted into a
+    # live composer. _senders/_queued_subjects already neutralize them; doing it again
+    # here covers any other caller, and the helper is idempotent (no double escape).
+    senders = [neutralize_at_mentions(str(x)) for x in senders] if senders else senders
+    subjects = [neutralize_at_mentions(str(x)) for x in subjects] if subjects else subjects
     who = ", ".join(senders) if senders else "another agent"
     n = len(names)
     plural = "s" if n != 1 else ""
@@ -1180,7 +1200,8 @@ def _intake_hold(agent: str, new_dir: Path, names: list[str], maintenance_fn=Non
     if st is None or not st.intake_blocked:
         return False, ""
     srcs = ", ".join(st.sources) or "seat hold"
-    paused_only = not (st.launch_blocked or st.remediation_vetoed)
+    # T-5868: a HALTED seat is dark mid-rollback; normal AND urgent mail queue, never wake it.
+    paused_only = not (st.launch_blocked or st.remediation_vetoed or st.alertable is True)
     if paused_only and _has_urgent(new_dir, names):
         return False, f"paused-intake ({srcs}) but urgent mail waits"
     return True, srcs
@@ -1227,13 +1248,21 @@ def appserver_route_try(prompt: str, newest: str, home: str) -> tuple:
     return status, detail
 
 
+def appserver_route_enabled(home: str) -> bool:
+    """True only for a readable, enabled, structurally valid route switch."""
+    try:
+        return _appserver_route_module().load_switch(home) is not None
+    except Exception:  # noqa: BLE001 — uncertainty must take the fail-closed pane path
+        return False
+
+
 def _run_locked(agent: str, *, inbox: Path | None = None, do_inject=inject,
                 session_key_fn=session_key, now: float | None = None,
                 pane_idle_fn=pane_is_idle,
                 unknown_pane_ok_fn=unknown_pane_deliverable,
                 pane_tail_fn=None, capture_fn=_capture_plain, enter_fn=_send_enter,
                 sleep_fn=time.sleep, alert_fn=alert_stuck, maintenance_fn=None,
-                route_fn=None, seat_state_fn=None) -> int:
+                route_fn=None, route_enabled_fn=None, seat_state_fn=None) -> int:
     cfg = AGENT_PANE.get(agent)
     if cfg is None:
         print(f"[mailbox_wake] unknown agent {agent!r} (known: {list(AGENT_PANE)})", file=sys.stderr)
@@ -1243,16 +1272,15 @@ def _run_locked(agent: str, *, inbox: Path | None = None, do_inject=inject,
     defer_state = box / _DEFER_STATE_NAME
     inject_record = box / _INJECT_RECORD_NAME
     now = time.time() if now is None else now
-    current_session = session_key_fn(cfg["pane_target"])  # None → legacy fallback
-    pane_idle = pane_idle_fn(cfg["pane_target"])           # None → unknown, never wakes
-
-    action, names, reason = decide(new_dir, marker, current_session, now, pane_idle)
+    # T-5741: decide the state-change cases that do not require a pane read first.
+    # An app-server-backed Codex seat has no pane delivery dependency; consulting its
+    # legacy pane before the route made a healthy Specialist writer unreachable whenever
+    # that pane rendered UNKNOWN. If the route is off/unavailable, we still evaluate
+    # the pane below and preserve the idle-transition re-kick.
+    action, names, reason = decide(new_dir, marker, None, now, None)
     if action == "empty":
         print(f"[mailbox_wake] {agent}: inbox/new empty — nothing to wake")
         clear_defer_state(defer_state)
-        return 0
-    if action == "debounced":
-        print(f"[mailbox_wake] {agent}: {len(names)} unread — debounced ({reason})")
         return 0
     # T-5277: a seat in seat-maintenance is held on purpose (its session may not even exist).
     # Its mail stays queued in new/ for the lift; no kick, and no wake-stuck streak either,
@@ -1268,10 +1296,31 @@ def _run_locked(agent: str, *, inbox: Path | None = None, do_inject=inject,
     if why:
         print(f"[mailbox_wake] {agent}: {len(names)} unread — {why}; waking (ORG-106 decision 2)")
 
+    # T-4792: resolve the controller-selected runtime before choosing a delivery path.
+    # Static AGENT_PANE entries describe the normal harness, but Specialist can be running
+    # Codex under the runtime controller while its static entry remains Claude.
+    harness = live_harness.resolve(
+        agent, cfg.get("harness", _DEFAULT_HARNESS),
+        state_root=live_harness.default_state_root(cfg["home"]),
+    )
+
+    # A prior app-server receipt debounces without touching the legacy pane while
+    # its switch remains on. When the switch turns off, fall through: session=None
+    # deliberately makes the pane path wake once and rewrite the marker for tmux.
+    marker_state = _read_marker(marker)
+    if (harness == "codex" and action == "debounced"
+            and marker_state is not None
+            and marker_state.get("delivery") == "appserver"):
+        enabled = (route_enabled_fn or appserver_route_enabled)(cfg["home"])
+        if enabled and (route_fn is not None or _is_hub_inbox(box, agent)):
+            print(f"[mailbox_wake] {agent}: {len(names)} unread — debounced "
+                  f"on active app-server route ({reason})")
+            return 0
+
     # T-5306 (ORG-103 L4): a codex seat whose app-server route switch is on gets its wake
     # through the seat's delivery path. That path queues while the seat is busy, so none
     # of the pane-idle logic below applies. Route down -> alerted, then the pane path.
-    if cfg.get("harness") == "codex":
+    if harness == "codex" and action == "wake":
         prompt = build_kick(agent, names, _senders(new_dir, names),
                             _queued_subjects(new_dir, names))
         # T-5660: the live route carries wakes for the seat's real hub inbox only. A
@@ -1281,8 +1330,12 @@ def _run_locked(agent: str, *, inbox: Path | None = None, do_inject=inject,
             route_fn = _route_off_non_hub
         status, detail = (route_fn or appserver_route_try)(prompt, names[-1], cfg["home"])
         if status == "enqueued":
-            _write_marker(marker, names[-1], current_session, now,
-                          idle_kicked=(reason == IDLE_REKICK_REASON))
+            # The app-server delivery id, not a tmux session, is the receipt. Keep
+            # the legacy-session field unknown so a later route-off fallback wakes
+            # the live pane once instead of assuming the queued route reached it.
+            _write_marker(marker, names[-1], None, now,
+                          idle_kicked=(reason == IDLE_REKICK_REASON),
+                          delivery="appserver")
             clear_defer_state(defer_state)
             print(f"[mailbox_wake] {agent}: {len(names)} unread — wake queued on the app-server "
                   f"delivery path as {detail} ({reason})")
@@ -1290,6 +1343,13 @@ def _run_locked(agent: str, *, inbox: Path | None = None, do_inject=inject,
         if status == "unavailable":
             print(f"[mailbox_wake] {agent}: app-server route unavailable ({detail}); "
                   f"falling back to the pane (alerted)", file=sys.stderr)
+
+    current_session = session_key_fn(cfg["pane_target"])  # None → legacy fallback
+    pane_idle = pane_idle_fn(cfg["pane_target"])           # None → unknown, never wakes
+    action, names, reason = decide(new_dir, marker, current_session, now, pane_idle)
+    if action == "debounced":
+        print(f"[mailbox_wake] {agent}: {len(names)} unread — debounced ({reason})")
+        return 0
 
     # T-2681: a CONFIRMED-BUSY pane (mid-turn) cannot accept a submit — an inject
     # there fails 'submit unconfirmed' and systemd records a FALSE unit failure
@@ -1301,13 +1361,6 @@ def _run_locked(agent: str, *, inbox: Path | None = None, do_inject=inject,
     # sweep, and condition 5 idle-rekick covers the debounced case). A pane whose
     # main turn has ENDED while background agents run is not busy here: input
     # submits there, and pane_idle_state reads it idle for delivery (T-4284).
-    # T-4792: the controller's recorded runtime wins over the static map, so a
-    # Claude seat failed over to codex gets the codex profile (and vice versa).
-    harness = live_harness.resolve(
-        agent, cfg.get("harness", _DEFAULT_HARNESS),
-        state_root=live_harness.default_state_root(cfg["home"]),
-    )
-
     def _count_defer() -> None:
         count, alert_now = note_defer(defer_state, names, now)
         if alert_now:

@@ -18,6 +18,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 from tools.bringup_acceptance.codex_acceptance_config_guard import (
     AcceptanceConfigGuardError,
     build_startup_config_expectation,
@@ -49,6 +51,7 @@ class ReplayPreservesBeforeOwnershipTests(unittest.TestCase):
     """T-3096: scratch replay must inherit before-file (uid, gid), not the
     process's default primary gid."""
 
+    @pytest.mark.nested_namespace
     def test_scratch_prefix_snapshots_match_before_ownership_when_gid_differs(self) -> None:
         # Pick a supplementary group that differs from the process's primary
         # gid -- this is the shape that trips the drift check in the real
@@ -89,6 +92,7 @@ class ReplayPreservesBeforeOwnershipTests(unittest.TestCase):
                     f"prefix {prefix.prefix_index} gid drift (writers={prefix.writer_names})",
                 )
 
+    @pytest.mark.nested_namespace
     def test_replay_refuses_when_before_ownership_cannot_be_mirrored(self) -> None:
         # If the process cannot chown scratch to before.(uid, gid) -- e.g.
         # before.gid is not in this process's group set -- the replay must

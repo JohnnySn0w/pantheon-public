@@ -1,14 +1,14 @@
 # Persona daemon liveness — diagnose + recover
 
-**Status:** Ratified. Drafted 2026-06-06 (T-0873; generalizes `recovery-service-recovery.md` to the Telegram-facing personas per the 2026-05-21 incident's stated recurrence vector). Revised 2026-10-17 (T-5061) for the runtime-controller topology: control-plane seats recover through the controller, never their retired bespoke unit. Author: Recovery. **Ratified 2026-10-17 by the operator (TG 8525)** per the sop/remediation per-SOP ratification rule (T-0157); simplify once every seat is on the controller (T-5116).
+**Status:** Ratified. Drafted 2026-06-06 (T-0873; generalizes `recovery-service-recovery.md` to the Telegram-facing personas per the 2026-05-21 incident's stated recurrence vector). Revised 2026-10-17 (T-5061) for the runtime-controller topology and simplified 2026-11-02 (T-5116) after every covered seat moved to that topology. Author: Recovery. **Ratified 2026-10-17 by the operator (TG 8525)** per the sop/remediation per-SOP ratification rule (T-0157); that ruling explicitly authorized removing the obsolete bespoke branch once every seat was on the controller.
 
 How to tell whether a persona's Telegram-facing session is actually alive, and bring it back when it isn't. Audience: whoever is recovering a persona — Recovery (the monitoring/recovery host), the recovery seat (Watchman), HO/Orchestrator via sudo, or the operator directly. Applies to **Orchestrator, Specialist, Recovery and Archivist**. Each runs a harness TUI in a named tmux session, so any of them can die the same silent way, and "is the persona up?" is non-obvious from a process list.
 
-## Substrate (re-verified 2026-10-30, T-5744)
+## Substrate (re-verified 2026-11-02, T-5116)
 
-What owns each session differs by seat, and it is changing as seats cut over to the runtime controller (T-2953/ORG-068). **Don't hardcode the owner: resolve it live** with `python3 tools/agent_role_map.py restart-target <persona>`, which prints `SUPERVISOR`, `SERVICE`, `PANE` and `SESSION_UNIT` from instance.yaml.
+Every covered session is owned by the runtime controller (T-2953/ORG-068). **Don't hardcode the owner: resolve it live** with `python3 tools/agent_role_map.py restart-target <persona>`, which prints `SUPERVISOR`, `SERVICE`, `PANE` and `SESSION_UNIT` from instance.yaml.
 
-| Persona | Account | Supervisor (2026-10-30) | Session unit | tmux session | Runtime | jsonl dir |
+| Persona | Account | Supervisor (2026-11-02) | Session unit | tmux session | Runtime | jsonl dir |
 |---|---|---|---|---|---|---|
 | Orchestrator (HO) | `claude` | control-plane | `pantheon-runtime-controller@orchestrator.service` (consume: `pantheon-persona-consume@orchestrator`) | `claude-telegram-bot` | claude or codex fallback | `/home/claude/.claude/projects/-home-claude` |
 | Specialist | `claude-research` | control-plane | `pantheon-runtime-controller@specialist.service` (consume: `pantheon-persona-consume@specialist`) | `claude-research-bot` | claude/interactive-subscription | `/home/claude-research/.claude/projects/-home-claude-research-pantheon-config` |
@@ -17,7 +17,7 @@ What owns each session differs by seat, and it is changing as seats cut over to 
 
 **Telegram receiver.** instance.yaml `codex_telegram_bridge.personas.<p>.claude_receiver_topology` is `runtime-owned` for orchestrator, specialist, recovery and archivist. On a claude runtime the `--channels` plugin inside the TUI is the receiver; on a codex runtime the `codex-telegram-poller.service` bridge is. So "is the bot up?" depends on which runtime is live. Read `~/.local/state/pantheon/personas/<p>/active-runtime.json` (a cache; tmux plus pid liveness is authoritative) before choosing a recovery path.
 
-**Control-plane seats** (all four personas above): `pantheon-runtime-controller@<p>` owns the session and relaunches a dead pane through runtime selection (honouring holds and overrides). The old bespoke unit is retired and disabled: **never start or restart it**, because that resurrects a second supervisor next to the controller.
+`pantheon-runtime-controller@<p>` owns each session and relaunches a dead pane through runtime selection (honouring holds and overrides). The old bespoke unit is retired and disabled: **never start or restart it**, because that resurrects a second supervisor next to the controller.
 
 The auto-restart and health layer on top (context_fill_monitor api-health, wedge and fill restarts, `restart_drain`, `handoff_and_restart.sh`, the recovery watcher) reduces incidence but does not replace this runbook for the residual cases.
 
@@ -29,7 +29,7 @@ Mason (`suborch1`), Artisan (`suborch2`) and Watchman (`codex-fallback`) have no
 
 Three distinct modes — **`systemctl is-active` does NOT distinguish them; `tmux capture-pane` is the source of truth.**
 
-1. **Inert daemon** — the tmux session and its harness process exited; nothing is running. Bespoke seats auto-restart, and the mode persists only if the crash-loop guard tripped (unit `failed`). Control-plane seats are relaunched by the controller unless runtime selection is blocked (look for `runtime_viability_blocked` in `~/.local/state/pantheon/personas/<p>/runtime-controller/controller-evidence.jsonl`).
+1. **Inert daemon** — the tmux session and its harness process exited; nothing is running. The controller relaunches it unless runtime selection is blocked (look for `runtime_viability_blocked` in `~/.local/state/pantheon/personas/<p>/runtime-controller/controller-evidence.jsonl`).
 2. **Alive-but-erroring** — process running, `is-active` = `active`, but every API request 400s (the 2026-05-21 Recovery trigger: `400 role 'system' is not supported on this model`, 162 failures over ~14h on a giant long-lived session). A bare auto-restart does NOT catch this (the process never exits); the `context_fill_monitor` api-health check force-restarts it.
 3. **Wedged TUI** — blocked at a modal or dialog (e.g. a malformed `~/.claude/settings.json` gives "Settings Error"; a "Resume from summary" usage modal; the dev-channels boot dialog; a spend-limit or `/model` picker). capture-pane shows the dialog; the loop is frozen behind it.
 
@@ -56,7 +56,7 @@ sudo -u <ACCT> XDG_RUNTIME_DIR=/run/user/$(id -u <ACCT>) systemctl --user status
 
 ## Recommended remediation (ranked)
 
-### Control-plane seats (`SUPERVISOR=control-plane`)
+### Controller-owned seats (`SUPERVISOR=control-plane`)
 
 0. **First, `harness <seat> status`** (ORG-106, T-5526). A seat in `deep-sleep` (`asleep` or `draining`) is down ON PURPOSE. It is not a fault. Do not restart it, kill-and-relaunch it, or start any unit for it: a launch while asleep is a `launch_breach` and pages. If it must come back, run `harness <seat> wake --reason "..."` and let the next consume fire relaunch it. A `paused-intake` seat's session is alive, so recover it normally (the pause stays in force).
 
@@ -64,29 +64,15 @@ sudo -u <ACCT> XDG_RUNTIME_DIR=/run/user/$(id -u <ACCT>) systemctl --user status
    ```bash
    # what recovery_self_restart.sh and context_fill_monitor resolve to:
    sudo -u <ACCT> bash -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) ~/pantheon-config/tools/handoff_and_restart.sh \
-     --service pantheon-persona-consume@<p>.service --mode user --target-pane <PANE> --supervisor control-plane'
+     --handoff-file /home/<ACCT>/HANDOFF.md --service pantheon-persona-consume@<p>.service \
+     --mode user --target-pane <PANE> --supervisor control-plane'
    ```
-   It asks the seat to write a handoff, ends the pane, and lets the controller re-run selection.
+   It asks the seat to write a handoff, ends the pane, and lets the controller re-run selection. Treat this wrapper as the **sole owner of the cycle** and let it return through its built-in readiness verification. Do not separately restart `pantheon-persona-consume@<p>.service` before, during, or immediately after it: a second consume job can race the controller relaunch and respawn the selected runtime over the fresh pane. If another action is still necessary, re-capture the pane and controller evidence after this command returns, then diagnose that result before firing another controller/consume action.
 2. **Pane wedged so hard the handoff can't land** (mode 3 with no prompt): end the tmux session (`sudo -u <ACCT> tmux kill-session -t <SESSION>`); the controller relaunches it. A spend-limit modal is governed by the specific [agent spend-limit wedge SOP](agent-spend-limit-wedge.md), not this generic liveness recipe: its lease-held broker Escape is permitted only when fresh detector evidence identifies a monthly-spend-limit modal, the parsed reset time has passed, and a live capture immediately before action proves the exact modal still occupies the pane bottom. The detector state is reread after capture; missing, changed, stale, ambiguous, pre-reset, unreadable, or nonmatching evidence refuses. This broker action does not authorize dismissing a generic picker modal. Don't restart `pantheon-runtime-controller@<p>` itself for a stuck pane.
 3. **Controller unit `failed`** (start-limit): `systemctl --user reset-failed pantheon-runtime-controller@<p>.service`, then `start` it, then read controller-evidence for the cause before trying again.
 4. **Never** start or restart the retired bespoke unit (`claude-telegram-<x>.service`) on a control-plane seat.
 
-### Bespoke seats (`SUPERVISOR=bespoke`)
-
-1. **Restart the service (preferred — clean lifecycle; the cure for mode 2).**
-   ```bash
-   systemctl --user restart <SESSION_UNIT>                                            # same-account
-   sudo -u <ACCT> XDG_RUNTIME_DIR=/run/user/$(id -u <ACCT>) systemctl --user restart <SESSION_UNIT>   # cross-account
-   ```
-   ⚠️ **`systemctl restart` can be a NO-OP for the inner harness.** The supervisor wrapper is idempotent: it only (re)creates the tmux session if it's missing, so a restart that finds the session alive cycles only the supervisor and leaves the SAME inner-claude PID. **Verify by inner-process PID change** (`pgrep -af '.npm-global/bin/claude'`), NEVER by `is-active` or exit-zero alone (caught on Orchestrator 2026-05-25).
-2. **True restart when the inner process must actually cycle** (mode 2/3, or a no-op restart):
-   ```bash
-   sudo -u <ACCT> tmux kill-session -t <SESSION>     # supervisor (Restart=always) respawns a FRESH session
-   ```
-   A fresh session resets accumulated session and request state (clears the mode-2 poison), gives a fresh `--channels` bridge (clears mode-4 fork-severance) and dismisses a modal (mode 3).
-3. **Unit `failed`** (crash-loop guard tripped): `systemctl --user reset-failed <SESSION_UNIT> && systemctl --user restart <SESSION_UNIT>`.
-
-### Either supervisor
+### Configuration recovery
 
 - **Mode 3 on malformed settings:** restore `~/.claude/settings.json` from a known-good backup (snapshot hooks / `~/.claude/backups/`), then cycle as above. Only hand-edit config if the failure points there — every edit is a chance to make recovery harder.
 
@@ -101,11 +87,11 @@ systemctl --user is-active <SESSION_UNIT>              # active
 pgrep -af '.npm-global/bin/claude'                     # NEW inner PID vs pre-restart
 tmux capture-pane -t <PANE> -p | tail -5               # prompt frame, no API errors / modal
 ```
-On a control-plane seat, also confirm the last `controller_start_*` event in controller-evidence is after your action. Then **round-trip the bridge**: send a Telegram message and confirm a reply lands (a healthy-looking idle pane can still have a dead bridge — mode 4). Canonical self-check: `bash ~/pantheon-config/tools/verify_startup.sh --agent <persona>` (exit 0 = healthy; 7 = pane wedged; it names the session supervisor). Full discipline: `sop/standard/confirm-health-after-touching-a-live-session.md`.
+Also confirm the last `controller_start_*` event in controller-evidence is after your action. Then **round-trip the bridge**: send a Telegram message and confirm a reply lands (a healthy-looking idle pane can still have a dead bridge — mode 4). Canonical self-check: `bash ~/pantheon-config/tools/verify_startup.sh --agent <persona>` (exit 0 = healthy; 7 = pane wedged; it names the session supervisor). Full discipline: `sop/standard/confirm-health-after-touching-a-live-session.md`.
 
 ## Autonomous-vs-bubble-up (D3) placement
 
-- **Autonomous** (Recovery or any recoverer applies directly — in-scope, reversible): a controller cycle through `handoff_and_restart.sh --supervisor control-plane`, a bespoke restart / reset-failed / tmux-kill-session, restoring settings from backup, and the round-trip verification. Confirm health (is-active + capture-pane + PID change + round-trip) and state "confirmed healthy" rather than leaving it implied.
+- **Autonomous** (Recovery or any recoverer applies directly — in-scope, reversible): a controller cycle through `handoff_and_restart.sh --supervisor control-plane`, the controller-owned reset-failed or tmux-kill-session paths above, restoring settings from backup, and the round-trip verification. Confirm health (is-active + capture-pane + PID change + round-trip) and state "confirmed healthy" rather than leaving it implied.
 - **Bubble up to the operator:** a crash-loop or start-limit guard repeatedly exhausting after restarts (genuinely broken, not transient); any need to *edit* (not restore) config or change the model; a recurrence of the mode-2 400 outage (signals an unresolved upstream harness or model cause); a fresh session that boots silent and a re-kick doesn't recover; runtime selection blocked for a reason no ticket explains.
 
 ## Precedent cases

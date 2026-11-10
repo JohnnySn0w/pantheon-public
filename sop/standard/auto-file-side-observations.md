@@ -107,7 +107,7 @@ If the file invocation fails (e.g., git push conflict): log the failure, retry o
 
 ### Recovery (claude-fallback)
 
-- Recovery observes a lot during grooming + system-monitor work. Most observations are tooling/bug/refactor candidates in pantheon-config (or another live project repo — e.g. kino-pwa, codex-config).
+- Recovery observes a lot during grooming + system-monitor work. Most observations are tooling/bug/refactor candidates in pantheon-config (including `harness/codex/`) or another live project repo such as kino-pwa.
 - `role:head_system_orchestrator` tickets for own work, `role:head_engineering_orchestrator` for items needing triage. Don't hesitate to file — the cost of an extra ticket Recovery could have done inline is much lower than the cost of losing the observation.
 - Use `requester: recovery` so the ledger thread is clean.
 

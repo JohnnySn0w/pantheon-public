@@ -366,9 +366,10 @@ carve_outs:
     axis: role-claude-md-present
     verdict: intentional-variant
     rationale: >
-      Codex uses codex-config-template (per codex bringup, pantheon-bringup.md
-      §12) not a CLAUDE.md file. The role-orientation surface for codex is
-      AGENTS.md + codex-config files, verified separately. Absence of
+      Codex uses the pantheon-config harness/codex FRAMEWORK (published to
+      codex-config-template only as a downstream release artifact; see
+      pantheon-bringup.md §12), not a CLAUDE.md file. Its role-orientation
+      surface is AGENTS.md plus the Codex harness files, verified separately. Absence of
       /home/codex/CLAUDE.md is not a parity gap.
     ratifier: sop/standard/pantheon-bringup.md-section-12
     ratified_date: 2026-09-16
@@ -393,8 +394,8 @@ carve_outs:
     axis: persona-orientation-rendered-fresh
     verdict: intentional-variant
     rationale: >
-      persona_orientation/check_stale.py is Claude-Code-clone-aware; codex uses
-      codex-config-template which has its own persona-orientation render path
+      persona_orientation/check_stale.py is Claude-Code-clone-aware; Codex uses
+      harness/codex, which has its own persona-orientation render path
       (T-3338 codex-side spawn preload). Cross-harness parity is that BOTH
       surfaces stay fresh, verified per-harness, not that both use the same
       check_stale.py mechanism. T-3338 preload confirmed live in codex spawn

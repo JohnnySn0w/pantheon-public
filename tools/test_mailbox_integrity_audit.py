@@ -22,6 +22,9 @@ from tools import mailbox
 from tools import mailbox_integrity_audit as mia
 
 ME = getpass.getuser()
+# An account that is never the one running the tests (T-5784: the suite runs on every
+# seat, and on specialist's own account "claude-research" was ME, so no owner mismatch fired).
+OTHER = "soak-other-account"
 
 
 class AuditTests(unittest.TestCase):
@@ -33,8 +36,8 @@ class AuditTests(unittest.TestCase):
         for sub in ("tmp", "new", "cur"):
             (self.inbox / sub).mkdir(parents=True, exist_ok=True)
         # personas map to accounts; "recovery" is written by this test's own account.
-        self.persona_accounts = {"recovery": ME, "specialist": "claude-research"}
-        self.accounts = {ME, "claude-research"}
+        self.persona_accounts = {"recovery": ME, "specialist": OTHER}
+        self.accounts = {ME, OTHER}
         env = mock.patch.dict(os.environ, {"PANTHEON_SENT_LEDGER": os.devnull})
         env.start()
         self.addCleanup(env.stop)
@@ -85,10 +88,10 @@ class AuditTests(unittest.TestCase):
                           "sender-mismatch", "world-bits"])
 
     def test_owner_must_match_the_persona_account(self) -> None:
-        self.send(sender="specialist")  # written by ME, but specialist's account is claude-research
+        self.send(sender="specialist")  # written by ME, but specialist maps to OTHER
         r = self.run_audit()
         self.assertEqual(self.classes(r), ["owner-mismatch"])
-        self.assertIn("expects claude-research", r.anomalies[0][2])
+        self.assertIn(f"expects {OTHER}", r.anomalies[0][2])
 
     def test_tool_senders_are_counted_not_flagged(self) -> None:
         self.send(sender="disk-warn")
@@ -133,6 +136,68 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(mia.list_inboxes(self.hub, run=fake), ["orchestrator"])
         argv = fake.call_args.args[0]
         self.assertEqual(argv[-2:], ["-1A", str(self.hub)])
+
+    def _deny_hub_listing(self):
+        real = os.listdir
+
+        def listdir(p):
+            if Path(p) == self.hub:
+                raise PermissionError(13, "denied")
+            return real(p)
+        return mock.patch.object(mia.os, "listdir", listdir)
+
+    def test_recovery_seat_enumerates_known_inboxes_when_complete(self) -> None:
+        # T-6142: no listing and no owner sudo (watchman). The registry-known names are
+        # probed by traverse; st_nlink proves they are EVERY subdir, so coverage is full.
+        (self.hub / "specialist-a2a" / "new").mkdir(parents=True)
+        failed = mock.Mock(return_value=subprocess.CompletedProcess([], 1, stdout=""))
+        with self._deny_hub_listing():
+            names = mia.list_inboxes(self.hub, run=failed,
+                                     candidates=["orchestrator", "recovery", "specialist-a2a"])
+        self.assertEqual(names, ["specialist-a2a", "orchestrator"])
+
+    def test_recovery_seat_shortfall_is_refused_never_partial_clean(self) -> None:
+        (self.hub / "rogue-box" / "new").mkdir(parents=True)  # nobody named it
+        failed = mock.Mock(return_value=subprocess.CompletedProcess([], 1, stdout=""))
+        with self._deny_hub_listing(), self.assertRaisesRegex(PermissionError, "1 NOT"):
+            mia.list_inboxes(self.hub, run=failed, candidates=["orchestrator"])
+
+    def test_symlinked_candidate_cannot_stand_in_for_an_unnamed_inbox(self) -> None:
+        # reviewer (T-6142): a symlink passes is_dir() but adds nothing to st_nlink
+        (self.hub / "rogue-box" / "new").mkdir(parents=True)
+        os.symlink(self.inbox, self.hub / "recovery")
+        failed = mock.Mock(return_value=subprocess.CompletedProcess([], 1, stdout=""))
+        with self._deny_hub_listing(), self.assertRaisesRegex(PermissionError, "NOT auditable"):
+            mia.list_inboxes(self.hub, run=failed, candidates=["orchestrator", "recovery"])
+
+    def test_non_maildir_subdir_is_a_refusal_not_a_clean(self) -> None:
+        (self.hub / "stray").mkdir()
+        failed = mock.Mock(return_value=subprocess.CompletedProcess([], 1, stdout=""))
+        with self._deny_hub_listing(), self.assertRaises(PermissionError):
+            mia.list_inboxes(self.hub, run=failed, candidates=["orchestrator"])
+
+    def test_uncounted_nlink_is_refused(self) -> None:
+        failed = mock.Mock(return_value=subprocess.CompletedProcess([], 1, stdout=""))
+        real = os.stat
+        fake = lambda p, *a, **k: os.stat_result((0o40710, 0, 0, 1, 0, 0, 0, 0, 0, 0)) \
+            if Path(p) == self.hub else real(p, *a, **k)
+        with self._deny_hub_listing(), mock.patch.object(mia.os, "stat", fake), \
+                self.assertRaisesRegex(PermissionError, "unverifiable"):
+            mia.list_inboxes(self.hub, run=failed, candidates=["orchestrator"])
+
+    def test_owner_sudo_raising_still_reaches_the_complete_probe(self) -> None:
+        for exc in (FileNotFoundError(2, "no sudo"), subprocess.TimeoutExpired("sudo", 60)):
+            boom = mock.Mock(side_effect=exc)
+            with self._deny_hub_listing():
+                self.assertEqual(mia.list_inboxes(self.hub, run=boom, candidates=["orchestrator"]),
+                                 ["orchestrator"])
+
+    def test_default_candidates_cover_every_registry_persona(self) -> None:
+        from tools import agent_role_map as arm
+        c = mia.candidate_inboxes()
+        for persona in arm.account_persona_map().values():
+            self.assertIn(persona, c)
+        self.assertIn("specialist-a2a", c)
 
     def test_unlistable_hub_is_exit_2_never_clean(self) -> None:
         err = io.StringIO()

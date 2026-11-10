@@ -13,6 +13,12 @@ Applies to all four pairs. They share one shape: a **genericized derivative** wh
 | **Generator pair** | `claude-harness-mirror` (claude-code-config), `codex-harness-mirror` (codex-config-template) | GENERATED from one pinned pantheon-config sha by `tools/build_harness_mirror.py`, from `harness/<h>/mirror/manifest.yaml` (generated files, shadows, overlay). ORG-091 §2. | Steps marked **[G]** |
 | **Legacy pair** | `pwa-release-mirror`, `pantheon-public-mirror` | Hand-built: pwa from its persistent `genericize` branch; pantheon-public from the weekly T-1327 scratch build plus deep-verify (`gated: true`). | Steps marked **[L]** |
 
+For generator pairs, `claude-code-config` and `codex-config-template` are the
+publication targets, not editable source repositories. Their canonical source
+is the pinned pantheon-config tree under `harness/<h>/`; the retired
+standalone `claude-config` and `codex-config` repos do not participate in this
+procedure.
+
 Steps with no marker apply to both. The publish leg (steps 6-10: commit-tree orphan-squash, fast-forward, one-ref bundle, verify by cloning, anchor record, handoff) is the same for both classes.
 
 Do NOT use this for: reading a mirror to measure drift (the sweep is anchor-based and never reads a mirror — see `tools/mirror_state.py`), or changing a mirror's visibility/branding (operator-initiated only, standing boundary from T-1983).
@@ -276,11 +282,14 @@ git push -q /tmp/pub.git <publish-commit>:refs/heads/main
 git --git-dir=/tmp/pub.git bundle create /tmp/<name>.bundle main
 git bundle list-heads /tmp/<name>.bundle      # must show exactly ONE ref
 sha256sum /tmp/<name>.bundle
-git clone -q /tmp/<name>.bundle /tmp/verify
+git clone -q -b main /tmp/<name>.bundle /tmp/verify   # -b <the one ref's branch> (main; pantheon-public: master)
+git -C /tmp/verify ls-files | wc -l                    # must equal the build's file count, never 0
 cd /tmp/verify && git log --format='%an <%ae>' | sort -u   # authors, FULL history
 ```
 
 **Verification:** read the CLONE's log and author set — do not trust the construction. Confirm the history is the short orphan-squash lineage, not the source repo's.
+
+**A one-ref bundle has no HEAD, so a bare `git clone` checks out NOTHING (T-1327, 2026-11-02).** Clone warns `remote HEAD refers to nonexistent ref, unable to checkout` and leaves an empty worktree. Every scan run on it then passes vacuously: on the 2026-11-02 pantheon-public pass, `verify_seed.py` on the empty clone reported identity classes 0. Always pass `-b <branch>`, and check the file count before trusting any scan of the clone.
 
 **[G]** Also, on the clone:
 
@@ -451,7 +460,7 @@ A **hand-landing** is a commit landed directly on the public mirror outside the 
 
 ## Boundary *(T-4768 changed)*
 
-Covers the **build + gate + bundle + handoff** legs and the anchor contract. Does NOT cover: the publish push itself (orchestrator's leg — `git push mirror`), visibility flips or public branding (**operator-initiated only**, standing boundary), the weekly drift sweep's own operation (`tools/mirror_drift_sweep.py`, T-1994; this SOP only says what to do with its outcomes), merging the pantheon-config PRs that change a manifest, shadow or overlay (`merging-an-agent-branch-pr.md`, HO leg), or genericization *substitutions* for the legacy pairs (`tools/seed_genericize.py` is the **claude-config seed's** gate with its own leak classes — do not misapply its `T-NNNN`/date patterns to the pwa mirror, which deliberately keeps those). The generator pairs' substitutions are the manifest's `protect` / `subs` / `rules`. They borrow only `neutralize_seed`'s boundary helpers, not its tables.
+Covers the **build + gate + bundle + handoff** legs and the anchor contract. Does NOT cover: the publish push itself (orchestrator's leg — `git push mirror`), visibility flips or public branding (**operator-initiated only**, standing boundary), the weekly drift sweep's own operation (`tools/mirror_drift_sweep.py`, T-1994; this SOP only says what to do with its outcomes), merging the pantheon-config PRs that change a manifest, shadow or overlay (`merging-an-agent-branch-pr.md`, HO leg), or genericization *substitutions* for the legacy pairs (`tools/seed_genericize.py` is the **pantheon-public seed's** gate with its own leak classes — do not misapply its `T-NNNN`/date patterns to the pwa mirror, which deliberately keeps those). The generator pairs' substitutions are the manifest's `protect` / `subs` / `rules`. They borrow only `neutralize_seed`'s boundary helpers, not its tables.
 
 Recovery holds a working read-write deploy key for the pwa mirror (T-1983). **Capability is not authorization** — pushing an outward-facing repo trips the external-facing prong of the act-vs-ask test, and the T-1475 division routes the publish through orchestrator regardless.
 

@@ -914,6 +914,13 @@ class BusyStaleWiringT4323(unittest.TestCase):
         with patch("tools.seat_state.safe_effective_for", return_value=None):
             self.assertFalse(msm._inbox_seat_paused("artisan"))
 
+    def test_halted_seat_is_not_an_authorised_pause_T5868(self):
+        from tools import seat_state_testkit as kit
+        for state, expect in (("paused-intake", True), ("deep-sleep", True), ("halted", False)):
+            with self.subTest(state), patch("tools.seat_state.safe_effective_for",
+                                            return_value=kit.eff(state)):
+                self.assertIs(msm._inbox_seat_paused("artisan"), expect)
+
     def test_maintenance_alone_still_suppresses_exactly_as_before_T5527(self):
         with patch("tools.notify_policy.in_maintenance", return_value=True):
             self.assertTrue(msm._inbox_in_maintenance("artisan"))

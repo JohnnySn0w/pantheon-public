@@ -25,6 +25,7 @@ can still see what was lost — which is why this works despite running long aft
 event, and why it must never `reset-failed` (that is what destroys the evidence).
 
     for each account:  systemctl --user list-units --failed   -> {units} | UNKNOWN
+    plus SYSTEM:       systemctl list-units --failed          -> {units} | UNKNOWN  (T-6364)
     against:           recovery's mailbox, subjects "unit-failure: <unit>"
     report:            failed units with NO alert ever received  <- the asymmetry
 
@@ -40,6 +41,7 @@ is a judgement, and it is the act that destroys the only remaining evidence.
 Usage:
     python3 tools/failed_unit_reconcile.py            # sweep all accounts
     python3 tools/failed_unit_reconcile.py --account claude-research
+    python3 tools/failed_unit_reconcile.py --account system   # system units only
     python3 tools/failed_unit_reconcile.py --json
 """
 from __future__ import annotations
@@ -64,6 +66,13 @@ PROBE_TIMEOUT_SECONDS = 20
 # Sentinel distinct from both "no failures" and an empty set.
 UNKNOWN = "UNKNOWN"
 
+# T-6364: pseudo-account for the SYSTEM manager. System units (the mosquitto drop-in,
+# the host-approval ingress) gained StartLimit latches in T-6352/T-6359 with no
+# OnFailure, so a latched system failure was invisible to a --user-only sweep.
+# `systemctl list-units --failed` reads system state without root. No alert is wired
+# for system units, so any failed one reports SILENT, which is the point.
+SYSTEM = "system"
+
 _SUBJECT_RE = re.compile(r"^unit-failure:\s*(?P<unit>\S+)")
 
 
@@ -76,8 +85,12 @@ def failed_units(account: str, *, timeout: int = PROBE_TIMEOUT_SECONDS):
     an empty set would manufacture exactly the all-clear it is meant to catch.
     """
     inner = "XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user list-units --failed --plain --no-legend"
-    argv = (["bash", "-lc", inner] if account == getpass.getuser()
-            else ["sudo", "-n", "-u", account, "bash", "-lc", inner])
+    if account == SYSTEM:
+        argv = ["systemctl", "list-units", "--failed", "--plain", "--no-legend"]
+    elif account == getpass.getuser():
+        argv = ["bash", "-lc", inner]
+    else:
+        argv = ["sudo", "-n", "-u", account, "bash", "-lc", inner]
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, OSError):
@@ -125,7 +138,7 @@ def alerted_units(inbox: pathlib.Path = RECOVERY_INBOX) -> dict[str, set[str]]:
 def reconcile(accounts=None, *, inbox: pathlib.Path = RECOVERY_INBOX) -> dict:
     """Per account: failed units, and which of them we never got an alert for."""
     mapping = account_persona_map()
-    accounts = list(accounts or mapping.keys())
+    accounts = list(accounts or [*mapping.keys(), SYSTEM])
     alerts = alerted_units(inbox)
     result = {"unreachable": [], "clean": [], "accounted": {}, "SILENT": {}}
     for acct in sorted(accounts):
@@ -183,6 +196,10 @@ def main(argv=None) -> int:
             print(f"    {a}  {u}")
     print("  Triage per unit; do NOT reset-failed before reading the journal — "
           "clearing the latch destroys the only remaining evidence.")
+    if SYSTEM in r["SILENT"]:
+        print("  'system' units: clearing the latch needs ROOT (plain `systemctl "
+              "reset-failed <unit>`, no --user); route it via orchestrator/pantheon-sudo. "
+              "Until then this re-fires each sweep (as a silent user unit does).")
     return 1
 
 

@@ -36,11 +36,12 @@ exit 64 before anything runs. Side effects are exactly: stdout lines, the
 close) bare TCP/UDP sockets and send no payload but a fixed DNS root query to
 the local resolver; --render-sample opens nothing and writes nothing.
 
-NOT WIRED HERE (later phases). main() constructs no balance observer (the
-thresholds are set at H7, and the key lives on the seat) and no renderer (H2's
-hermes target), so balance_band/config_* read unknown from the CLI. run() takes
-both injected; tests drive them with the real DeepSeekBalanceObserver over a
-canned body and a fake renderer.
+LIVE CLI WIRING (T-6222). main() first verifies the same typed egress evidence
+as the runtime launch gate. Only an ``enforced`` result may load the H4
+manifest, construct the real proxy-backed DeepSeekBalanceObserver, and render
+the expected Hermes bytes in memory. Missing, malformed, open, or stale gate
+evidence fails closed to enum ``unknown`` without an HTTP request. run() keeps
+observer and renderer injection seams for deterministic unit tests.
 
 UNTRUSTED INPUT. Provider bodies are reduced to a band and an int by
 provider_quota/quota before this module sees them; the renderer's output and the
@@ -73,8 +74,17 @@ from tools.harness_adapter.hermes_render import (  # noqa: E402
     RUNTIME_CONFIG_FILENAME,
     SEAT_DIRNAME,
     STANDING_FILENAME,
+    dotenv_control_findings,
+    hermes_install_root,
+    render_seat_files,
 )
 from tools.harness_adapter.quota import classify_balance  # noqa: E402
+from tools.harness_adapter.hermes import balance_thresholds_from_native  # noqa: E402
+from tools.harness_adapter.provider_quota import (  # noqa: E402
+    DeepSeekBalanceObserver,
+    read_deepseek_balance,
+)
+from tools.deepseek_egress_proxy import load_policy, probe_boundary  # noqa: E402
 from tools.health_export import _MAX_EPOCH, _bounded_int, atomic_write_json  # noqa: E402
 from tools.recovery_watcher import CAP_STATES, _load_json, _read_small  # noqa: E402
 
@@ -82,8 +92,16 @@ SEAT_ACCOUNT = "deepseek-fallback"
 DEFAULT_OUT_DIR = Path("/run/deepseek-fallback-health")
 HEALTH_NAME = "watcher.json"
 DEFAULT_STATE_FILE = Path.home() / ".local/state/pantheon/deepseek_seat_watcher.json"
+DEFAULT_EGRESS_POLICY = Path("/etc/pantheon/deepseek-egress/policy.json")
+DEFAULT_EGRESS_CA = Path("/etc/pantheon/deepseek-egress/ca.pem")
+DEFAULT_EGRESS_MANIFEST = Path("/etc/pantheon/deepseek-egress/watcher-gate.json")
+DEFAULT_SOURCE_ROOT = Path("/opt/pantheon/deepseek-seat/source/current")
+DEFAULT_MANIFEST = DEFAULT_SOURCE_ROOT / "instance.yaml"
+DEFAULT_HERMES_DEFAULTS = DEFAULT_SOURCE_ROOT / "harness/hermes/config.defaults.yaml"
+DEFAULT_ROLE = "system-orchestrator-2"
 SCHEMA_VERSION = 1
 STATE_SCHEMA_VERSION = 1
+MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 
 # ---- thresholds (module constants; tests override via monkeypatch) ----------
 BURN_WINDOW_S = 24 * 3600
@@ -259,6 +277,10 @@ def burn_rate(state: dict, *, now: int, minor: int | None, currency: str | None,
 
 
 # --------------------------------------------------------------- config drift
+def _missing_install_root(_executable: Path) -> Path:
+    raise ValueError("missing executable")
+
+
 def _valid_render(rendered) -> dict[str, bytes] | None:
     if not isinstance(rendered, dict) or set(rendered) != EXPECTED_RENDER:
         return None
@@ -272,28 +294,48 @@ def _valid_render(rendered) -> dict[str, bytes] | None:
     return out
 
 
-def config_state(renderer, seat_home: Path | None) -> tuple[str, str]:
+def config_state(
+    renderer,
+    seat_home: Path | None,
+    *,
+    hermes_executable: Path | None = None,
+    install_root_resolver=hermes_install_root,
+    dotenv_evidence: list[str] | None = None,
+) -> tuple[str, str]:
     """-> (config_render, config_drift).
 
-    No renderer wired -> (unknown, unknown). A raising renderer, or one whose
-    output is not exactly {EXPECTED_RENDER path: bytes}, -> (failed, unknown).
+    No renderer wired -> render unknown. A raising renderer, or one whose
+    output is not exactly {EXPECTED_RENDER path: bytes}, -> render failed.
+    Independently, each of the three dotenv controls is audited; a finding or
+    omitted executable makes drift ``drifted`` even when render is unknown/failed.
     Otherwise each rendered file must equal the seat's on-disk bytes (a regular,
     non-symlink file: _read_small), and ~/seat must hold nothing but the
     rendered seat files; anything else is drifted. No seat home, or a ~/seat
     listing that fails other than "absent", -> drift unknown. The seat's own
     harness home (~/.hermes) carries runtime state, so only its rendered files
     are compared, not its listing."""
+    dotenv_drifted = False
+    if seat_home is not None:
+        resolver = _missing_install_root if hermes_executable is None else install_root_resolver
+        findings = dotenv_control_findings(
+            Path(seat_home), Path() if hermes_executable is None else Path(hermes_executable),
+            install_root_resolver=resolver,
+        )
+        for path_class, values in findings.items():
+            if dotenv_evidence is not None:
+                dotenv_evidence.append(f"{path_class}:{','.join(values) if values else 'clean'}")
+            dotenv_drifted = dotenv_drifted or bool(values)
     if renderer is None:
-        return "unknown", "unknown"
+        return "unknown", "drifted" if dotenv_drifted else "unknown"
     try:
         rendered = _valid_render(renderer())
     except Exception:  # noqa: BLE001 - a broken renderer is "failed", its text dropped
         rendered = None
     if rendered is None:
-        return "failed", "unknown"
+        return "failed", "drifted" if dotenv_drifted else "unknown"
     if seat_home is None:
-        return "ok", "unknown"
-    drifted = False
+        return "ok", "drifted" if dotenv_drifted else "unknown"
+    drifted = dotenv_drifted
     for rel, want in rendered.items():
         got = _read_small(Path(seat_home) / rel, MAX_RENDER_BYTES)
         if got != want:
@@ -439,6 +481,32 @@ def evaluate_egress(checks) -> str:
     return "unknown"
 
 
+def configured_egress(
+    policy_path: Path,
+    ca_path: Path,
+    manifest_path: Path,
+    *,
+    now: int | None = None,
+) -> str:
+    """The exact typed probe shared with the runtime launch gate."""
+
+    try:
+        policy = load_policy(
+            policy_path,
+            expected_owner=0 if os.geteuid() != 0 else os.geteuid(),
+        )
+        verdict, _findings = probe_boundary(
+            policy,
+            ca_path,
+            manifest_path=manifest_path,
+            now=now,
+            timeout=EGRESS_TIMEOUT_S,
+        )
+        return verdict if verdict in EGRESS_STATES else "unknown"
+    except Exception:  # noqa: BLE001 - every audit-input failure is enum unknown
+        return "unknown"
+
+
 # ------------------------------------------------------------------ incidents
 def incidents_for(rec: dict) -> list[str]:
     out = set()
@@ -501,6 +569,101 @@ def default_seat_home() -> Path | None:
         return None
 
 
+def build_runtime_components(
+    manifest_path: Path,
+    *,
+    repo_root: Path,
+    defaults_path: Path,
+    seat_home: Path,
+    ca_path: Path,
+    account: str = SEAT_ACCOUNT,
+) -> tuple[DeepSeekBalanceObserver, object, Path]:
+    """Build the H7 observer and renderer from the H4 manifest, without writes.
+
+    The fixed account discovers the eventual self-chosen persona and role from
+    ``roles``. The persona may therefore remain unknown when these account-keyed
+    units are staged, while the live H4 manifest must contain exactly one
+    binding before a cycle can observe. Every malformed/missing condition raises
+    to :func:`main`, which converts it to enum ``unknown`` without reflecting
+    exception text into output.
+    """
+    import yaml
+
+    from tools.harness_adapter.diagnostics import resolve_launch_config
+    from tools.persona_installer import Manifest, hermes_render_inputs
+
+    raw = _read_small(Path(manifest_path), MAX_MANIFEST_BYTES)
+    if raw is None:
+        raise ValueError("manifest-unavailable")
+    # Runtime readers must not let a retired flip key disable or wedge the
+    # unconditional fleet swap policy (T-5451/T-5461).
+    manifest = Manifest.from_bytes(Path(manifest_path), raw, strict_flip_keys=False)
+    try:
+        document = yaml.safe_load(raw.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError):
+        raise ValueError("manifest-invalid") from None
+    if not isinstance(document, dict):
+        raise ValueError("manifest-invalid")
+
+    matches: list[tuple[str, dict]] = []
+    for role, binding in manifest.roles.items():
+        if isinstance(binding, dict) and binding.get("account") == account:
+            matches.append((str(role), binding))
+    if len(matches) != 1:
+        raise ValueError("account-binding-invalid")
+    role, binding = matches[0]
+    persona = binding.get("persona")
+    if role != DEFAULT_ROLE or binding.get("harness") != "hermes" or not isinstance(persona, str):
+        raise ValueError("account-binding-invalid")
+
+    launch = resolve_launch_config(
+        document,
+        role=role,
+        account_home=Path(seat_home),
+        selected_harness="hermes",
+    )
+    native = launch.native
+    base_url = native.get("base_url")
+    if base_url != "https://deepseek-proxy.invalid:8448/v1":
+        raise ValueError("proxy-base-url-invalid")
+    thresholds = balance_thresholds_from_native(native.get("balance"))
+    observer = DeepSeekBalanceObserver(
+        lambda: read_deepseek_balance(
+            Path(seat_home) / HERMES_HOME_DIRNAME / ".env",
+            base_url=base_url,
+            key_holding_proxy=True,
+            ca_file=Path(ca_path),
+        ),
+        profile=f"hermes/{launch.profile}",
+        thresholds=thresholds,
+    )
+    inputs = hermes_render_inputs(
+        manifest.installer,
+        persona,
+        account_home=Path(seat_home),
+        repo_root=Path(repo_root),
+        defaults_path=Path(defaults_path),
+        label=str(manifest_path),
+    )
+    if inputs is None:
+        raise ValueError("render-inputs-missing")
+
+    def renderer() -> dict[str, bytes]:
+        rendered: dict[str, bytes] = {}
+        for path, data in render_seat_files(inputs, launch):
+            try:
+                relative = path.relative_to(seat_home).as_posix()
+            except ValueError:
+                raise ValueError("render-target-outside-home") from None
+            if relative in EXPECTED_RENDER:
+                rendered[relative] = data
+        if set(rendered) != EXPECTED_RENDER:
+            raise ValueError("render-target-set-invalid")
+        return rendered
+
+    return observer, renderer, launch.executable
+
+
 def build_record(*, now: int, band: str, minor: int | None, burn: str, render: str,
                  drift: str, egress: str) -> dict:
     rec = {"schema_version": SCHEMA_VERSION, "heartbeat": now, "account": SEAT_ACCOUNT,
@@ -514,7 +677,9 @@ def build_record(*, now: int, band: str, minor: int | None, burn: str, render: s
 
 def run(*, out_dir: Path, state_file: Path, now: int | None = None, observer=None,
         thresholds="observer", renderer=None, seat_home: Path | None = None,
-        egress_checks=None, burn_alarm_minor_units: int | None = None, out=None) -> int:
+        hermes_executable: Path | None = None, install_root_resolver=hermes_install_root,
+        egress_checks=None, egress_verdict: str | None = None,
+        burn_alarm_minor_units: int | None = None, out=None) -> int:
     """One dry-run cycle. `thresholds` defaults to the observer's own (the
     manifest's, at H7). The burn alarm is burn_alarm_minor_units, else the
     thresholds' burn_alarm_24h, else DEFAULT_BURN_ALARM_MINOR_UNITS.
@@ -537,8 +702,18 @@ def run(*, out_dir: Path, state_file: Path, now: int | None = None, observer=Non
     # EGRESS_TIMEOUT_S) run first and write nothing, so the heartbeat is
     # stamped at write time, not at cycle start.
     band, minor, currency = read_balance(observer, thresholds)
-    render, drift = config_state(renderer, seat_home)
-    egress = evaluate_egress(egress_checks)
+    dotenv_evidence: list[str] = []
+    render, drift = config_state(
+        renderer, seat_home,
+        hermes_executable=hermes_executable,
+        install_root_resolver=install_root_resolver,
+        dotenv_evidence=dotenv_evidence,
+    )
+    egress = (
+        egress_verdict
+        if egress_verdict in EGRESS_STATES
+        else evaluate_egress(egress_checks) if egress_verdict is None else "unknown"
+    )
 
     # One cycle at a time from load_state to the last write: atomic_write_json
     # uses a FIXED .tmp name, and an overlapping cycle (a manual run during the
@@ -573,6 +748,8 @@ def run(*, out_dir: Path, state_file: Path, now: int | None = None, observer=Non
             f"cap_state={rec['cap_state']} burn_rate={burn} config_render={render} "
             f"config_drift={drift} egress_policy={egress} "
             f"incidents={len(rec['incidents'])} actions=0")
+        if dotenv_evidence:
+            log(f"dotenv_controls={';'.join(dotenv_evidence)}")
         for value in rec["incidents"]:
             log(render_incident(Incident(value), {**rec, "burn_alarm_minor_units": alarm}))
         if new_state is not state:
@@ -724,9 +901,20 @@ LIVE_REFUSED = "refused: this watcher has no live mode (T-5125 is dry-run only; 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    ap.add_argument("--account", default=SEAT_ACCOUNT,
+                    help="account-keyed unit instance (only deepseek-fallback is valid)")
+    ap.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    ap.add_argument("--repo-root", type=Path, default=DEFAULT_SOURCE_ROOT)
+    ap.add_argument("--defaults", type=Path, default=DEFAULT_HERMES_DEFAULTS)
+    ap.add_argument("--seat-home", type=Path, default=None)
     ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     ap.add_argument("--state-file", type=Path, default=DEFAULT_STATE_FILE)
     ap.add_argument("--burn-alarm-minor-units", type=int, default=None)
+    ap.add_argument("--egress-policy", type=Path, default=DEFAULT_EGRESS_POLICY)
+    ap.add_argument("--egress-ca", type=Path, default=DEFAULT_EGRESS_CA)
+    ap.add_argument("--egress-manifest", type=Path, default=DEFAULT_EGRESS_MANIFEST)
+    ap.add_argument("--hermes-executable", type=Path, default=None,
+                    help="Hermes console script; enables the three-path dotenv drift audit")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true",
                       help="one observe-only cycle (default). Inert for ACTIONS only: it "
@@ -738,6 +926,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--live", action="store_true", help=argparse.SUPPRESS)
     mode.add_argument("--live-page", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
+    if args.account != SEAT_ACCOUNT:
+        ap.error(f"--account must be {SEAT_ACCOUNT}")
     if args.burn_alarm_minor_units is not None and args.burn_alarm_minor_units < 0:
         ap.error("--burn-alarm-minor-units must be >= 0")
     if args.live or args.live_page:
@@ -746,9 +936,37 @@ def main(argv: list[str] | None = None) -> int:
     if args.render_sample:
         print("\n".join(render_sample()))
         return 0
+    egress = configured_egress(args.egress_policy, args.egress_ca, args.egress_manifest)
+    observer = None
+    renderer = None
+    executable = args.hermes_executable
+    seat_home = args.seat_home if args.seat_home is not None else default_seat_home()
+    # The egress decision is the pre-action state gate. An open, stale, absent,
+    # or malformed gate must prevent both manifest consumption and the TLS
+    # balance observation; the record still writes typed unknowns for Recovery.
+    if egress == "enforced" and seat_home is not None:
+        try:
+            observer, renderer, manifest_executable = build_runtime_components(
+                args.manifest,
+                repo_root=args.repo_root,
+                defaults_path=args.defaults,
+                seat_home=seat_home,
+                ca_path=args.egress_ca,
+                account=args.account,
+            )
+            if executable is None:
+                executable = manifest_executable
+        except Exception:  # noqa: BLE001 - value-free, fail-closed enum output
+            observer = None
+            renderer = None
+    # When the pre-gate is not enforced, no H4 bytes were trusted or loaded;
+    # report config unknown rather than fabricating drift from a deliberately
+    # absent executable audit input.
+    inspected_home = seat_home if egress == "enforced" else None
     return run(out_dir=args.out_dir, state_file=args.state_file,
-               observer=None, renderer=None, seat_home=default_seat_home(),
-               egress_checks=make_egress_checks(),
+               observer=observer, renderer=renderer, seat_home=inspected_home,
+               hermes_executable=executable,
+               egress_checks=None, egress_verdict=egress,
                burn_alarm_minor_units=args.burn_alarm_minor_units)
 
 

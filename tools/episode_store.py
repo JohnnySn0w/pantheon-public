@@ -195,6 +195,7 @@ class DetectorSpec:
     harness: str = ""            # the faulted harness (routing prefers another one)
     account: str = ""            # OS account the detector runs under (deferred => same-account)
     candidates: tuple = ()       # tuple[repair_evidence.Candidate, ...] repair duty holders
+    any_live_fallback: tuple = ()  # T-5998 B(i): consulted last, any_live only, never for deferred evidence
     redactor: Callable[[str], str] = repair_evidence.default_redactor
     invariant_list_id: str | None = None
     invariant_list_digest: str | None = None
@@ -285,6 +286,7 @@ class CycleResult:
     status: str                      # counted|opened|suppressed|resolved|healthy|busy_suppressed|reconciled
     episode_ids: list = dataclasses.field(default_factory=list)
     pending: list = dataclasses.field(default_factory=list)   # episodes still mid-delivery
+    corrupt: list = dataclasses.field(default_factory=list)   # reconcile: (domain, reason) skipped as corrupt
 
 
 # --------------------------------------------------------------------------- #
@@ -372,6 +374,12 @@ def _load(path: Path, domain_key: str) -> dict:
         raise StoreCorruptionError(f"{path}: unreadable store JSON: {exc}") from exc
     if not isinstance(doc, dict) or doc.get("schema") != SCHEMA_VERSION:
         raise StoreCorruptionError(f"{path}: schema mismatch")
+    # T-5999 review (MED): ``store_path`` slugs ':' '_' '-' alike, so two distinct domain keys can map to ONE
+    # file (e.g. ``mail:stale-recovery`` / ``mail-stale:recovery``). Fail closed: a document is only ever opened for
+    # the domain it was created for; any alias (first-writer-wins in either order) raises.
+    if doc.get("domain_key") != domain_key:
+        raise StoreCorruptionError(f"{path}: holds domain {doc.get('domain_key')!r}, not {domain_key!r} "
+                                   f"(store-path slug alias)")
     return doc
 
 
@@ -572,6 +580,9 @@ def reconcile(specs: Sequence[DetectorSpec], *, ports: Ports | None = None,
                 _resume_pending(doc, by_detector, path, ports, out)
         except _Busy:
             out.status = "busy_suppressed"
+        except StoreCorruptionError as exc:  # T-5999: one corrupt/aliased domain must not stop the others
+            _log(f"{domain}: reconcile skipped: {exc}")
+            out.corrupt.append((domain, str(exc)))
     return out
 
 
@@ -1145,15 +1156,20 @@ def _route(ep: dict, spec: DetectorSpec, ports: Ports) -> dict:
     if not spec.candidates:
         return {"kind": "unrouted", "target": spec.requester, "harness": spec.harness,
                 "deferred": deferred}
+    # T-5999 Recovery condition: never route an episode to its own SUBJECT persona (from the fault_id;
+    # ``subject_of`` returns None, i.e. no exclusion, for ids not shaped ``<kind>:<persona>``).
     r = repair_evidence.resolve_route(spec.harness, spec.candidates, liveness=ports.liveness,
                                       page=ports.page, evidence_deferred=deferred,
                                       origin_account=spec.account or None,
-                                      subject=f"ORG-076 {ep['episode_id']}: no eligible repair target")
+                                      subject=f"ORG-076 {ep['episode_id']}: no eligible repair target",
+                                      episode_subject=repair_evidence.subject_of(ep.get("fault_id")),
+                                      any_live_fallback=spec.any_live_fallback)
+    extra = {"excluded_subject": list(r.excluded_subject)} if r.excluded_subject else {}
     if r.target is None:
         return {"kind": "page", "target": spec.requester, "harness": spec.harness, "deferred": deferred,
-                "refused_cross_account": list(r.refused_cross_account)}
+                "refused_cross_account": list(r.refused_cross_account), **extra}
     return {"kind": r.kind, "target": r.target.name, "harness": r.target.harness, "deferred": deferred,
-            "refused_cross_account": list(r.refused_cross_account)}
+            "refused_cross_account": list(r.refused_cross_account), **extra}
 
 
 def _repair_fields(ep: dict, spec: DetectorSpec, route: dict) -> dict:
@@ -1202,13 +1218,22 @@ def _file_argv(ep: dict, spec: DetectorSpec, route: dict, fields_path: Path) -> 
         stance = "Measurement FAILED (unknown): diagnose first, do not blind-swap."
     else:
         stance = "Measurement succeeded and found a bad state (broken): open the playbook for this fault_id."
+    # T-6084: `subject:` names the seat the fault is ON (repair_evidence.subject_of), matching
+    # soak_filer and test_ticket_role_only_targets; the seat chosen to fix it is `repair-target:`.
+    # Both labels describe; neither routes.
+    faulted = repair_evidence.subject_of(ep.get("fault_id"))
+    faulted_txt = f"Faulted seat: {faulted}. " if faulted else ""
     ask = (f"ORG-076 repair episode {ep['episode_id']}: {ep['fault_id']} ({ep['verdict_kind']}) "
            f"on {spec.subsystem}. {stance} Route: {route['kind']} -> {route['target']}. "
-           f"Subject seat: {route['target']} (harness {route.get('harness') or 'unknown'}"
+           f"{faulted_txt}"
+           f"Repair target seat: {route['target']} (harness {route.get('harness') or 'unknown'}"
            f"{', account ' + spec.account if spec.account else ''}) - routed to its role pool; "
-           f"label subject:{route['target']} describes, it does not route. "
+           f"labels subject:/repair-target: describe, they do not route. "
            f"Attempts budget {spec.attempts_budget}.")
-    labels = ",".join(["repair", "org-076", _slug(spec.subsystem, 40), f"subject:{route['target']}"])
+    labels = ["repair", "org-076", _slug(spec.subsystem, 40), f"repair-target:{route['target']}"]
+    if faulted:
+        labels.append(f"subject:{faulted}")
+    labels = ",".join(labels)
     return ["file", "--automated-filer", "episode_store", "--requester", spec.requester, "--target", _repair_ticket_target(route["target"]), "--title", title,
             "--labels", labels, "--serves", "ORG-076 fleet health-and-repair: one repair ticket per fault episode",
             "--project-id", "null", "--nearest-intent-ref", f"maintenance:fleet-health/{_slug(spec.subsystem, 40)}",

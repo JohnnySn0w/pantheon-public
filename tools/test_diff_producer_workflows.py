@@ -26,11 +26,23 @@ def _diff_cmds(workflow: str) -> list[str]:
     return _DIFF_CMD_RE.findall((WORKFLOWS / workflow).read_text(encoding="utf-8"))
 
 
-def _trigger_paths(workflow: str) -> dict[str, list[str]]:
+def _triggers(workflow: str) -> dict[str, object]:
     doc = yaml.safe_load((WORKFLOWS / workflow).read_text(encoding="utf-8"))
     # PyYAML reads the bare `on:` key as boolean True.
-    triggers = doc.get("on", doc.get(True))
-    return {event: spec.get("paths", []) for event, spec in triggers.items()}
+    return doc.get("on", doc.get(True))
+
+
+def _normalized_trigger_spec(triggers: dict[str, object], event: str) -> dict:
+    spec = triggers[event]
+    if spec is None:
+        return {}
+    if not isinstance(spec, dict):
+        raise TypeError(f"{event} trigger must be null or a mapping, got {type(spec).__name__}")
+    return spec
+
+
+def _trigger_paths(workflow: str) -> dict[str, list[str]]:
+    return {event: (spec or {}).get("paths", []) for event, spec in _triggers(workflow).items()}
 
 
 class AdrScopingLintWorkflowTests(unittest.TestCase):
@@ -53,6 +65,25 @@ class RegistryLintWorkflowTests(unittest.TestCase):
     """T-5073: the ORG-081 D-10 creation check walks a diff through the shared parser."""
 
     WORKFLOW = "registry-lint.yml"
+    PUSH_PATHS = (
+        "registry/**",
+        "architecture/adr/**",
+        "schedules/**",
+        "repos.yaml",
+        "tools/germinate/registry/**",
+        "tools/germinate/engine/contract.py",
+        "tools/germinate/engine/handlers_digest.py",
+        "tools/germinate/components/**",
+        "tools/germinate/cli.py",
+        "tools/germinate/__main__.py",
+        "tools/adr_reeval_walk.py",
+        "tools/hermes_diff_scan.py",
+        "tools/_git_utils.py",
+        "tickets/**",
+        "tools/ticket.py",
+        "tools/frontmatter_registry.py",
+        ".github/workflows/registry-lint.yml",
+    )
 
     def test_every_diff_producer_emits_raw_bytes(self) -> None:
         cmds = _diff_cmds(self.WORKFLOW)
@@ -61,10 +92,33 @@ class RegistryLintWorkflowTests(unittest.TestCase):
             for flag in RAW_BYTES_FLAGS:
                 self.assertIn(flag, cmd.split(), f"{flag} missing from: {cmd}")
 
-    def test_path_triggers_include_the_shared_parser(self) -> None:
-        for event, paths in _trigger_paths(self.WORKFLOW).items():
-            for needed in ("tools/germinate/registry/**", "tools/hermes_diff_scan.py", "tools/_git_utils.py"):
-                self.assertIn(needed, paths, f"{event} trigger lacks {needed}")
+    def test_pull_requests_are_not_filtered_or_narrowed(self) -> None:
+        triggers = _triggers(self.WORKFLOW)
+        self.assertEqual(_normalized_trigger_spec(triggers, "pull_request"), {})
+
+    def test_trigger_spec_accepts_only_null_or_mapping(self) -> None:
+        self.assertEqual(_normalized_trigger_spec({"pull_request": None}, "pull_request"), {})
+        self.assertEqual(_normalized_trigger_spec({"pull_request": {}}, "pull_request"), {})
+        with self.assertRaises(KeyError):
+            _normalized_trigger_spec({}, "pull_request")
+
+    def test_trigger_spec_rejects_malformed_falsy_values(self) -> None:
+        for malformed in (False, [], "", 0):
+            with self.subTest(malformed=malformed), self.assertRaises(TypeError):
+                _normalized_trigger_spec({"pull_request": malformed}, "pull_request")
+
+    def test_trigger_spec_preserves_nonempty_filters_for_exact_empty_check(self) -> None:
+        filters = ({"paths": ["never/**"]}, {"branches": ["never"]}, {"types": ["opened"]})
+        for narrowed in filters:
+            with self.subTest(narrowed=narrowed):
+                self.assertNotEqual(_normalized_trigger_spec({"pull_request": narrowed}, "pull_request"), {})
+
+    def test_push_paths_preserve_the_load_bearing_scope(self) -> None:
+        triggers = _triggers(self.WORKFLOW)
+        self.assertIn("push", triggers)
+        push = triggers.get("push")
+        self.assertIsInstance(push, dict)
+        self.assertEqual(tuple(push["paths"]), self.PUSH_PATHS)
 
 
 class HermesAuditWorkflowTests(unittest.TestCase):

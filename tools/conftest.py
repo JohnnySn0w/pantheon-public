@@ -19,11 +19,25 @@ that inner patch wins — so they continue to work. (T-0856.)
 import atexit
 import os
 import shutil
+import sys
 import tempfile
 import warnings
 from pathlib import Path
 
 import pytest
+
+# T-6118/T-6144: snapshot the running account's REAL Chronicle, persona, and sender-ledger
+# state BEFORE anything below redirects the environment; pytest_sessionfinish (bottom of this
+# file) re-checks it. Skipped in an xdist worker (the controller owns the check; workers share
+# the same real roots).
+_REAL_STATE_BASELINE = None
+if not os.environ.get("PYTEST_XDIST_WORKER") and os.environ.get("PANTHEON_REAL_STATE_TRIPWIRE") != "off":
+    try:
+        from tools import _real_state_tripwire as _tripwire
+
+        _REAL_STATE_BASELINE = _tripwire.take_snapshot()
+    except Exception as _exc:  # noqa: BLE001 -- a broken guard must not take the suite down
+        warnings.warn(f"T-6118 real-state tripwire disabled: {_exc!r}")
 
 
 # T-3753: pytest-xdist (via execnet) cannot serialize pathlib.PosixPath,
@@ -90,6 +104,24 @@ except ImportError:
 _SESSION_STATE_DIR = tempfile.TemporaryDirectory(prefix="pt-state-")
 atexit.register(_SESSION_STATE_DIR.cleanup)
 os.environ["PANTHEON_STATE_DIR"] = _SESSION_STATE_DIR.name
+
+# T-6118: the two narrower overrides OUTRANK PANTHEON_STATE_DIR in every resolver
+# (runtime_invocation_receipt._state_root, session_chronicle.persona_state_root,
+# chronicle._chronicle_root, harness_state), and a live seat's own environment carries them
+# (artisan: PANTHEON_PERSONA_STATE_DIR=/home/suborch2/.local/state/pantheon/personas), so setting
+# only PANTHEON_STATE_DIR left every state_root=None path pointed at the REAL personas dir.
+# Drop them: the resolvers then derive personas/ and chronicle/ from the redirected state dir,
+# exactly as in CI, where neither is set. (Setting them to tmp paths instead would make a test
+# that sets its own PANTHEON_STATE_DIR trip harness_state's "the two disagree" refusal.)
+_SEAT_STATE_OVERRIDES = ("PANTHEON_PERSONA_STATE_DIR", "PANTHEON_CHRONICLE_ROOT")
+for _name in _SEAT_STATE_OVERRIDES:
+    os.environ.pop(_name, None)
+
+# T-6118 PR-2: the memex export tree (/var/lib/pantheon/chronicle-export) is a REAL host path that
+# session-end hardlinks into. Point every resolver at a deliberately ABSENT session-tmp path at import
+# (export-unprovisioned: non-fatal, writes nothing), and _isolate_state_dir re-pins a per-test one.
+# The tripwire (tools/_real_state_tripwire.py) fails the run if the real tree changes anyway.
+os.environ["PANTHEON_CHRONICLE_EXPORT_ROOT"] = str(Path(_SESSION_STATE_DIR.name) / "chronicle-export-absent")
 
 # Canonical (package) identities of the modules that read the real bot token.
 # Repo-root is the canonical pytest invocation, where only these package
@@ -236,6 +268,14 @@ def _isolate_state_dir(monkeypatch, tmp_path):
     this fixture, so their value wins (same contract as the fixtures above).
     """
     monkeypatch.setenv("PANTHEON_STATE_DIR", str(tmp_path / "pantheon-state"))
+    # T-6118: see _SEAT_STATE_OVERRIDES above; a test that wants one sets it inside its body.
+    for name in _SEAT_STATE_OVERRIDES:
+        monkeypatch.delenv(name, raising=False)
+    # T-6118 PR-2: a per-test export root that does not exist (tests that export create their own).
+    monkeypatch.setenv("PANTHEON_CHRONICLE_EXPORT_ROOT", str(tmp_path / "chronicle-export-unprovisioned"))
+    # T-6118: the import-time home constants (runtime_controller.DEFAULT_STATE_ROOT, chronicle.CHRONICLE_ROOT, ...)
+    # are deliberately NOT repointed: the resolvers' fallbacks must keep agreeing
+    # (test_t5028_mr2 drift guard), and a test that clears os.environ is caught by the session tripwire.
     yield
 
 
@@ -352,6 +392,10 @@ def pytest_configure(config):
         "markers", "allows_real_git: T-4934 opt-out; test genuinely needs real mutating git")
     config.addinivalue_line(
         "markers", "allows_real_mailbox: T-4934 opt-out; test genuinely needs the real mailbox hub")
+    config.addinivalue_line(
+        "markers", "nested_namespace: T-5915; test builds its own user/pid namespaces and fails "
+                   "inside an outer one. tools/soak_leg.py runs these un-namespaced in leg B and "
+                   "everything else namespaced in leg A; plain CI runs them all")
 
 
 @pytest.fixture(autouse=True)
@@ -366,3 +410,41 @@ def _real_state_guard(request, monkeypatch, tmp_path_factory):
         mailbox=request.node.get_closest_marker("allows_real_mailbox") is None,
     )
     yield
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """T-6118/T-6144: fail if the run changed REAL Chronicle/persona/sender state.
+
+    The roots are the running account's (passwd home). The seat's own persona subtree is
+    exempt, except Chronicle session records with a /tmp handoff (the fixture-leak signature);
+    see tools/_real_state_tripwire.py. PANTHEON_REAL_STATE_TRIPWIRE=warn reports without
+    failing, =off disables (checked again here, at call time). Controller process only.
+
+    Contract (pinned by tools/test_t6118_sessionfinish_contract.py): the only status change is
+    exactly 0 -> TESTS_FAILED; any other status is left alone. A broken guard fails open: it
+    prints and never raises."""
+    try:
+        if os.environ.get("PANTHEON_REAL_STATE_TRIPWIRE") == "off":
+            return
+        if _REAL_STATE_BASELINE is None or hasattr(session.config, "workerinput"):
+            return
+        from tools import _real_state_tripwire as tripwire
+
+        changes = tripwire.diff(_REAL_STATE_BASELINE, tripwire.take_snapshot())
+        if not changes:
+            return
+        shown = "\n".join(f"  {line}" for line in changes[:40])
+        more = f"\n  ... and {len(changes) - 40} more" if len(changes) > 40 else ""
+        print(
+            f"\nT-6118 REAL STATE TOUCHED: this test run changed {len(changes)} path(s) under the "
+            f"account's real Chronicle/personas/sender state:\n{shown}{more}\n"
+            "A test must isolate these (tools/conftest.py, tools/_seat_state_isolation.py).",
+            file=sys.stderr,
+        )
+        if os.environ.get("PANTHEON_REAL_STATE_TRIPWIRE") != "warn" and session.exitstatus == 0:
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    except Exception as exc:  # noqa: BLE001 -- a broken guard fails open, never errors the session
+        try:
+            print(f"T-6118 real-state tripwire errored (ignored): {exc!r}", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass

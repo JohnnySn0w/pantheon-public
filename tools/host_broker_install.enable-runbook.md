@@ -202,6 +202,8 @@ U1's `PHASES` lists P3, but no plan entry carries it. The runtime entries sit in
 
 ### P6: plan registration (T-5533 steps a-d)
 
+**Scope (ORG-052 section 8 clarification, #1665; T-6167 PR-1).** The broker is sudo-on-behalf for running seats; seat installation belongs to the germination engine. P6 therefore registers plans ONLY for seats named in the manifest's `plan_registration.protocol_test_seat_ids` (a disposable protocol-test seat for ORG-052 E37; the rehearsal fixture seats). The production template carries `[]`: P6 then has no entries, the registry keeps its pre-registration bytes with no `plans` key, and the broker refuses any seat with `no registered plan for seat and manifest revision`. The steps below describe a run that has a protocol-test seat.
+
 - **Preconditions:**
   - P5 is green.
   - The SETPRIV producer argv is EXACTLY the Recovery-amended template: `--reuid=nobody --regid=nogroup --clear-groups --no-new-privs --inh-caps=-all --bounding-set=-all -- /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I <fw_root>/tools/host_plan_producer.py ...`.
@@ -281,7 +283,7 @@ U1's `PHASES` lists P3, but no plan entry carries it. The runtime entries sit in
   - **G-MEMBERSHIP is ticked** (section 1): the doc row, then the membership commit, then the membership check (property (j)).
   - **The membership commit moves the framework rev and the plan sha**, because `tools/persona_installer.py` is a FRAMEWORK_CODE_ARTIFACT. Before registration, P10 therefore runs, in order:
     1. a re-plan at the new commit, recording the new `plan_sha256`;
-    2. the P4 framework copy (a new `<rev>`, `active` switched atomically, the previous rev kept) and the P6 plan registration, re-run (P6 (d));
+    2. the P4 framework copy (a new `<rev>`, `active` switched atomically, the previous rev kept) and, when a protocol-test seat is named, the P6 plan registration, re-run (P6 (d));
     3. a restart of the broker and approval units onto the new rev (LIVE-VERB);
     4. a fresh gate-32a check: the broker's logged `startup_record` digest equals the root-side digest over the NEW copy.
   - **No re-rehearsal for the membership commit (ACCEPTED, mason ruling).** The membership commit differs from the G-R1-rehearsed rev only in the `_CLAUDE_MCP_ALLOWLIST` persona sets. P10's own gate-32a check and the broker and approval health checks are its evidence.
@@ -440,7 +442,7 @@ Every carry-forward, U5 item and runbook note recorded on T-2920 (and in the rev
 | CF-A9 | Approval resumes pending deliveries at start; Bot API on the loop thread residual; no close-card | orchestrator 10-26 (T-5518) | P9, P11 |
 | CF-A10 | Executor install AND framework copy ship `tools/runtime_invocation_receipt.py` | mason 10-26 (T-5572) | P4 |
 | CF-A11 | Seat-local residue depends on broker-leg evidence | mason 10-26 (T-5533 delta review) | section 4 |
-| CF-A12 | T-5533 registration steps a-d, re-registered on every framework-copy update | mason 10-26 (T-5533 merged) | P6 |
+| CF-A12 | T-5533 registration steps a-d, re-registered on every framework-copy update, for protocol-test seats only (#1665) | mason 10-26 (T-5533 merged) | P6 |
 | CF-A13 | T-5597 digest widening deferred, gated on this ticket | orchestrator/mason 10-27 | G-PRE |
 | CF-S1 | `DriverContext.compensate` is an opt-in, OFF for the first fire | design survey (T-4964) | P5, P9 |
 | CF-S2 | CredentialRef registration; /etc/pantheon dirs including the 0700 credentials parent; the mandatory executor activation file; "none" lines | design review F6/F8 | P5, P7 |

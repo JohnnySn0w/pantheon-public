@@ -13,6 +13,10 @@ from pathlib import Path
 from unittest import mock
 
 from tools import runtime_controller as rc
+try:
+    from tools import _seat_state_isolation
+except ImportError:  # pragma: no cover
+    import _seat_state_isolation  # type: ignore[no-redef]
 from tools import subscription_usability as su
 from tools.harness_adapter.codex import classify_codex_usage_limit
 from tools.test_runtime_controller import _stateless_binding
@@ -25,6 +29,16 @@ T0 = datetime(2026, 10, 13, 12, 0, 0, tzinfo=timezone.utc)
 def _clock(start: datetime):
     state = {"t": start}
     return (lambda: state["t"]), (lambda s: state.__setitem__("t", state["t"] + timedelta(seconds=s)))
+
+
+# T-6118: plain `python3 -m unittest` never loads tools/conftest.py; without this the controller
+# lifecycle tests wrote the REAL Chronicle / persona state. See tools/_seat_state_isolation.py.
+def setUpModule() -> None:
+    _seat_state_isolation.start()
+
+
+def tearDownModule() -> None:
+    _seat_state_isolation.stop()
 
 
 class CodexCapSwapTests(unittest.TestCase):
@@ -72,6 +86,47 @@ class CodexCapSwapTests(unittest.TestCase):
         elapsed = (outcome.cooldown_until - T0).total_seconds()
         self.assertGreaterEqual(elapsed, rc.MID_SESSION_CAP_CONSERVATIVE_DEFAULT_SECONDS)
         self.assertLess(elapsed, rc.MID_SESSION_CAP_CONSERVATIVE_DEFAULT_SECONDS + 600)
+
+    def test_predecessor_cleanup_preserves_recovery_runtime_cache(self) -> None:
+        """T-5753: recovery may install the fallback before the capped
+        predecessor's controller tail runs.  That tail owns only its original
+        cache entry; it must not unlink the newer live runtime's record."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(
+                root, harness="claude", profile="anthropic-code", mid_session_cap_swap=True,
+            )
+            codex = _stateless_binding(root, harness="codex", profile="interactive-chatgpt")
+            claude_handle = rc.RuntimeHandle(
+                claude.launch, claude.controller.tmux, None, T0, pid=1033767,
+            )
+            codex_handle = rc.RuntimeHandle(
+                codex.launch, codex.controller.tmux, None, T0 + timedelta(seconds=10), pid=1038879,
+            )
+
+            def recovery_won_the_race(_binding):
+                rc.write_active_runtime(
+                    "recovery", codex, codex_handle, pid=codex_handle.pid, state_root=root,
+                )
+                return rc.MidSessionCapSwapOutcome(
+                    modal_kind="session-limit",
+                    cooldown_until=T0 + timedelta(hours=6),
+                    cooldown_source="parsed",
+                )
+
+            result = rc.controller_main(
+                "recovery", candidates=[claude, codex], state_root=root, now=lambda: T0,
+                sleep=lambda _seconds: None,
+                start_runtime_fn=lambda _binding: (
+                    rc.RuntimeStart(rc.TMUX_RUNTIME_SCOPE_UNIT, False), claude_handle,
+                ),
+                block_until_death_fn=recovery_won_the_race,
+            )
+
+            self.assertEqual(result, 0)
+            cache = rc.read_active_runtime("recovery", state_root=root)
+            self.assertEqual(cache["runtime"], "codex/interactive-chatgpt")
+            self.assertEqual(cache["pid"], 1038879)
 
 
 class ReturnAfterResetTests(unittest.TestCase):

@@ -2,7 +2,7 @@
 aliases: [ORG-106]
 id: ORG-106
 title: "Seat pause and deep sleep: one HC-owned seat state, always owned, reasoned and expiring by default"
-status: "Proposed 2026-10-26 by Orchestrator (head_engineering_orchestrator), drafted under T-5438 per the operator TG 12269. Awaiting ratification."
+status: "Ratified 2026-11-09 by the operator via Telegram 13198 (proposed 2026-10-26 by Orchestrator under T-5438 per the operator TG 12269; Decision 9 substance approved TG 12744)."
 date: 2026-10-26
 author: Orchestrator (head_engineering_orchestrator)
 steward: orchestrator
@@ -17,18 +17,19 @@ ratifiable_files: [pantheon-config:architecture/adr/ORG-106-seat-pause-and-deep-
 
 # ORG-106: Seat pause and deep sleep
 
-**Status:** Proposed 2026-10-26 (T-5438, the operator TG 12269). Mechanism: [notes/2026-10-26-org106-seat-state-mechanism.md](../../notes/2026-10-26-org106-seat-state-mechanism.md).
+**Status:** Ratified 2026-11-09 by the operator (TG 13198). Proposed 2026-10-26 (T-5438, the operator TG 12269). Decision 9 added 2026-11-02 (T-5868); the operator approved its substance (TG 12744). Edited 2026-11-02 for the operator's review questions (TG 12811): plain-language wording, early wake by system orchestrators (Decision 3) and a 15-minute HALTED ticket (Decision 9). Mechanism: [notes/2026-10-26-org106-seat-state-mechanism.md](../../notes/2026-10-26-org106-seat-state-mechanism.md).
 
 ## Decision
 
 1. **One seat state, owned by the harness controller.** Each seat has at most one operator record saying which state it is in: ACTIVE (no record), PAUSED-INTAKE or DEEP-SLEEP. The record lives with the seat's own controller state, next to its runtime holds. It is the only place where a person or agent pauses or sleeps a seat. Every consumer asks one reader for the seat's effective state, and none keeps a private flag.
-2. **PAUSED-INTAKE stops new work, not the seat.** The session stays up and healthy, and nothing hands it work unprompted: no ticket delivery, no keep-going nudges, no queue pokes and no wake for ordinary peer mail. Mail and tickets queue. The operator's direct messages, urgent mail, monitoring, repair, context restarts and cap-hit swaps all continue. (This is Kubernetes' cordon.)
-3. **DEEP-SLEEP takes the seat down and keeps it down.** The seat writes its handoff, then its session ends, and the end does not count as a failure. While the seat is asleep, no runtime launches on either control plane (the codex fallback included), and the system orchestrators do not restore it. Mail queues for the wake. Monitors still look at the seat, but they report it as asleep rather than down, so nothing pages and nothing repairs it. If the sleep fails to hold and a session comes back, that is a real fault and it pages. (This is Kubernetes' drain plus scale-to-zero.)
+2. **PAUSED-INTAKE stops new work, not the seat.** The session stays up and healthy, and nothing hands it work unprompted: no ticket delivery, no keep-going nudges, no queue pokes and no wake for ordinary peer mail. Mail and tickets queue. The operator's direct messages, urgent mail, monitoring, repair, context restarts and cap-hit swaps all continue.
+3. **DEEP-SLEEP takes the seat down and keeps it down.** The seat writes its handoff, then its session ends, and the end does not count as a failure. While the seat is asleep, no runtime launches on either control plane (the codex fallback included), and the system orchestrators do not treat it as broken or restore it on their own. A system orchestrator may wake it early, with a ledger entry, when the sleep's reason no longer holds or its owner can't be reached; waking never needs the operator in person. Mail queues for the wake. Monitors still look at the seat, but they report it as asleep rather than down, so nothing pages and nothing repairs it. If the sleep fails to hold and a session comes back, that is a real fault and it pages. (In short: the seat finishes and hands off its work, then runs no session at all until it is woken.)
 4. **Every pause has an owner, a reason and an expiry.** The verb refuses a pause without a reason. Expiry is the default. Past its expiry a record reads as ACTIVE, so a forgotten pause fails toward a running seat. The owner is told before expiry and can extend it. A pause with no expiry has to be asked for explicitly. It shows as such on kino Health, with its age, and it is flagged when it gets old. The OOM hold keeps its ratified release-only rule (ORG-104 rule 2).
 5. **One verb surface, run as the seat.** The verbs are `harness <seat> pause | sleep | wake | status`, beside the existing hold and restart verbs. They run as the seat account (the T-5483 guard) and land a ledger entry like every harness override. They are idempotent: setting the state a seat is already in refreshes the record, and waking an active seat does nothing. The Telegram harness surface gets the same verbs. A kino toggle can follow later through the existing dropbox pattern.
 6. **Visible where the operator looks.** kino Health shows each seat's state, owner, reason and time left. A paused or sleeping seat is an expected state, not an incident.
 7. **Wrap the old holds first, then retire them one at a time.** From day one the reader folds today's holds into the effective state, so consumers move onto the reader before any writer changes. The per-account off switch is retired in favour of PAUSED-INTAKE. Seat maintenance (T-5282) and the OOM hold (ORG-104) keep their writers and their meanings, and are read through the reader. The narrow, single-purpose suppressions stay as they are: alert mute, context-fill hold, wedge suppress, runtime holds, the hand-move poller hold and the bootstrap bypass token. The per-hold disposition and the migration order are in the mechanism note.
-8. **Seat state is intent; cooldowns are facts.** A cap-hit cooldown says a runtime can't run. A seat state says the operator doesn't want the seat to run. The controller launches only when both allow it, and neither clears the other. The bypass token used by hand-moves never bypasses DEEP-SLEEP.
+8. **Seat state is intent; cooldowns are facts.** A cap-hit cooldown says a runtime can't run. A seat state says the operator doesn't want the seat to run. The controller launches only when both allow it, and neither clears the other. The one-time maintenance override an operator can put in a seat-move plan, to start a seat during maintenance, never overrides DEEP-SLEEP.
+9. **A pause that stops partway is a fault, not a pause.** *(Added 2026-11-02, T-5868; substance approved by the operator, TG 12744.)* When an automated pause (the harness-manager run-state pause, T-5858) halts partway, the seat is left with some wake paths off and its run waiting for rollback. That seat is in a third recorded state, HALTED, never PAUSED-INTAKE and never ACTIVE. HALTED blocks new work and withholds repair like a pause does, since rollback is the repair. It is never an expected state, though: every monitor reports it and it pages its owner and the recovery seat once, and if it is not cleared within 15 minutes a ticket is filed automatically to the system orchestrators. It does not expire, because a halted record that fell back to ACTIVE would hide a seat that cannot wake. Only the run's own rollback clears it, or an operator clearing it after recovering the seat by hand, which lands a ledger entry like every override.
 
 ## Why
 
@@ -41,6 +42,8 @@ The operator, TG 12269: "we do want a way to pause/deep sleep a seat." The T-543
 
 The one seat-wide mechanism that has never gone stale is seat maintenance, because it always expires. That is the property to make universal.
 
+Decision 9 comes from Recovery's D15 ruling on T-5858. A pause that times out while draining leaves the seat's wake timers off, so a mailbox-first seat stops waking for mail while its services still look up. Recording that as PAUSED-INTAKE would tell every monitor it is an authorised pause and silence them. Clearing the record would make a later restore read the seat as never paused.
+
 ## Alternatives considered
 
 - **Add another flag for "pause".** This is how the current thirteen arose.
@@ -48,6 +51,7 @@ The one seat-wide mechanism that has never gone stale is seat maintenance, becau
 - **Extend seat maintenance into the pause.** Maintenance means "an operator is working on this seat, so don't repair it". A sleeping seat is the opposite: it should be watched. Maintenance's 4-hour cap is right for a cutover and wrong for a sleep.
 - **Put the record in a shared cross-account registry.** That lets any account pause any seat, and it separates the authority from the controller that has to enforce it. Recovery's monitors already read per-seat state across accounts (the cap detector's file), so a shared location buys nothing.
 - **No expiry; rely on review.** That is the `autonomy_off` failure.
+- **Mark a halted pause with a `partial` flag on a PAUSED-INTAKE record (Decision 9).** Every reader would have to learn to inspect the flag, and one that missed it would fail silent, treating the seat as an authorised pause. A distinct state fails loud: a reader that doesn't know HALTED sees an invalid record, which is logged and paged (Consequence 1).
 
 ## Consequences
 

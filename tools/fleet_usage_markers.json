@@ -1,0 +1,21 @@
+{
+  "schema": "pantheon-fleet-usage-markers/v1",
+  "_comment": "T-5962 change-marker log for the fleet-usage period aggregates: anything that explains a trend break (a pricing or weights change, an optimization, a seat added or retired, a coverage change). Append only; scope is 'fleet' or a seat name; kind is one of pricing, optimization, seat, model, coverage, other. A change to the weights or price table in tools/fleet_usage_ledger.py needs a new 'pricing' marker carrying pricing_fingerprint() (test-pinned). Model and seat first-seen markers are derived from the aggregates on read and are not listed here.",
+  "markers": [
+    {
+      "at": "2026-11-02T00:00:00Z",
+      "scope": "fleet",
+      "kind": "pricing",
+      "label": "baseline: units weights (T-4536) and model input price table (T-5962)",
+      "ref": "T-5962",
+      "pricing_fingerprint": "f96e3e92d26581d6ddcb104b756ff67afe9be50ffb08f3c9a107be16ffc0eb2d"
+    },
+    {
+      "at": "2026-11-02T17:00:00Z",
+      "scope": "fleet",
+      "kind": "coverage",
+      "label": "every seat writes rows from here (archivist joined 16:41Z, artisan 16:53Z); earlier fleet totals undercount",
+      "ref": "T-5933"
+    }
+  ]
+}

@@ -12,7 +12,8 @@ WORKAROUND (T-5090 S3, cross-scope-dependency seam gap): the engine requires eac
 dependency to have a SATISFIED install in the SAME scope, so the fixture registry
 carries in-scope STUB dependency components (host-substrate, mailbox,
 action-broker, credential-broker) with empty seat-scope installs. They stand in
-for system-scope components the engine cannot see from a seat scope yet.
+for system-scope components; the cross-scope seam has since closed (T-5135 S3), and
+test_harness_manager_dependencies exercises the real components (T-5947).
 """
 
 from __future__ import annotations
@@ -44,6 +45,10 @@ FILES = (
     "harness-manager_handlers.py",
     "harness-manager.invariants.yaml",
     "harness_manager_verify.py",
+    "harness_manager_supervisor.py",  # T-5830: a helper the handlers import (digest-pinned)
+    "harness_manager_run_state.py",  # T-5858: a helper the handlers import (digest-pinned)
+    "harness_manager_remove.py",  # T-5859: a helper the handlers import (digest-pinned)
+    "harness_manager_preflight.py",  # T-5921: the PREFLIGHT hook's checks (digest-pinned)
 )
 CID = "harness-manager"
 DEPS = ("host-substrate", "mailbox", "action-broker", "credential-broker")
@@ -167,11 +172,11 @@ def test_real_contract_loads_and_registry_row_validates():
     doc = yaml.safe_load((REPO_ROOT / "registry" / "systems.yaml").read_text(encoding="utf-8"))
     [row] = [r for r in doc["systems"] if r.get("id") == CID]
     assert row["contract"]["digest"] == compute_contract_digest(COMPONENTS / "harness-manager.yaml")
-    # partial would require plan_install + plan_remove (GF2), so the row stays not_adopted.
+    # every GF2 leg still runs only through simulated handlers, so the row stays not_adopted.
     assert row["contract_adoption"] == "not_adopted"
     body = yaml.safe_load((COMPONENTS / "harness-manager.yaml").read_text(encoding="utf-8"))["component"]
     assert body["scopes"] == ["system", "seat"]
-    assert set(body["legs"]) == {"install", "configure", "verify"}  # install: T-5091 U1
+    assert set(body["legs"]) == {"install", "configure", "remove", "verify"}  # install: T-5091 U1; remove: U3 (T-5859)
 
 
 def test_planner_imports_leaf_modules_not_runtime_controller():
@@ -525,7 +530,10 @@ def test_desired_harness_is_the_closed_enum(real):
         _configure(eng, "hermes")
     assert info.value.code == "inputs-refused"
     with pytest.raises(EngineRefusal) as info:
-        eng.plan("configure", SCOPE, CID, desired={"supervisor": "consume"})  # sub-op (a) is GF2
+        eng.plan("configure", SCOPE, CID, desired={"supervisor": "systemd"})  # sub-op (a): closed enum (T-5830)
+    assert info.value.code == "inputs-refused"
+    with pytest.raises(EngineRefusal) as info:
+        eng.plan("configure", SCOPE, CID, desired={"not_declared": "x"})
     assert info.value.code == "inputs-refused"
 
 
@@ -540,7 +548,7 @@ def test_configure_refuses_until_dependencies_are_installed(tmp_path):
 # --- absent / deferred legs and the dark-landing gate -----------------------------
 
 
-@pytest.mark.parametrize("leg", ["update", "remove", "repair"])  # install landed in T-5091 U1
+@pytest.mark.parametrize("leg", ["update", "repair"])  # install landed in T-5091 U1, remove in U3 (T-5859)
 def test_deferred_legs_refuse_cleanly(real, leg):
     _repo_, eng = real
     with pytest.raises(EngineRefusal) as info:

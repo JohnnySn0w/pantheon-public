@@ -105,6 +105,36 @@ class EvaluateTests(unittest.TestCase):
         self.assertIn("wrote 400 GB/day", probs[0])
         self.assertIn("budget 197 GB/day", probs[0])
 
+    def _sda_hist(self, week_gb_per_day=None, day_gb=None):
+        cur = {d["serial"]: d for d in dhm.summarise(facts())}
+        now_b = cur["2350E88927AF"]["written_bytes"]
+        hist = []
+        if week_gb_per_day is not None:
+            hist.append({"now": NOW - 7 * DAY, "host": "pve2",
+                         "disks": {"2350E88927AF": {"written_bytes": now_b - 7 * week_gb_per_day * 1e9}}})
+        if day_gb is not None:
+            hist.append({"now": NOW - DAY, "host": "pve2",
+                         "disks": {"2350E88927AF": {"written_bytes": now_b - day_gb * 1e9}}})
+        return hist
+
+    def test_ssd_noisy_day_under_weekly_budget_is_quiet(self):
+        """T-5919: 2026-11-02 paged on one 212 GB day while the week averaged ~147 GB/day."""
+        hist = self._sda_hist(week_gb_per_day=147, day_gb=212)
+        self.assertEqual(dhm.evaluate(facts(), ack={**SDA_ACK, **SDB_ACK}, history=hist), [])
+
+    def test_ssd_sustained_weekly_overage_fires(self):
+        hist = self._sda_hist(week_gb_per_day=250, day_gb=250)
+        probs = dhm.evaluate(facts(), ack={**SDA_ACK, **SDB_ACK}, history=hist)
+        self.assertEqual(len(probs), 1)
+        self.assertIn("2350E88927AF", probs[0])
+        self.assertIn("wrote 250 GB/day", probs[0])
+
+    def test_ssd_runaway_day_fires_even_when_week_is_under_budget(self):
+        hist = self._sda_hist(week_gb_per_day=150, day_gb=700)
+        probs = dhm.evaluate(facts(), ack={**SDA_ACK, **SDB_ACK}, history=hist)
+        self.assertEqual(len(probs), 1)
+        self.assertIn("wrote 700 GB in a day", probs[0])
+
     def test_write_budget_ignores_samples_younger_than_20h(self):
         cur = {d["serial"]: d for d in dhm.summarise(facts())}
         prev = {"now": NOW - 3600, "host": "pve2",

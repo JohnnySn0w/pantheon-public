@@ -116,7 +116,7 @@ class TestAppendToLedgerRouting(unittest.TestCase):
             ledger_dir.mkdir()
             legacy = ledger_dir / "2026.jsonl"
             legacy.write_text("")  # legacy exists → must append here
-            entry = {"id": "x", "ts": "2026-05-29T21:00:00Z"}
+            entry = srr.build_ledger_entry({"class": "handoff_restart", "ts_iso": "2026-05-29T21:00:00Z"})
             written = srr.append_to_ledger([entry], ledger_dir=ledger_dir)
             self.assertEqual(written, legacy)
             self.assertEqual(len(legacy.read_text().strip().splitlines()), 1)
@@ -126,7 +126,7 @@ class TestAppendToLedgerRouting(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ledger_dir = Path(tmp) / "ledger"
             ledger_dir.mkdir()
-            entry = {"id": "x", "ts": "2026-05-29T21:00:00Z"}
+            entry = srr.build_ledger_entry({"class": "handoff_restart", "ts_iso": "2026-05-29T21:00:00Z"})
             written = srr.append_to_ledger([entry], ledger_dir=ledger_dir)
             expected = current_write_target(ledger_dir, datetime.now(timezone.utc))
             self.assertEqual(written, expected)
@@ -403,6 +403,52 @@ class TestMainWatermark(unittest.TestCase):
         self.assertIn("2026-05-12T13:00:00Z", out)
         self.assertNotIn("2026-05-12T11:00:00Z", out)
         self.assertNotIn("2026-05-12T12:00:00Z", out)
+
+
+class TestMainValidatesBeforeSideEffects(unittest.TestCase):
+    """T-4739 (orchestrator requirement 2): a ledger entry ORG-001 would refuse means no pull,
+    no journal-sweep append_event and no watermark move. Tmp state/ledger only."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self.tmp.name)
+        os.environ["PANTHEON_STATE_DIR"] = str(self.tmp_path)
+
+    def tearDown(self) -> None:
+        os.environ.pop("PANTHEON_STATE_DIR", None)
+        self.tmp.cleanup()
+
+    def _main(self, agent: str):
+        sample = [{"ts": 1500, "ts_iso": "2026-05-12T13:00:00Z", "class": "cap_hit_auto_resume",
+                   "trigger": "z", "agent_account": "claude"}]
+        ledger = self.tmp_path / "ledger"
+        ledger.mkdir()
+        with patch.object(srr, "_LEDGER_AGENT", agent), \
+             patch.object(srr, "pull_repo_or_warn") as pull, \
+             patch.object(srr, "read_events_cross_account", return_value=sample), \
+             patch.object(srr, "journal_started_events", return_value=[1700000000]), \
+             patch.object(srr, "find_unattributed_restarts", return_value=[1700000000]), \
+             patch.object(srr, "append_event") as append_event, \
+             patch.object(srr, "save_watermark") as save_wm, \
+             patch.object(srr, "_log"), \
+             redirect_stdout(io.StringIO()):
+            rc = main(["--no-commit", "--ledger-dir", str(ledger)])
+        return rc, pull, append_event, save_wm, ledger
+
+    def test_refusable_identity_does_nothing(self):
+        rc, pull, append_event, save_wm, ledger = self._main("recovery")  # persona names are history-only
+        self.assertEqual(rc, 1)
+        pull.assert_not_called()
+        append_event.assert_not_called()
+        save_wm.assert_not_called()
+        self.assertEqual(list(ledger.rglob("*.jsonl")), [])
+
+    def test_conforming_identity_runs_the_sweep_and_moves_the_watermark(self):
+        rc, pull, append_event, save_wm, ledger = self._main(srr._LEDGER_AGENT)
+        self.assertEqual(rc, 0)
+        append_event.assert_called_once()
+        save_wm.assert_called_once()
+        self.assertEqual(len(list(ledger.rglob("*.jsonl"))), 1)
 
 
 # ---------------------------------------------------------------------------

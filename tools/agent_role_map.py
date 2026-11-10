@@ -1014,7 +1014,7 @@ def ledger_entry_by(entry: dict, seat: str) -> bool:
 # fail-CLOSED per ORG-085 invariants 4 (mirrors are digest-bound; mismatch refuses)
 # + 5 (missing revision/digest is a typed refusal): it RAISES rather than serving
 # stale/unverified membership. A fail-safe fallback here would BE the second
-# authority ORG-085 §253 bans. The two are reconciled by LAZINESS — the reader
+# authority ORG-085 §Field ownership and authority bans. The two are reconciled by LAZINESS — the reader
 # loads+verifies on CALL, never at import, so a source problem fails only the
 # role-routing path, not every importer of this module.
 # ---------------------------------------------------------------------------
@@ -1272,7 +1272,7 @@ def known_role_ids() -> frozenset[str]:
     the SAME already-verified reader as functional_roles/role_members
     (_resolve_membership) — NOT a second literal role list: persona_roles.yaml is the
     SOLE authority for role_ids (its header), and a hand-copied vocab here would BE the
-    second authority ORG-085 §253 bans.
+    second authority ORG-085 §Field ownership and authority bans.
 
     Fail-CLOSED, matching the reader's existing contract (functional_roles' raises): a
     missing/unverifiable/malformed L3 source RAISES PersonaRoleMembershipError rather

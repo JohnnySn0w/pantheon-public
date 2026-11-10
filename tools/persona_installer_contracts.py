@@ -46,6 +46,7 @@ OperationKind = Literal[
     "seat-service-enable-observe",
     "seat-service-decommission",
     "seat-claude-settings-env",
+    "seat-codex-hook-config",
     "seat-runtime-residue-quarantine",
     "seat-claude-workspace-trust",
     "manager-check",

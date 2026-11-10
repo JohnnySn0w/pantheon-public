@@ -5,7 +5,7 @@ import json
 import pytest
 
 from tools.germinate.engine.executor import EngineRefusal
-from tools.germinate.engine.receipts import SCHEMA as RECEIPT_SCHEMA
+from tools.germinate.engine.receipts import SCHEMA as RECEIPT_SCHEMA, ReceiptError, validate_body
 from tools.germinate.engine.run_state import RunStore
 from tools.germinate.engine.tests import helpers as H
 from tools.germinate.op_registry import load_op_registry
@@ -42,6 +42,8 @@ def test_happy_path_writes_record_wal_receipts_and_transcript(tmp_path):
         assert body["schema"] == RECEIPT_SCHEMA
         assert body["op_registry_digest"] == load_op_registry().digest
         assert body["evidence_scope"] == "simulated" and body["mutation"]["changed"] is True
+        assert body["authority"] is None  # T-5233: always present; null for an op no grant authorized
+        validate_body(body)
         events = [json.loads(line)["event"] for line in handle.read_transcript()]
         assert events[0] == "run.admitted" and events[-1] == "run.satisfied"
         assert events.count("op.intent") == 3 and events.count("op.receipted") == 3
@@ -49,6 +51,28 @@ def test_happy_path_writes_record_wal_receipts_and_transcript(tmp_path):
         assert admitted["op_registry_digest"] == eng.backend.loaded_op_registry_digest
         assert admitted["expected_runtime_subset"]["digest"].startswith("sha256:")
         assert load_canonical_json((handle.path / "plan.json").read_bytes())["plan_digest"].startswith("sha256:")
+
+
+@pytest.mark.parametrize(
+    "authority",
+    [
+        {"gate_id": "g", "scope": "system"},  # missing authority_record_id
+        {"gate_id": "g", "scope": "system", "authority_record_id": "a" * 64, "approval_handle": "b" * 64},
+        {"gate_id": "", "scope": "system", "authority_record_id": "a" * 64},
+        "a" * 64,
+    ],
+)
+def test_receipt_authority_shape_is_closed(tmp_path, authority):
+    _repo, eng = H.simple_setup(tmp_path, ops=OPS)
+    [outcome] = _apply(eng)
+    with _handle(eng, outcome.run_id) as handle:
+        body = dict(handle.wal().read_receipt_by_ref("receipt-op-1.json")[0].receipt_payload)
+    body["authority"] = authority
+    with pytest.raises(ReceiptError):
+        validate_body(body)
+    del body["authority"]
+    with pytest.raises(ReceiptError):
+        validate_body(body)  # the key is always present
 
 
 def test_plan_is_read_only(tmp_path):

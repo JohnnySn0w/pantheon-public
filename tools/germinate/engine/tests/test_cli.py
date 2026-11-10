@@ -8,7 +8,8 @@ from tools.germinate.cli import main
 from tools.germinate.engine.backend import SimulatedHostBackend
 from tools.germinate.engine.tests import helpers as H
 
-OPS = {"install": [H.dir_op("op-1", "/srv/c"), H.file_op("op-2", "/srv/c/a.conf", "hi\n")]}
+# owner alice: test_context_flag_... invokes as account alice, and C6 requires a seat op's owner to match it
+OPS = {"install": [H.dir_op("op-1", "/srv/c", owner="alice"), H.file_op("op-2", "/srv/c/a.conf", "hi\n", owner="alice")]}
 
 
 @pytest.fixture
@@ -133,3 +134,29 @@ def test_corrupt_run_record_is_a_typed_refusal(setup, capsys):
     record.write_bytes(record.read_bytes().replace(b'"SATISFIED"', b'"BOGUS"'))
     assert main(["status", *common]) == 1
     assert "run-state-refused" in capsys.readouterr().err
+
+
+def test_context_flag_defaults_to_operator_and_parses(setup, monkeypatch):
+    from tools.germinate.engine import cli as engine_cli
+
+    seen = []
+    real = engine_cli._engine
+
+    def spy(args):
+        eng = real(args)
+        seen.append((eng.context.kind, eng.context.account))
+        return eng
+
+    monkeypatch.setattr(engine_cli, "_engine", spy)
+    common, _ = setup
+    assert main(["plan", "install", "--system", "comp-a", *common]) == 0
+    assert main(["plan", "install", "--system", "comp-a", *common, "--context", "scheduled", "--invoking-account", "alice"]) == 0
+    assert seen == [("operator", None), ("scheduled", "alice")]
+
+
+def test_invalid_context_value_exits_non_zero(setup, capsys):
+    common, _ = setup
+    with pytest.raises(SystemExit) as exc:
+        main(["plan", "install", "--system", "comp-a", *common, "--context", "cron"])
+    assert exc.value.code != 0
+    assert "--context" in capsys.readouterr().err

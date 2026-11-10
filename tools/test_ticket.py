@@ -300,6 +300,7 @@ class TestMainCheckoutGuard(unittest.TestCase):
         from tools._test_fixtures import (
             _run,
             assert_real_repo_untouched,
+            copy_tools_import_closure,
             git_head,
             setup_integration_env,
             snapshot_real_repo,
@@ -312,24 +313,7 @@ class TestMainCheckoutGuard(unittest.TestCase):
             tools_dir = env.repo_path / "tools"
             tools_dir.mkdir(parents=True, exist_ok=True)
             repo_tools = Path(__file__).resolve().parent
-            for fname in (
-                "__init__.py",
-                "ticket.py",
-                "_git_utils.py",
-                "agent_role_map.py",
-                "_md_table.py",
-                "_security_gate.py",  # T-5678: ticket.py imports it
-                "_frontmatter_block.py",  # T-5689: ticket.py imports it
-                "hermes_action.py",
-                # T-3020 BT3 / ORG-078: ticket.py now imports this at module
-                # scope (priority-sort's rank-map source) — the subprocess
-                # fixture needs it on disk too, or import fails before the
-                # guard under test even runs.
-                "priority_list_parse.py",
-            ):
-                src = repo_tools / fname
-                if src.exists():
-                    shutil.copy2(src, tools_dir / fname)
+            copy_tools_import_closure(tools_dir, source_tools=repo_tools)
 
             for state in ("inbox", "active", "done"):
                 (env.repo_path / "tickets" / state).mkdir(parents=True, exist_ok=True)
@@ -9852,6 +9836,190 @@ def setUpModule() -> None:
 def tearDownModule() -> None:
     _ratifiable_resolve_patch.stop()
     _seat_state_isolation.stop()
+
+class TestRatifiableExcludedClassT6071(unittest.TestCase):
+    """T-6071 / ORG-015: refuse NEW ratifiable_files targets in excluded classes;
+    stored (grandfathered) values must still pass every transition."""
+
+    EXCLUDED = [
+        "pantheon-config:notes/2026-05-17-x.md",
+        "pantheon-config:ledger/2026-W20/2026-W20.jsonl",
+        "pantheon-config:tickets/active/T-0001.md",
+        "pantheon-config:incidents/2026-05-b33/README.md",
+        "pantheon-config:incidents/2026-05-b33/analysis.md",
+        "pantheon-config:bugs/some-gotcha.md",
+        "pantheon-config:lessons/some-lesson.md",
+        "pantheon-config:knowledge/watch/reports/2026-05-17/r.md",
+        "pantheon-config:knowledge/episodic/topic/dive.md",
+        "pantheon-config:sop/standard/README.md",
+        "pantheon-config:tools/ticket.py",
+        "echo-prismatic:src/main.rs",
+    ]
+    ALLOWED = [
+        "pantheon-config:architecture/adr/ORG-015-x.md",
+        "pantheon-pwa:adr/ADR-050-x.md",
+        "pantheon-config:rulebook/principles.md",
+        "pantheon-config:rulebook/directives.md",
+        "pantheon-config:rulebook/policies/trust-posture.md",
+        "pantheon-config:sop/standard/foo.md",
+        "pantheon-config:sop/remediation/bar.md",
+    ]
+
+    def test_classifier_refuses_every_excluded_class(self) -> None:
+        for e in self.EXCLUDED:
+            with self.subTest(entry=e):
+                with self.assertRaises(ticket.TicketRefusal) as cm:
+                    ticket._refuse_excluded_ratifiable_class([e])
+                self.assertIn("ORG-015", str(cm.exception))
+
+    def test_classifier_accepts_allowed_classes(self) -> None:
+        ticket._refuse_excluded_ratifiable_class(self.ALLOWED)
+
+    def test_parser_stays_syntax_only(self) -> None:
+        # The shared parser must accept a notes/ value (grandfathered re-parse).
+        e = "pantheon-config:notes/x.md"
+        self.assertEqual(ticket._parse_ratifiable_files([e]), [e])
+
+    def _file_args(self, entry: str):
+        a = argparse.Namespace(
+            requester="orchestrator", target="operator", title="t",
+            labels="ratifiable", depends_on=None, stale_after=None,
+            not_before=None, ratifiable_file=[entry], ask="a", context="c",
+            no_push=True, spawn_impl=False, terminal=False, impl_title=None,
+            impl_ask=None, appetite=None, bet_ref=None, impl_target=None,
+            orphan="test fixture: T-6071 excluded-class gate", no_file=None,
+            intent=None,
+        )
+        return a
+
+    def test_file_refuses_notes_target_citing_org015(self) -> None:
+        with (
+            patch("tools.ticket._next_ticket_id", return_value="T-0099"),
+            patch("tools.ticket._pull_if_needed"),
+            patch("tools.ticket._commit_and_push") as commit,
+        ):
+            with self.assertRaises(ticket.TicketRefusal) as cm:
+                ticket.cmd_file(self._file_args("pantheon-config:notes/x.md"))
+            self.assertIn("ORG-015", str(cm.exception))
+            commit.assert_not_called()
+
+    def test_file_refuses_each_excluded_class(self) -> None:
+        for e in self.EXCLUDED:
+            with self.subTest(entry=e), \
+                    patch("tools.ticket._next_ticket_id", return_value="T-0099"), \
+                    patch("tools.ticket._pull_if_needed"), \
+                    patch("tools.ticket._commit_and_push"):
+                with self.assertRaises(ticket.TicketRefusal):
+                    ticket.cmd_file(self._file_args(e))
+
+    def test_file_accepts_allowed_class(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("tools.ticket._next_ticket_id", return_value="T-0099"), \
+                patch("tools.ticket._pull_if_needed"), \
+                patch("tools.ticket._commit_and_push"), \
+                patch("tools.ticket._check_ratifiable_resolve"), \
+                patch.object(ticket, "TICKETS_ROOT", Path(tmp) / "tickets"):
+            (Path(tmp) / "tickets" / "inbox").mkdir(parents=True)
+            a = self._file_args("pantheon-config:sop/standard/foo.md")
+            a.terminal = True
+            ticket.cmd_file(a)
+            self.assertEqual(len(list((Path(tmp) / "tickets" / "inbox").iterdir())), 1)
+
+    def test_attach_and_retarget_refuse_notes_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(ticket, "TICKETS_ROOT", Path(tmp)), \
+                patch.object(ticket, "REPO_ROOT", Path(tmp)):
+            for st in ticket.STATES:
+                (Path(tmp) / st).mkdir()
+            _write_ticket(Path(tmp) / "inbox" / "T-0001.md", tid="T-0001", state="inbox")
+            at = argparse.Namespace(ticket="T-0001", ratifiable_file=["pantheon-config:notes/x.md"],
+                                    no_file=None, no_push=True)
+            with self.assertRaises(ticket.TicketRefusal) as cm:
+                ticket.cmd_attach(at)
+            self.assertIn("ORG-015", str(cm.exception))
+            rt = argparse.Namespace(ticket="T-0001", to="operator", note=None, no_push=True,
+                                    keep_state=False, no_file=None,
+                                    ratifiable_file=["pantheon-config:notes/x.md"])
+            with self.assertRaises(ticket.TicketRefusal) as cm:
+                ticket.cmd_retarget(rt)
+            self.assertIn("ORG-015", str(cm.exception))
+
+
+class TestGrandfatheredNotesTargetTransitionsT6071(unittest.TestCase):
+    """A stored notes/ ratifiable_files value must round-trip every transition
+    without ever reaching the refusal (guard against a future re-parse)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        for s in ticket.STATES:
+            (self.root / s).mkdir(parents=True)
+        for p in (
+            patch.object(ticket, "TICKETS_ROOT", self.root),
+            patch.object(ticket, "REPO_ROOT", self.root),
+            patch.object(_git_utils, "REPO_ROOT", self.root),
+            patch.object(ticket, "_commit_and_push"),
+            patch.object(ticket, "_pull_if_needed"),
+            patch.object(ticket, "_refuse_excluded_ratifiable_class",
+                         side_effect=AssertionError("re-parse hit the refusal")),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+        sp = patch("tools._git_utils.subprocess.run")
+        self.mock_run = sp.start()
+        self.addCleanup(sp.stop)
+
+        def fake_run(argv, **kwargs):
+            if argv[:2] == ["git", "mv"] and len(argv) >= 4:
+                dst = contained_path(self.root, argv[3])
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(contained_path(self.root, argv[2])), str(dst))
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        self.mock_run.side_effect = fake_run
+        self._prev_cap = os.environ.get("PANTHEON_MAX_ACTIVE_TICKETS")
+        os.environ["PANTHEON_MAX_ACTIVE_TICKETS"] = _cap_override(100000)
+        self.addCleanup(self._restore_cap)
+
+    def _restore_cap(self) -> None:
+        if self._prev_cap is None:
+            os.environ.pop("PANTHEON_MAX_ACTIVE_TICKETS", None)
+        else:
+            os.environ["PANTHEON_MAX_ACTIVE_TICKETS"] = self._prev_cap
+
+    def _seed(self, state: str) -> Path:
+        p = self.root / state / "T-0001.md"
+        _write_ticket(p, tid="T-0001", state=state, target="operator")
+        text = p.read_text(encoding="utf-8")
+        text = text.replace(
+            "parent_ticket: null",
+            "parent_ticket: null\nratifiable_files: [pantheon-config:notes/x.md]", 1)
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def _find(self) -> Path:
+        return next(self.root.glob("*/T-0001.md"))
+
+    def _assert_kept(self) -> None:
+        fields, _ = ticket.parse_front_matter(self._find().read_text(encoding="utf-8"))
+        self.assertEqual(fields["ratifiable_files"], ["pantheon-config:notes/x.md"])
+
+    def test_claim_unclaim_annotate_resolve_pass(self) -> None:
+        self._seed("inbox")
+        ns = argparse.Namespace(ticket="T-0001", no_push=True)
+        self.assertEqual(ticket.cmd_claim(ns), 0)
+        self._assert_kept()
+        self.assertEqual(ticket.cmd_annotate(
+            argparse.Namespace(ticket="T-0001", note="n", no_push=True)), 0)
+        self._assert_kept()
+        self.assertEqual(ticket.cmd_unclaim(argparse.Namespace(ticket="T-0001", no_push=True)), 0)
+        self._assert_kept()
+        self.assertEqual(ticket.cmd_claim(ns), 0)
+        r = argparse.Namespace(ticket="T-0001", with_summary="ok", no_push=True)
+        self.assertEqual(ticket.cmd_resolve(with_ruling(r, self.root)), 0)
+        self.assertTrue((self.root / "done" / "T-0001.md").exists())
+        self._assert_kept()
 
 
 if __name__ == "__main__":

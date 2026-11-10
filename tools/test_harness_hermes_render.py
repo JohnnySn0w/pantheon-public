@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import codecs
+import dataclasses
 import hashlib
 import json
 from pathlib import Path, PurePath
@@ -27,6 +28,7 @@ from tools.harness_adapter.render_target import HarnessRenderTarget
 from tools.harness_adapter.types import HarnessLaunchConfig
 
 _REAL_INSIDE_REPO = hermes_render._inside_repo
+_REAL_INSTALL_ROOT = hermes_render.hermes_install_root
 
 
 @pytest.fixture(autouse=True)
@@ -42,6 +44,7 @@ def _repo_probe_bounded_to_tmp(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(hermes_render, "_inside_repo", bounded)
+    monkeypatch.setattr(hermes_render, "hermes_install_root", lambda _executable: tmp_path / "package")
 
 
 def test_default_repo_probe_walks_up(tmp_path):
@@ -55,11 +58,11 @@ COMMITTED_DEFAULTS = REPO / "harness" / "hermes" / "config.defaults.yaml"
 SOURCE_TEXT = "# Qianliyan pinned rules (fixture)\n\nrules body\n\n## Identity\n\nYou are a watcher.\n\n## Other\n\nmore\n"
 
 
-def _launch(**native_overrides) -> HarnessLaunchConfig:
+def _launch(*, executable: Path = Path("/opt/hermes"), **native_overrides) -> HarnessLaunchConfig:
     native = {"provider": "deepseek", "busy_input_mode": "queue"}
     native.update(native_overrides)
     return HarnessLaunchConfig(
-        harness="hermes", profile="deepseek-direct", executable=Path("/opt/hermes"),
+        harness="hermes", profile="deepseek-direct", executable=executable,
         model="deepseek-v4-pro", mode="interactive", meter="api", quota_source="provider-api",
         native=native, sources=("test",),
     )
@@ -379,6 +382,21 @@ def test_prepare_default_writer_is_idempotent(tmp_path):
     assert first.outputs == second.outputs
 
 
+def test_deepseek_fallback_launch_requires_local_key_holding_proxy_base(tmp_path):
+    original = _inputs(tmp_path)
+    home = tmp_path / "deepseek-fallback"
+    (home / "seat").mkdir(parents=True)
+    inputs = dataclasses.replace(original, account_home=home)
+    for launch in (_launch(), _launch(base_url="https://api.deepseek.com/v1")):
+        with pytest.raises(HermesRenderError) as info:
+            prepare_hermes_launch(inputs, launch)
+        assert info.value.reason == "egress-proxy-required"
+    prepare_hermes_launch(inputs, _launch(base_url="https://deepseek-proxy.invalid:8448/v1"))
+    config = yaml.safe_load((home / ".hermes/config.yaml").read_text())
+    assert config["model"]["base_url"] == "https://deepseek-proxy.invalid:8448/v1"
+    assert all(slot["base_url"] == "https://deepseek-proxy.invalid:8448/v1" for slot in config["auxiliary"].values())
+
+
 def test_source_hash_mismatch_fails_closed(tmp_path):
     inputs = _inputs(tmp_path, sha="f" * 64)
     with pytest.raises(HermesRenderError) as info:
@@ -508,6 +526,65 @@ def test_nested_per_seat_key_is_refused_in_both_placements(tmp_path, placement):
 # --- r1 MED-1: a seat .env must not carry scope/home/config controls ---------
 
 
+def _editable_install_layout(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "hermes-source"
+    venv = root / ".venv"
+    executable = venv / "bin" / "hermes"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    (venv / "pyvenv.cfg").write_text("version_info = 3.14.8\n", encoding="utf-8")
+    metadata = venv / "lib" / "python3.14" / "site-packages" / "hermes_agent-0.0.0.dist-info"
+    metadata.mkdir(parents=True)
+    (metadata / "direct_url.json").write_text(
+        json.dumps({"url": root.as_uri(), "dir_info": {"editable": True}}), encoding="utf-8"
+    )
+    (root / "hermes_cli").mkdir()
+    (root / "hermes_cli" / "_startup_fast.py").write_text("", encoding="utf-8")
+    (root / "pyproject.toml").write_text("[project]\nname='hermes-agent'\n", encoding="utf-8")
+    return executable, root
+
+
+def test_install_root_follows_pinned_editable_package_metadata(tmp_path):
+    executable, root = _editable_install_layout(tmp_path)
+    assert _REAL_INSTALL_ROOT(executable) == root
+
+
+def test_dotenv_audit_wires_exactly_three_clean_paths(tmp_path):
+    executable, root = _editable_install_layout(tmp_path)
+    home = tmp_path / "home"
+    harness_home = home / ".hermes"
+    harness_home.mkdir(parents=True)
+    for path in (harness_home / ".env", harness_home / ".op.env", root / ".env"):
+        path.write_text("DEEPSEEK_API_KEY=fixture\n", encoding="utf-8")
+    assert hermes_render.dotenv_control_findings(
+        home, executable, install_root_resolver=_REAL_INSTALL_ROOT,
+    ) == {
+        "harness-env": (),
+        "harness-op-env": (),
+        "install-root-env": (),
+    }
+
+
+@pytest.mark.parametrize("path_class", hermes_render.DOTENV_PATH_CLASSES)
+def test_prepare_refuses_forbidden_control_in_every_loaded_dotenv(tmp_path, path_class):
+    inputs = _inputs(tmp_path)
+    executable, root = _editable_install_layout(tmp_path)
+    paths = {
+        "harness-env": inputs.account_home / ".hermes" / ".env",
+        "harness-op-env": inputs.account_home / ".hermes" / ".op.env",
+        "install-root-env": root / ".env",
+    }
+    paths[path_class].parent.mkdir(parents=True, exist_ok=True)
+    paths[path_class].write_text("HERMES_MANAGED_DIR=/tmp/repoint\n", encoding="utf-8")
+    with pytest.raises(HermesRenderError) as info:
+        prepare_hermes_launch(
+            inputs, _launch(executable=executable), install_root_resolver=_REAL_INSTALL_ROOT,
+        )
+    assert info.value.reason == "env-file-control"
+    assert path_class in info.value.detail
+    assert not (inputs.account_home / ".hermes" / "config.yaml").exists()
+
+
 def test_forbidden_env_file_keys():
     assert hermes_render.FORBIDDEN_ENV_FILE_KEYS == {
         "HERMES_MANAGED_DIR", "HERMES_MANAGED", "HERMES_HOME", "HERMES_IGNORE_USER_CONFIG", "HERMES_IGNORE_RULES",
@@ -520,6 +597,29 @@ def test_clean_env_file_has_no_controls(tmp_path):
     env.write_text("# seat credentials\n\nDEEPSEEK_API_KEY=sk-test\n", encoding="utf-8")
     assert hermes_render.check_env_file_controls(env) == []
     assert hermes_render.check_env_file_controls(tmp_path / "missing.env") == []
+
+
+def test_bounded_reader_consumes_short_reads_before_classifying(tmp_path, monkeypatch):
+    env = tmp_path / ".env"
+    env.write_bytes(b"DEEPSEEK_API_KEY=x\nHERMES_MANAGED_DIR=/x\n")
+    real_read = hermes_render.os.read
+
+    def short_read(fd, count):
+        return real_read(fd, min(count, 3))
+
+    monkeypatch.setattr(hermes_render.os, "read", short_read)
+    assert hermes_render.check_env_file_controls(env) == ["HERMES_MANAGED_DIR"]
+
+
+def test_env_control_check_rejects_symlink_and_oversize(tmp_path):
+    target = tmp_path / "target"
+    target.write_text("DEEPSEEK_API_KEY=x\n", encoding="utf-8")
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    assert hermes_render.check_env_file_controls(link) == [hermes_render.ENV_FILE_SYMLINK]
+    oversized = tmp_path / "oversized"
+    oversized.write_bytes(b"x" * (hermes_render.MAX_ENV_FILE_BYTES + 1))
+    assert hermes_render.check_env_file_controls(oversized) == [hermes_render.ENV_FILE_OVERSIZE]
 
 
 def test_api_key_alone_is_not_flagged(tmp_path):

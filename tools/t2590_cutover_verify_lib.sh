@@ -209,6 +209,45 @@ cutover_companion_rejoined() {
   systemctl --user is-active --quiet "$unit" && tmux has-session -t "$session" 2>/dev/null
 }
 
+# T-5956: companion pre-cutover state. The cutover records each declared
+# companion unit's ActiveState before it stops them; the rollback then
+# restores (starts and verifies) only those that were active. Without this, a
+# companion that was deliberately inactive (e.g. specialist's retired acp-bridge,
+# T-5946) would be revived by a rollback.
+companion_snapshot_path() { # <home> <persona> <stamp>
+  printf '%s/.local/state/pantheon/persona-cutover-%s-%s.companions\n' "$1" "$2" "$3"
+}
+
+companion_snapshot_write() { # <path> <tokens...>: one "unit=ActiveState" line per companion
+  local path="$1"; shift
+  local tok unit state
+  # Keep the FIRST snapshot for a stamp: a cutover that aborted after stopping
+  # the companions and is re-run with the same --stamp would otherwise record
+  # them as inactive, and the rollback would then leave them stopped.
+  [[ -s "$path" ]] && return 0
+  mkdir -p "$(dirname "$path")"
+  : > "$path"
+  for tok in "$@"; do
+    unit="${tok%%=*}"
+    state="$(systemctl --user show "$unit" -p ActiveState --value 2>/dev/null)" || state=""
+    printf '%s=%s\n' "$unit" "${state:-unknown}" >> "$path"
+  done
+}
+
+companion_should_restore() { # <path> <unit>; 0 = restore, 1 = leave stopped
+  # Restore unless the snapshot PROVES the unit was not active. A missing
+  # snapshot (a cutover from before T-5956) or an unrecorded unit keeps the
+  # old restore-everything behaviour: unknown must not read as "was inactive".
+  local path="$1" unit="$2" line
+  [[ -r "$path" ]] || return 0
+  line="$(awk -F= -v u="$unit" '$1 == u { print; exit }' "$path" 2>/dev/null)"
+  [[ -n "$line" ]] || return 0
+  case "${line#*=}" in
+    active|activating|reloading|unknown|"") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # rollback_scope_clean <scope_unit> [proc_root] — true (rc 0) iff the CURRENT
 # default tmux server (if any) has NO cgroup membership under <scope_unit>.
 # T-2642: persona_rollback.sh's verify signal that the restarted bespoke

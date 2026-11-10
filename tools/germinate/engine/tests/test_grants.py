@@ -20,6 +20,7 @@ import pytest
 
 from tools.germinate.engine import grants as G
 from tools.germinate.engine.executor import EngineRefusal
+from tools.germinate.engine.run_state import RunStore
 from tools.germinate.engine.tests import helpers as H
 from tools.host_control.approval.contracts import ApproverDenied, PlanMetadata
 from tools.host_control.approval.journal import ApprovalJournal
@@ -77,7 +78,8 @@ class LiveSource:
         return PlanMetadata(**self._find(plan_handle).metadata_fields(self.policy_revision))
 
     def plan_summary(self, plan_handle, expected_digest):
-        return self._find(plan_handle).plan_digest, "simulated plan"
+        req = self._find(plan_handle)
+        return req.plan_digest, req.summary()
 
 
 class Rig:
@@ -219,6 +221,108 @@ def test_a_grant_for_scope_x_cannot_bind_scope_y(tmp_path):
         assert rig.status(handle) == "issued"
         [outcome] = rig.apply({"op-a": handle}, scope="system")
         assert outcome.state == "SATISFIED"
+    finally:
+        rig.close()
+
+
+def _receipt_bodies(rig, run_id, scope="system"):
+    store = RunStore(rig.eng.backend.run_state_root(scope))
+    with store.open(store.find(run_id)) as handle:
+        wal = handle.wal()
+        return {
+            e.op_id: wal.read_receipt_by_ref(e.receipt_ref)[0].receipt_payload for e in wal.read_manifest().receipts
+        }
+
+
+def test_receipt_body_carries_the_authority_gate_and_scope_never_the_handle(tmp_path):
+    rig = Rig(tmp_path, OPS_MIXED)
+    try:
+        handle = rig.issue(rig.requests()["op-a"])
+        [outcome] = rig.apply({"op-a": handle}, accept_gates=frozenset({"op-gate"}))
+        bodies = _receipt_bodies(rig, outcome.run_id)
+        bound = [json.loads(line) for line in rig.eng.echo.getvalue().splitlines() if '"grant.bound"' in line]
+        assert len(bound) == 1 and bound[0]["component"] == "comp-a" and bound[0]["scope"] == "system"
+        assert bodies["op-a"]["authority"] == {
+            "gate_id": "gate-a",
+            "scope": "system",
+            "authority_record_id": bound[0]["authority_record_id"],
+        }
+        assert bodies["op-o"]["authority"] is None  # operator gate: no independent authority
+        assert handle not in json.dumps(bodies)
+    finally:
+        rig.close()
+
+
+def test_binding_and_summary_name_gate_and_scope_explicitly(rig):
+    req = rig.requests()["op-a"]
+    binding = req.binding()
+    assert (binding["component"], binding["op_id"], binding["gate_id"], binding["scope"], binding["kind"]) == (
+        "comp-a", "op-a", "gate-a", "system", req.kind,
+    )
+    assert "plan_handle" not in binding and "operator" not in json.dumps(binding)  # actor-free, handle-free
+    summary = json.loads(req.summary())
+    assert summary["gate_id"] == "gate-a" and summary["scope"] == "system"
+    assert summary["effect_digest"] == req.effect_digest and summary["plan_digest"] == req.plan_digest
+    assert len(req.summary()) < 4096
+    review = rig.service.review("reviewer", req.plan_handle, req.plan_digest, None)
+    assert review.record.effect_digest == req.effect_digest
+
+
+def test_effect_digest_commits_to_every_binding_field():
+    base = G.GrantRequest("comp-a", "op-a", "gate-a", "mkdir", "system", "1" * 64, "sha256:c", "operator", "engine", "2" * 64)
+    seen = {base.effect_digest}
+    for field, value in (
+        ("component", "comp-b"),  # same op id, gate and scope in another component (collided under v1)
+        ("op_id", "op-b"),
+        ("gate_id", "gate-b"),
+        ("scope", "seat-alice"),
+        ("kind", "file"),
+        ("op_spec_digest", "3" * 64),
+        ("contract_digest", "sha256:d"),
+    ):
+        digest = dataclasses.replace(base, **{field: value}).effect_digest
+        assert digest not in seen, field
+        seen.add(digest)
+    # actor-free (ORG-052 §4: owner/performer excluded) and plan-digest-free
+    assert dataclasses.replace(base, actor="other", performer="x", plan_digest="9" * 64).effect_digest == base.effect_digest
+
+
+def test_a_resumed_apply_within_expiry_replays_the_binding_without_a_second_grant(tmp_path):
+    rig = Rig(tmp_path, OPS_TWO)
+    try:
+        reqs = rig.requests()
+        handle_a = rig.issue(reqs["op-a"])
+        wrong_b = rig.issue(reqs["op-a"])  # a grant for op-a's gate, offered for op-b's
+        with pytest.raises(EngineRefusal, match=r"op-b: grant denied \(plan_mismatch\)"):
+            rig.apply({"op-a": handle_a, "op-b": wrong_b})
+        assert rig.status(handle_a) == "bound"  # op-a's bind committed before op-b refused
+        _assert_untouched(rig, "/srv/a", "/srv/b")
+        handle_b = rig.issue(reqs["op-b"])
+        rig.now = NOW + timedelta(minutes=5)
+        [outcome] = rig.apply({"op-a": handle_a, "op-b": handle_b})
+        assert outcome.state == "SATISFIED"
+        bodies = _receipt_bodies(rig, outcome.run_id)
+        assert bodies["op-a"]["authority"]["gate_id"] == "gate-a" and bodies["op-b"]["authority"]["gate_id"] == "gate-b"
+    finally:
+        rig.close()
+
+
+def test_a_resumed_apply_after_expiry_cannot_replay_the_bound_grant(tmp_path):
+    rig = Rig(tmp_path, OPS_TWO)
+    try:
+        reqs = rig.requests()
+        handle_a = rig.issue(reqs["op-a"])
+        wrong_b = rig.issue(reqs["op-a"])
+        with pytest.raises(EngineRefusal, match="op-b: grant denied"):
+            rig.apply({"op-a": handle_a, "op-b": wrong_b})
+        assert rig.status(handle_a) == "bound"
+        rig.now = NOW + timedelta(hours=2)
+        handle_b = rig.issue(reqs["op-b"])
+        with pytest.raises(EngineRefusal, match=r"op-a: grant denied \(expired\)"):
+            rig.apply({"op-a": handle_a, "op-b": handle_b})
+        _assert_untouched(rig, "/srv/a", "/srv/b")
+        assert rig.status(handle_a) == "bound"  # BOUND is terminal; expiry never rewrites it
+        assert rig.status(handle_b) == "issued"  # refused before op-b's bind: not burned
     finally:
         rig.close()
 

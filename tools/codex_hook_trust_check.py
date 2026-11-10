@@ -14,8 +14,13 @@ file_grep):
                   covers both "Bash" and "apply_patch", and every OTHER enabled hook,
                   trusted or not, is one the codex harness snippet declares (T-4160: the
                   control-plane launch bypasses hook trust, so untrusted hooks run).
-                  A Claude seat (its codex runtime is only a fallback) declares none,
-                  so the guard must be its only hook.
+                  Every Codex runtime also declares the trusted SessionStart/Stop
+                  lifecycle pair installed by the launch adapter (T-4990).
+                  The shell-box PreToolUse hook (T-5480, installer op
+                  harness.codex-shell-box) is declared by codex_shell_box itself on EVERY
+                  seat with a codex runtime, not by the snippet. A Claude seat (its codex
+                  runtime is only a fallback) declares those lifecycle hooks, the
+                  guard, and the shell-box hook.
   stdout "false"  any of that fails. The reasons go to stderr as JSON.
   (no stdout, exit 3)  could not evaluate (app-server, snippet or instance.yaml
                   unreadable, or this account has no harness binding), which parity
@@ -32,7 +37,11 @@ The injection direction (a trusted hook nobody declared) compares against the
 codex harness template (harness/codex/templates/config.toml.snippet in the clone
 this file runs from, `{{ codex_home }}` bound to this account's home). The
 worker-guard command is always expected, so a snippet that predates T-4144 can't
-flag the guard itself.
+flag the guard itself. The guard is the worker-guard-v2.py hook (T-5695); the v1
+worker-guard.py is accepted only as the SOLE guard generation (the rollback, when the
+seat's single guard entry is re-pointed back to v1). A v1 hook next to a v2 hook is not
+a guard and is flagged as undeclared. The active guard is declared by this file's own
+constants, never by the snippet.
 """
 from __future__ import annotations
 
@@ -41,7 +50,7 @@ import json
 import os
 import pwd
 import re
-import select
+import selectors
 import shutil
 import subprocess
 import sys
@@ -49,7 +58,9 @@ import time
 import tomllib
 from pathlib import Path
 
-GUARD_SUFFIX = "/pantheon-config/tools/hooks/worker-guard.py"
+# Canonical guard: worker-guard v2 (T-5695). v1 is the ROLLBACK guard only.
+GUARD_SUFFIX = "/pantheon-config/tools/hooks/worker-guard-v2.py"
+ROLLBACK_GUARD_SUFFIX = "/pantheon-config/tools/hooks/worker-guard.py"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SNIPPET = REPO_ROOT / "harness" / "codex" / "templates" / "config.toml.snippet"
 DEFAULT_INSTANCE = REPO_ROOT / "instance.yaml"
@@ -57,10 +68,9 @@ DEFAULT_INSTANCE = REPO_ROOT / "instance.yaml"
 _HARNESS_DECLARES_SNIPPET = {"codex": True, "claude-code": False}
 GUARDED_TOOLS = ("Bash", "apply_patch")
 EXIT_UNMEASURABLE = 3
-# The ORG-099 axis check_ref runs this file from each SEAT's clone and refuses
-# (UNMEASURABLE) unless it finds CHECK_CONTRACT >= 2. A clone still holding the
-# contract-1 tool (T-4155) would otherwise run it and read FAIL on Claude seats.
-CHECK_CONTRACT = 2
+# The ORG-099 axes run this file from each SEAT's clone. Contract 3 adds the
+# T-4990 lifecycle-only verdict; stale clones remain UNMEASURABLE.
+CHECK_CONTRACT = 3
 # parity_render's file_grep branch reads these stderr strings as "required file
 # absent" -> HARD FAIL, whatever the exit code. An UNMEASURABLE reason must never
 # carry them (T-4160: an unreadable snippet paged as a missing guard).
@@ -101,19 +111,21 @@ def list_hooks(*, codex_bin: str, cwd: Path, timeout: float = 30.0) -> list[dict
         proc.stdin.flush()
 
     def reply(want_id: int) -> dict:
-        while time.time() < deadline:
-            ready, _, _ = select.select([proc.stdout], [], [], 0.5)
-            if not ready:
-                continue
-            line = proc.stdout.readline()
-            if not line:
-                break
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            if msg.get("id") == want_id:
-                return msg
+        # T-5872: selectors, not select.select() (ValueError for fd >= 1024).
+        with selectors.PollSelector() as sel:
+            sel.register(proc.stdout, selectors.EVENT_READ)
+            while time.time() < deadline:
+                if not sel.select(0.5):
+                    continue
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("id") == want_id:
+                    return msg
         raise Unavailable(f"no app-server reply to request {want_id} within {timeout:.0f}s")
 
     try:
@@ -131,6 +143,13 @@ def list_hooks(*, codex_bin: str, cwd: Path, timeout: float = 30.0) -> list[dict
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()
+        # T-5872: release the pipes (no ResourceWarning leak)
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                stream.close()
+            except OSError:
+                pass
     if "error" in res:
         raise Unavailable(f"hooks/list error: {res['error']}")
     hooks: list[dict] = []
@@ -204,15 +223,122 @@ def _matcher_covers(matcher: object, tool: str) -> bool:
         return False
 
 
-def _is_guard(hook: dict) -> bool:
+def shell_box_commands(codex_home: Path) -> set[str]:
+    """The shell-box hook command, from codex_shell_box (single source, no re-spelled path).
+
+    Lazy import: this file runs as a plain script, where `tools` may not be importable.
+    Any failure is Unavailable (UNMEASURABLE), never a false FAIL."""
+    try:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        from tools.harness_adapter import codex_shell_box
+        return {codex_shell_box.hook_command(codex_home)}
+    except Exception as exc:  # noqa: BLE001 - includes ImportError
+        raise Unavailable(f"codex_shell_box unavailable: {type(exc).__name__}: {exc}") from exc
+
+
+def lifecycle_commands(home: Path, account: str) -> tuple[set[str], set[str]]:
+    """Accepted SessionStart/Stop commands: seat-clone canonical plus Consultant legacy."""
+    try:
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        from tools import agent_role_map
+        from tools.harness_adapter import codex as codex_adapter
+        persona = agent_role_map.account_persona(account)
+    except Exception as exc:  # noqa: BLE001
+        raise Unavailable(f"persona mapping unavailable: {type(exc).__name__}: {exc}") from exc
+    if persona is None:
+        raise Unavailable(f"no persona mapping for account {account!r}")
+    source = codex_adapter.lifecycle_source_path(home, persona)
+    if source is None or not source.is_file():
+        raise Unavailable(f"no persona-owned lifecycle source for {persona!r}")
+    canonical = codex_adapter.lifecycle_hook_commands(home, source)
+    starts, stops = {canonical[0]}, {canonical[1]}
+    legacy = codex_adapter.accepted_legacy_lifecycle_commands(home, persona)
+    if legacy:
+        starts.add(legacy[0])
+        stops.add(legacy[1])
+    return starts, stops
+
+
+def evaluate_lifecycle(
+    hooks: list[dict], starts: set[str], stops: set[str], *, home: Path | None = None,
+) -> list[str]:
+    """Problems, or [] when exactly one trusted/live lifecycle pair is reported.
+
+    With ``home`` (the production path), inventory is entrypoint-family based rather
+    than accepted-command based.  Thus a wrong source, malformed argument tail, or
+    disabled/untrusted duplicate remains evidence under ``--lifecycle-only``.
+    """
+    problems: list[str] = []
+    adapter = None
+    if home is not None:
+        try:
+            if str(REPO_ROOT) not in sys.path:
+                sys.path.insert(0, str(REPO_ROOT))
+            from tools.harness_adapter import codex as adapter
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"lifecycle family classifier unavailable: {type(exc).__name__}: {exc}")
+            return problems
+    for event, config_event, commands, matcher in (
+        ("sessionStart", "SessionStart", starts, "startup|resume|clear|compact"),
+        ("stop", "Stop", stops, None),
+    ):
+        found = [
+            hook for hook in hooks
+            if hook.get("eventName") == event
+            and (
+                hook.get("command") in commands
+                if adapter is None
+                else adapter.lifecycle_command_in_family(home, config_event, hook.get("command"))
+            )
+        ]
+        if len(found) != 1:
+            problems.append(f"expected exactly one {event} lifecycle hook, found {len(found)}")
+            continue
+        hook = found[0]
+        if hook.get("command") not in commands:
+            problems.append(
+                f"{event} lifecycle hook uses a non-canonical or wrong-source command: "
+                f"{hook.get('command')!r}"
+            )
+            continue
+        if hook.get("trustStatus") != "trusted" or not hook.get("enabled", True):
+            problems.append(
+                f"{event} lifecycle hook not live: trust={hook.get('trustStatus')} "
+                f"enabled={hook.get('enabled')}"
+            )
+        if hook.get("timeoutSec") != 5:
+            problems.append(f"{event} lifecycle hook timeout is {hook.get('timeoutSec')!r}, not 5")
+        if matcher is not None and hook.get("matcher") != matcher:
+            problems.append(f"{event} lifecycle matcher is {hook.get('matcher')!r}")
+    return problems
+
+
+def _is_pretooluse_ending(hook: dict, suffix: str) -> bool:
     return (hook.get("eventName") == "preToolUse"
-            and str(hook.get("command") or "").endswith(GUARD_SUFFIX))
+            and str(hook.get("command") or "").endswith(suffix))
+
+
+def _is_guard(hook: dict) -> bool:
+    """A worker-guard hook of either generation (v2 canonical, v1 rollback)."""
+    return (_is_pretooluse_ending(hook, GUARD_SUFFIX)
+            or _is_pretooluse_ending(hook, ROLLBACK_GUARD_SUFFIX))
+
+
+def _guards(hooks: list[dict]) -> list[dict]:
+    """The guard hooks: v2 ones; only when there are none, the v1 (rollback) ones."""
+    v2 = [h for h in hooks if _is_pretooluse_ending(h, GUARD_SUFFIX)]
+    if v2:
+        return v2
+    return [h for h in hooks if _is_pretooluse_ending(h, ROLLBACK_GUARD_SUFFIX)]
 
 
 def evaluate(hooks: list[dict], expected: set[str]) -> list[str]:
     """Problems, or [] when the seat is guarded and carries no undeclared trusted hook."""
     problems: list[str] = []
-    guards = [h for h in hooks if _is_guard(h)]
+    guards = _guards(hooks)
+    guard_ids = {id(h) for h in guards}
     live = [h for h in guards
             if h.get("trustStatus") == "trusted" and h.get("enabled", True)
             and all(_matcher_covers(h.get("matcher"), t) for t in GUARDED_TOOLS)]
@@ -226,7 +352,7 @@ def evaluate(hooks: list[dict], expected: set[str]) -> list[str]:
     # not. The control-plane codex launch passes --dangerously-bypass-hook-trust
     # (harness_adapter/codex.py:402), so an untrusted hook RUNS on those seats.
     for hook in hooks:
-        if _is_guard(hook) or not hook.get("enabled", True):
+        if id(hook) in guard_ids or not hook.get("enabled", True):
             continue
         if hook.get("command") not in expected:
             problems.append(f"hook not declared by the codex harness snippet "
@@ -249,6 +375,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--instance", type=Path, default=DEFAULT_INSTANCE,
                    help="instance.yaml to read the seat type from (default: this clone's)")
     p.add_argument("--timeout", type=float, default=30.0)
+    p.add_argument("--lifecycle-only", action="store_true",
+                   help="check only the trusted SessionStart/Stop lifecycle pair")
     args = p.parse_args(argv)
     home = Path.home()
     try:
@@ -258,9 +386,14 @@ def main(argv: list[str] | None = None) -> int:
         elif _HARNESS_DECLARES_SNIPPET[seat_harness(_account(), args.instance)]:
             expected = snippet_commands(DEFAULT_SNIPPET, home)
         else:
-            # T-4160: a Claude seat with a codex FALLBACK runtime should carry the
-            # worker-guard and nothing else, so it declares no other hook.
+            # A Claude seat with a Codex fallback does not declare the primary-seat
+            # snippet wholesale; T-4990's lifecycle pair is added explicitly below.
             expected = set()
+        starts, stops = lifecycle_commands(home, _account())
+        expected |= starts | stops
+        # Every seat with a codex runtime gets the shell-box hook (installer op
+        # harness.codex-shell-box), Claude fallback seats included.
+        expected = expected | shell_box_commands(home)
         hooks = list_hooks(codex_bin=_codex_bin(), cwd=home, timeout=args.timeout)
     except Unavailable as exc:
         print(_parity_safe(json.dumps({"unmeasurable": str(exc)})), file=sys.stderr)
@@ -269,7 +402,9 @@ def main(argv: list[str] | None = None) -> int:
         print(_parity_safe(json.dumps({"unmeasurable": f"{type(exc).__name__}: {exc}"})),
               file=sys.stderr)
         return EXIT_UNMEASURABLE
-    problems = evaluate(hooks, expected)
+    problems = evaluate_lifecycle(hooks, starts, stops, home=home)
+    if not args.lifecycle_only:
+        problems += evaluate(hooks, expected)
     if problems:
         print(json.dumps({"problems": problems}), file=sys.stderr)
     print("false" if problems else "true")

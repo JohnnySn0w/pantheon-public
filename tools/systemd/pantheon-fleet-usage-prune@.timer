@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily usage-ledger retention prune for Pantheon seat %i
+
+[Timer]
+OnCalendar=*-*-* 04:41:00
+RandomizedDelaySec=600
+Persistent=true
+Unit=pantheon-fleet-usage-prune@%i.service
+
+[Install]
+WantedBy=timers.target

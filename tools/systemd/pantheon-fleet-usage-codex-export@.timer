@@ -1,0 +1,13 @@
+[Unit]
+# T-5933/T-4889: hourly. The export rewrites the last 2 UTC days and refreshes the Codex
+# app-server quota record each run, so a missed run self-heals; Persistent catches up.
+Description=Hourly Codex usage export for Pantheon seat %i
+
+[Timer]
+OnCalendar=*-*-* *:17:00
+RandomizedDelaySec=120
+Persistent=true
+Unit=pantheon-fleet-usage-codex-export@%i.service
+
+[Install]
+WantedBy=timers.target

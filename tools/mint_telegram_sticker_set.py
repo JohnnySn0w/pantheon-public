@@ -42,10 +42,11 @@ DEFAULT_OWNER = "424242424"
 
 EMOJI = {"idle": "\U0001F916", "shipped": "\U0001F680", "approved": "✅",
          "investigating": "\U0001F50D", "thinking": "\U0001F914", "wedged": "⚠️",
+         "heart": "💜",
          "waypoint": "\U0001F9ED", "verified": "✅", "received": "✉️",
          "boundary": "\U0001F6E1", "waiting": "\U0001F3D5"}
 REACTION_ORDER = ["idle", "shipped", "approved", "investigating", "thinking", "wedged",
-                  "waypoint", "verified", "received", "boundary", "waiting"]
+                  "heart", "waypoint", "verified", "received", "boundary", "waiting"]
 AGENT_ORDER = ["orchestrator", "specialist", "recovery", "codex", "archivist", "consultant"]
 OPERATOR_ORDER = ["thoughtful", "knowing", "wanderer", "focus", "tangled", "serene"]
 

@@ -33,6 +33,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 from tools import runtime_controller as rc
+try:
+    from tools import _seat_state_isolation
+except ImportError:  # pragma: no cover
+    import _seat_state_isolation  # type: ignore[no-redef]
 from tools.bringup_acceptance import codex_acceptance_config_guard as config_guard
 from tools.bringup_acceptance import harness_codex_ready as hcr
 from tools.bringup_acceptance import harness_codex_rc_ready as hrc
@@ -53,6 +57,7 @@ _converge_patches = [mock.patch.object(hcr, "converge_worker_guard_hook"), mock.
 
 
 def setUpModule() -> None:
+    _seat_state_isolation.start()  # T-6118 (plain-unittest isolation)
     for p in _converge_patches:
         p.start()
 
@@ -60,6 +65,7 @@ def setUpModule() -> None:
 def tearDownModule() -> None:
     for p in reversed(_converge_patches):
         p.stop()
+    _seat_state_isolation.stop()  # T-6118
 
 
 def _skip_unless_disposable_tmux_available(test: unittest.TestCase) -> None:
@@ -546,6 +552,18 @@ class VersionJsonSnapshotTest(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
+def _reap_stand_in(proc) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    finally:
+        proc.stdout.close()
+        proc.stderr.close()
+
+
 class StandInScriptTest(unittest.TestCase):
     def test_written_script_is_executable_bash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -564,9 +582,20 @@ class StandInScriptTest(unittest.TestCase):
             proc.stdin.close()  # no dismiss line ever sent -- only need the modal
             out = proc.stdout.readline() + proc.stdout.read()
         finally:
-            proc.terminate()
-            proc.wait(timeout=5)
+            _reap_stand_in(proc)
         self.assertTrue(hcr._is_codex_update_modal(out))
+
+    def test_reap_stand_in_closes_pipes_after_wait_timeout(self) -> None:
+        proc = mock.Mock()
+        proc.wait.side_effect = [subprocess.TimeoutExpired("stand-in", 5), 0]
+
+        _reap_stand_in(proc)
+
+        proc.terminate.assert_called_once_with()
+        proc.kill.assert_called_once_with()
+        self.assertEqual(proc.wait.call_args_list, [mock.call(timeout=5), mock.call()])
+        proc.stdout.close.assert_called_once_with()
+        proc.stderr.close.assert_called_once_with()
 
 
 def _write_temp_stand_in() -> Path:

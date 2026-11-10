@@ -569,7 +569,8 @@ class ScriptTest(unittest.TestCase):
         text = (H.REPO_ROOT / R.INGRESS_UNIT_REL).read_text()
         service = text.split("[Service]", 1)[1].split("[Install]", 1)[0]
         keys = [ln.split("=", 1)[0] for ln in service.splitlines() if "=" in ln and not ln.startswith("#")]
-        not_sandbox = {"Type", "BusName", "ExecStart", "Restart", "RestartSec", "StateDirectory", "StateDirectoryMode"}
+        not_sandbox = {"Type", "BusName", "ExecStart", "Restart", "RestartSec", "RestartSteps",
+                       "RestartMaxDelaySec", "StateDirectory", "StateDirectoryMode"}  # T-6359: restart policy
         self.assertEqual(sorted(R.MDWE_PROBE_PROPERTIES), sorted(set(keys) - not_sandbox))
         line = next(ln for ln in emitted().splitlines() if "mdwe-probe.txt" in ln)
         for k, v in R.ingress_sandbox_properties():

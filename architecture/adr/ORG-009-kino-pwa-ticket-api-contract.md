@@ -74,6 +74,8 @@ POST   /api/tickets/:id/resolve          # resolve --with (body: {"with": "..."}
 
 `kino-daemon` runs an inotify watch on `~/pantheon-config/tickets/{inbox,active,blocked,done}/`. On any add / move / delete event involving a `T-NNNN.md` file, daemon emits a `ticket-changed` WS frame to all connected PWA clients.
 
+> Amended by: ORG-019 (2026-05-19, the operator via T-0454): the `blocked/` state is retired and `tickets/` now holds only `inbox/`, `active/` and `done/`; blocks are the `not_before` and `depends_on` fields. Read the watched set above as `tickets/{inbox,active,done}/`.
+
 Captures all transition sources uniformly:
 - PWA POSTs → `ticket.py` via shell-out → `git mv` → inotify fires
 - Cron (Specialist's `watch_runner.py`, Recovery's `ticket_grooming.py` + `spine_index_groom.py`, etc.) → `git pull` → file changes on disk → inotify fires

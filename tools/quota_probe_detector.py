@@ -144,8 +144,9 @@ def outcome_to_verdict(outcome: ProbeOutcome, persona: str):
 
 
 def spec_for(binding: Any):
-    """The DetectorSpec for one persona's probe. Claude-side repair routes to Consultant
-    (ORG-076 §4, TG 11361/11367) through the store's ``_route`` / ``resolve_route``."""
+    """The DetectorSpec for one persona's probe. Claude-side repair routes to Watchman@codex
+    (``repair_evidence.RECOVERY_CANDIDATE``; ORG-048 A1, T-5058) through the store's ``_route`` /
+    ``resolve_route``."""
     from tools import episode_store as es
     from tools import repair_evidence
     return es.DetectorSpec(
@@ -156,6 +157,7 @@ def spec_for(binding: Any):
         harness="claude",
         account=binding.account,
         candidates=(repair_evidence.RECOVERY_CANDIDATE,),
+        any_live_fallback=(repair_evidence.RECOVERY_CANDIDATE,),  # T-5998 B(i)
         redactor=repair_evidence.make_default_redactor(binding.account),
     )
 

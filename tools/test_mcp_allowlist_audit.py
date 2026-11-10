@@ -580,11 +580,11 @@ class ScanTests(AuditFixture):
     def test_probe_stdin_transfer_is_inside_deadline_and_kills_process_group(self):
         pid_file = self.root / "probe-pids"
         child = (
-            "import os,subprocess,sys,time;"
+            "import os,pathlib,subprocess,sys,time;"
             "grand=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],"
             "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);"
-            f"open({str(pid_file)!r},'w').write(f'{{os.getpid()}} {{grand.pid}}');"
-            "time.sleep(0.5)"
+            f"pathlib.Path({str(pid_file)!r}).write_text(f'{{os.getpid()}} {{grand.pid}}');"
+            "time.sleep(2)"
         )
 
         def cleanup() -> None:
@@ -599,13 +599,21 @@ class ScanTests(AuditFixture):
         self.addCleanup(cleanup)
         started = time.monotonic()
         result = audit.run_probe_command(
-            [sys.executable, "-c", child], seat="orchestrator", timeout_seconds=0.3,
+            [sys.executable, "-c", child], seat="orchestrator", timeout_seconds=1.0,
             input_text="not-a-secret:" + ("x" * (2 * 1024 * 1024)),
         )
         elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 0.55)
+        self.assertLess(elapsed, 1.25)
         self.assertEqual(result.findings[0].reason, "READER_TIMEOUT")
         self.assertNotIn("not-a-secret", result.to_json())
+        fixture_deadline = time.monotonic() + 0.25
+        while not pid_file.exists() and time.monotonic() < fixture_deadline:
+            time.sleep(0.01)
+        self.assertTrue(
+            pid_file.exists(),
+            f"probe PID fixture was not ready before its 1.0s deadline "
+            f"(elapsed={elapsed:.3f}s, result={result.to_json()})",
+        )
         pids = [int(raw) for raw in pid_file.read_text(encoding="utf-8").split()]
         deadline = time.monotonic() + 1
         while any(Path(f"/proc/{pid}").exists() for pid in pids) and time.monotonic() < deadline:
@@ -615,15 +623,19 @@ class ScanTests(AuditFixture):
     def test_cross_account_probe_uses_reviewed_stdin_and_exact_target_principal(self):
         authority = audit.load_authority(AUTHORITY)
         deadlines = audit._probe_deadlines(3)
-        seat = audit.Seat("specialist", "claude-research", "claude-code",
-                          Path("/home/claude-research"), Path("/home/claude-research/pantheon-config"))
+        # A target whose repo is not this checkout (T-5784): on specialist's own seat the
+        # specialist repo IS REPO, so the "probe never embeds the caller's repo" check misfired.
+        account = next(a for a in ("claude-research", "claude-fallback")
+                       if Path(f"/home/{a}/pantheon-config") != REPO)
+        seat = audit.Seat("specialist", account, "claude-code",
+                          Path(f"/home/{account}"), Path(f"/home/{account}/pantheon-config"))
         with mock.patch("tools.seat_exec.is_own_account", return_value=False):
             command, source = audit.build_probe_invocation(
                 seat, authority=authority, max_bytes=4096,
                 managed_root=Path("/etc/claude-code"), proc_root=Path("/proc"),
                 child_deadline=deadlines.child,
             )
-        self.assertEqual(command[:5], ["sudo", "-n", "-u", "claude-research", "/usr/bin/python3"])
+        self.assertEqual(command[:5], ["sudo", "-n", "-u", account, "/usr/bin/python3"])
         self.assertEqual(command[5:8], ["-I", "-c", audit.PROBE_BOOTSTRAP])
         self.assertEqual(len(command), 10)
         self.assertRegex(command[8], r"^[0-9]+(?:\.[0-9]+)?$")

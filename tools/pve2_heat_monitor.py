@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -89,6 +90,28 @@ def should_alert(problems: list[str], state: dict, now: float) -> bool:
     return False
 
 
+def save_state(path: Path, state: dict) -> None:
+    """Atomically persist alert state without risking truncation of the prior state."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=path.parent,
+                prefix=f".{path.name}.", delete=False) as handle:
+            temporary = handle.name
+            json.dump(state, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--state", type=Path, default=DEFAULT_STATE)
@@ -110,8 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         tailnet_self.note_reachable()
     alert = should_alert(problems, state, now)
-    a.state.parent.mkdir(parents=True, exist_ok=True)
-    a.state.write_text(json.dumps(state))
+    save_state(a.state, state)
     if not problems:
         r = facts["readings"]
         print(f"pve2_heat_monitor: OK cpu_package {r['cpu_package']:.1f}C, gpu {r['gpu']:.1f}C "

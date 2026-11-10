@@ -3,10 +3,10 @@
 # the most recent non-dry-run render. Read by
 # tools/persona_orientation/check_stale.py to detect drift.
 rulebook/directives.md:
-  byte_length: 64997
-  git_blob: 1dbcb37e00e444b3321274738d519b1f2142bb97
-  git_sha: fef18ac0885ece02cae91605ea147dca79a857db
-  sha256: a1a27493cd10e05844685eff9c1b32706d925ef9310b701c81f38c672725e618
+  byte_length: 72341
+  git_blob: 257f46a2b161a630a04ab9379b1ff0c4c5aff747
+  git_sha: ef6b35b307c6a2b82d1917db1d58bffcf2ca0a72
+  sha256: e5026c9c220db5d93916331a43a71ad869d3d3ee92ee5951b7999a663d983241
 rulebook/policies/autonomy.md:
   byte_length: 28390
   git_blob: fa13ae11c8b83cfb53cbb404876468752cc171e5
@@ -33,10 +33,10 @@ rulebook/policies/mcp-adoption.md:
   git_sha: d37c293ff229fe8b57192487711f5550e5a3e859
   sha256: 10a1a9ea37c3b9aa65df2c8763907534724e05e71e3ed138ef4de43b7e9644d7
 rulebook/policies/trust-posture.md:
-  byte_length: 26575
-  git_blob: 7ea7de923d44f69f1a6f2469a9aea86ef19ff512
-  git_sha: 63202f15abebd4a485cdee195852f3ae21e27705
-  sha256: 7dcb20b5788e000cd42cee0c8e19caee5ea167b44906b9ae4eb83b46b8b528d8
+  byte_length: 26953
+  git_blob: b00b2a65000ca2b0c3cc8c8353b18af108673790
+  git_sha: 79f44a8a37b16df8885845df45fe05380d474758
+  sha256: 10a76b914c72e75227d76a5eb286351880b52c2eae8eb4436157128e0085b8af
 rulebook/principles.md:
   byte_length: 8565
   git_blob: 860ff538dc237bd81206a50efa027898a4c57b42
@@ -78,10 +78,10 @@ sop/standard/handling-low-level-errors.md:
   git_sha: 9c3dce69cc76f7285e8816cefa57d99f0aca6972
   sha256: 79f6845039b50a3dafa081a14020262b0e2f8125c165cbb28635f569107a04f0
 sop/standard/handoff-restart-runbook.md:
-  byte_length: 8676
-  git_blob: e8cce4fd09625000dfc03e059da3828cadcb303c
-  git_sha: a39c552f3d452f289d26cb3b68320e8e6fc100be
-  sha256: 920f57b35a3c9ae083eea1d7622616511c3a5c59439bc2f46f88275818e1399f
+  byte_length: 8796
+  git_blob: 5e7b138b2b518a26ce62caad12638c98f5212b36
+  git_sha: 4652a465316fec95f86229e3acceeb9b8d218213
+  sha256: 6b94c06ec76f5d25b63585b351beaf0486becc1f61d1a336ad10c9b6b2e2b111
 sop/standard/ho-absent-operator-keep-working.md:
   byte_length: 8044
   git_blob: 9983278910158b5269a422779895ff8e5ee8ddd3
@@ -93,35 +93,35 @@ sop/standard/how-to-message-the-org-user.md:
   git_sha: c23733d265caafac9871367ade9a309a7ac6658d
   sha256: 28fe7f39662f960617b5abf37e0537b074b900a9796437e9ac50a466622d026c
 sop/standard/orchestrator-standing-rules.md:
-  byte_length: 13294
-  git_blob: 15c3fa59b4dca555873313d71db6a25b9d5da2b4
-  git_sha: 9c3dce69cc76f7285e8816cefa57d99f0aca6972
-  sha256: 5e963fd02d9de6d0015c0885c48c9342e2c2497a8671bb6c82389f8736a4d6d8
+  byte_length: 13266
+  git_blob: f4a6e5a343845031f9c767bda4d084d200056a05
+  git_sha: ddeb11f6a6561e2b7e999611510aeb2de866f1aa
+  sha256: 6b8343b4b32849b5b8f5da734ce8d778bb2b3eed47ad4fd57ea26162459ee963
 sop/standard/pre-implementation-reviewer-discipline.md:
   byte_length: 12831
   git_blob: 71ed3beb80a3decabb1c5b30e31c7c552a7b73b5
   git_sha: 65d5b2dac7af47e3aa19dc6a977133720bb27c8c
   sha256: 5385e341a5115a4d63335e94d485c7af1c783e4c5bd6e5e9e85ee5147f4a0e1f
 sop/standard/research-dispatch-deliverable-standards.md:
-  byte_length: 15708
-  git_blob: ae3cd87837b815c3396fb11d5334d74b48d1ca2c
-  git_sha: 114cc9bb3fa73cc4bc684dfe59f5a4787b42559c
-  sha256: 6f047c1382eb9743b35bc8340d88d92d88b8af841aca3e7f47badeab4f57bb40
+  byte_length: 16946
+  git_blob: 231ff7e20ebfc0dc79a5dfc814734dd66826458f
+  git_sha: 95920e18658f3c3113d3867a3fb761a299860ddd
+  sha256: 6fafa3fb4db0c32611d5ad43ede9b63af9c56772fac73ab3d3091383c2f44592
 sop/standard/research-dispatch-filing.md:
   byte_length: 7633
   git_blob: 2f893f78781029977d4c6466123f11a6b58d64be
   git_sha: fbfd7976c4377866ae6a461fa09237eda7bce9b3
   sha256: 89b04cc62f2ab51da93a9c9f56ddc31736ee5865c0f2db5c55ebc3b0c84d1915
 sop/standard/retask-dispatch.md:
-  byte_length: 6567
-  git_blob: 51f835d348d6081cbc4ac00b68a4fba2976bc293
-  git_sha: 4f9e6f575abd1be0cece905005a27f79c8e5e7d3
-  sha256: 2b312dea3a99ea3ae77676b86ff7965001b69029846dbcd19f25ee6c08c5ebb0
+  byte_length: 8487
+  git_blob: 43aae49d0b253646f0b26f408132baf3b40b2f4e
+  git_sha: ddeb11f6a6561e2b7e999611510aeb2de866f1aa
+  sha256: ad654aee67ab9954336099a7875d576c52568ecd65d94809610c6fd9143ebfca
 sop/standard/reviewer-methodologies.md:
-  byte_length: 14588
-  git_blob: 8a2e4d513be3756fdefef81ce832d7125e26967e
-  git_sha: 19e2eff7472bf09e2d074db7bd663267a69defbe
-  sha256: 48e43dac75cbfc72b4634f2e33b01f2da650fa03ab808574ffb7a9e21d4af34d
+  byte_length: 15373
+  git_blob: 6ef3dd7fce4ff6ee1b65593521eb7df1e4f25990
+  git_sha: c9f4345c155f223fb4cfd61097afc54ee75c1686
+  sha256: cf09e36a17917663ecdc68eb4b4d08c02ab59838addf64dcd9f4c0d02ba9436a
 sop/standard/shaping-and-viability.md:
   byte_length: 6039
   git_blob: 4e4df6fe7f1e9c40d78ff385bb6e4fbd75ed509e
@@ -138,10 +138,10 @@ sop/standard/team-orchestrator-dispatch-checklist.md:
   git_sha: 1fe207328dacc72bdc6f1b5d0c4ae34a28b38634
   sha256: bd6a6ee9917c7df4763bb7fbd37a18b01f60cbafdaedc4aab2446ac4b58f5550
 sop/standard/testing-depth-and-scope.md:
-  byte_length: 34054
-  git_blob: 8ddbb29b10ccd854c0842e1e12fc5a2c1ffd270d
-  git_sha: 585bc0af43d46de5832dddcc170a31c204ba2009
-  sha256: 1790f2790af046c1c6b865ef07bffffc0ccc9924b33bae64c7ef67c07dd11a48
+  byte_length: 34053
+  git_blob: 69d02010b7437aeab0c27d03884113232a2a508c
+  git_sha: ddeb11f6a6561e2b7e999611510aeb2de866f1aa
+  sha256: ab9362135308571437bfb499a4ff84d1ed50cac2da8fd9dabeadeb9e9f9f0240
 sop/standard/ticket-flow.md:
   byte_length: 16917
   git_blob: bdba2d230b0c53ddf17f1c10ce0202be17a0a0da

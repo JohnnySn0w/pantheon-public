@@ -9,6 +9,8 @@ transition map, and the canonical-bytes / receipt-digest primitives. It owns no
 policy judgement, mutation path, runtime, or live authority; the deny-by-default
 evaluator that consumes these types lives in ``memory_policy_evaluator``.
 
+Normative schema authority: sop/standard/memory-envelope-spec.md (ORG-058 §4-§6)
+
 Design posture (T-2447-derived, all structural rather than "remember not to"):
 
 * Four dimensions never collapse (INV-1): integrity/trust labels are OPEN

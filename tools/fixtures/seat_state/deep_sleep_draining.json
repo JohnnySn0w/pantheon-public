@@ -1,0 +1,11 @@
+{
+  "schema": "pantheon-seat-state/v1",
+  "state": "deep-sleep",
+  "phase": "draining",
+  "reason": "ORG-106 draining toward sleep (fixture)",
+  "owner": "operator",
+  "indefinite": true,
+  "expires": null,
+  "set_ts": "2026-11-01T00:00:00Z",
+  "phase_ts": "2026-11-01T00:10:00Z"
+}

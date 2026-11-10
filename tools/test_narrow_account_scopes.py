@@ -75,6 +75,15 @@ class TestMailStalenessCandidatesStayWiderThanThePersonaMap(unittest.TestCase):
 
         self.assertIn("specialist-a2a", msm.CANDIDATE_INBOXES)
 
+    def test_every_registry_persona_is_a_candidate(self) -> None:
+        """T-6165: the list was hand-kept and missed watchman. Every registry persona
+        must be a candidate, on top of the non-persona boxes (the union never narrows)."""
+        from tools import mail_staleness_monitor as msm
+        from tools.agent_role_map import account_persona_map
+
+        missing = set(account_persona_map().values()) - set(msm._candidate_inboxes())
+        self.assertFalse(missing, f"registry personas not probed by the fallback: {missing}")
+
     def test_it_is_not_merely_the_persona_set(self) -> None:
         from tools import mail_staleness_monitor as msm
         from tools.agent_role_map import account_persona_map

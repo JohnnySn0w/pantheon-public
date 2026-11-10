@@ -1,0 +1,15 @@
+[Unit]
+Description=Pantheon resource-sampler coverage guard — alert when evidence stops (T-6211)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# `sg pantheon-mailbox -c` is REQUIRED (T-1015): user systemd does not
+# inherit the supplementary group needed to deliver the specific Recovery alert.
+ExecStart=/usr/bin/sg pantheon-mailbox -c "/usr/bin/python3 %h/pantheon-config/tools/resource_sampler_coverage_monitor.py --check"
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=1min

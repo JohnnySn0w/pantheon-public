@@ -35,7 +35,7 @@ The operator can see, with numbers, (a) whether the principles and directives pr
    - **H2 (the fleet decides like the operator):** in a weekly blind sample, the operator agrees with at least 80% of calls. *Falsified if* the lower bound of the 90% Wilson interval stays below 70% for 4 consecutive weeks.
    - **H3 (autonomy grows without quality loss):** operator-touches per shipped arc trend down over 8 weeks while change-failure rate (H4) does not rise. *Falsified if* touches are flat or rising, or if falling touches coincide with rising failure (autonomy bought with quality).
    - **H4 (capability):** for multi-PR arcs (3 or more merged PRs), change-failure rate (reverts, hotfix PRs, rollbacks per merged PR) stays at or below that of single-PR work, and lead time scales sub-linearly with arc size. *Falsified if* failure rate climbs with arc size. That would mean the fleet is good at small changes but not at larger projects.
-2. **Structured DECISIONS line.** The one format change, enforced, not hand-counted. A DECISIONS item is one line: `DECISION: <call> | serves: <intent or "goal-neutral maintenance"> | via: <P/D/ORG ids> | ref: <T-NNNN or repo#PR>`. Prose explanation may follow on indented lines. ticket.py annotate/resolve and the PR-body check WARN on DECISIONS sections with no parseable line; later they REFUSE (WARN-first, same rollout pattern as ORG-021). The reviewer persona's existing DECISIONS pre-flight checks the format.
+2. **Structured DECISIONS line.** The one format change, enforced, not hand-counted. A DECISIONS item is one line: `DECISION: <call> | serves: <intent or "goal-neutral maintenance"> | via: <P/D/ORG/ADR/T ids, each optionally followed by a section qualifier, e.g. ORG-052§3 or ORG-052 §3/§5; or a ruling cite operator:tg:<message number> or ho:mail:<mailbox message id>> | ref: <one or more of T-NNNN, repo#PR, or a 7-40 hex commit sha, comma-separated>`. A qualifier is kept as data and the base id is what is counted; a ruling cite counts as the class "ruling" (amended 2026-11-09, see §Amendment 2026-11-09). Prose explanation may follow on indented lines. ticket.py annotate/resolve and the PR-body check WARN on DECISIONS sections with no parseable line; later they REFUSE (WARN-first, same rollout pattern as ORG-021). The reviewer persona's existing DECISIONS pre-flight checks the format.
 3. **Collectors read exhaust only.** A daily timer runs read-only collectors that write one JSONL feed under `/var/lib/pantheon/quant/`:
    - **calls:** structured DECISIONS lines from ticket transition logs, PR bodies (GitHub REST) and ledger `justifies_via`;
    - **outcomes per call:** *reversed* when a later commit reverts the ref'd PR, the ticket reopens, a REBOUND cites it, a ledger entry or ADR supersedes it, or a rollback names it; *overridden* when the operator's Telegram ruling (recorded on the ticket as `the operator TG <id>`) contradicts it; otherwise *held* at 14 days;
@@ -81,3 +81,13 @@ The operator can see, with numbers, (a) whether the principles and directives pr
 - After 8 weekly digests: are the hypotheses still the right questions, and is n sufficient?
 - If H2's sample is graded fewer than 3 weeks in 4 (the one human step has failed; redesign it or drop it).
 - If DECISIONS-format WARNs stay high after a month (the format is wrong, not the agents).
+
+## Amendment 2026-11-09 — DECISIONS-line field grammar (T-4819)
+
+Ratified by the operator via Telegram 13201 (2026-11-09). Decision item 2's field descriptions are widened, with no other decision changed:
+
+1. `via` ids may be P/D/ORG/ADR/T ids, each optionally followed by a section qualifier (e.g. `ORG-052§3`, `ORG-052 §3/§5`). The qualifier is kept as data; the base id is counted.
+2. `via` also accepts a ruling cite, `operator:tg:<message number>` or `ho:mail:<mailbox message id>`, counted as the class "ruling".
+3. `ref` accepts one or more of `T-NNNN`, `repo#PR`, or a 7-40 hex commit sha, comma-separated.
+
+Why: in the 2026-10-09..11-09 WARN month 26% of structured lines were malformed, flat, and about two-thirds of those were legitimate citations the literal grammar could not express. Enforcing the literal grammar would push seats to drop citations, a P4 traceability loss. The WARN-to-REFUSE sentence is unchanged: the flip happens only when the re-measured malformed rate is under 10% (T-6300) and this amendment is ratified (now true). Draft: mason on T-4819 (2026-11-09).

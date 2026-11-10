@@ -6,7 +6,7 @@ wrapper (and every other invocation surface) checks -- NOT option (i), a
 ``After=``/``Requires=``.
 
 Why (i) is rejected, with a real citation rather than a re-derivation:
-adr/ORG-080-germination-engine.md L343-347 (``[Documentary -- informs
+adr/ORG-080-germination-engine.md (relocated to notes/2026-11-02-org-080-run-state-relocated.md §Reboot recovery and postboot marker) (``[Documentary -- informs
 C3]``) already ran this exact mechanism during the ADR's own v8->v9
 review fold and found it structurally broken -- a system-manager
 ``pantheon-germinate.target`` cannot order user-manager component units

@@ -640,11 +640,12 @@ class TestLinearScannerMatchesOldRegexT4392(unittest.TestCase):
 
 _LINEAR_BOUND_S = 1.0
 _HARD_STOP_S = 10
-# The doubling-ratio test runs 3 repeats at two sizes (~0.5s CPU in all) under ONE
+# The doubling-ratio test runs 9 repeats at two sizes (T-4587; 3x the old 3) under ONE
 # hard stop; on a heavily contended CI runner that is several seconds of wall clock,
-# so it gets more headroom. The stop only turns a hang into a failure, and the CPU-time
+# so it gets more headroom (T-5838: 30s tripped on 2 of 12 shapes with 9 repeats at load
+# ~15 plus 2 CPU burners). The stop only turns a hang into a failure, and the CPU-time
 # ratio and bound still decide pass/fail.
-_RATIO_HARD_STOP_S = 30
+_RATIO_HARD_STOP_S = 90
 
 
 @contextlib.contextmanager
@@ -724,7 +725,9 @@ class TestCommandPositionScanIsLinearT4392(unittest.TestCase):
                     ratio, best_2n = _doubling_ratio(
                         lambda: guard.command_targets_mcp_list(cmd_n),
                         lambda: guard.command_targets_mcp_list(cmd_2n),
-                        repeats=3,
+                        # T-4587: the default 9, not 3: a median of 3 flaked to 3.27 under a
+                        # soak's load and 3.20 in CI against 3.0 (as #1215 saw in
+                        # test_background_pipe_gate.py, which moved to 9 for the same reason).
                     )
                 self.assertLess(ratio, 3.0, f"{unit!r}: t(2N)/t(N)={ratio:.2f}")
                 self.assertLess(best_2n, _LINEAR_BOUND_S)

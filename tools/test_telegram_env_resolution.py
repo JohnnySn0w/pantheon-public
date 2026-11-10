@@ -32,7 +32,6 @@ _PIN_RE = re.compile(r"^\s*Environment\s*=.*\bPANTHEON_TELEGRAM_ENV\s*=", re.MUL
 RESOLVING_MODULES = (
     "tools.ticket_lint",
     "tools.ticket_grooming",
-    "tools.artifact_gc",
     "tools.mirror_drift_sweep",
     "tools.watch_digest",
 )

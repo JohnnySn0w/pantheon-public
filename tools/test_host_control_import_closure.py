@@ -172,6 +172,9 @@ DYNAMIC_IMPORT_NAMES = frozenset(
 )
 DYNAMIC_EVAL_BUILTINS = frozenset({"exec", "eval", "compile"})
 GERMINATE_COMPONENTS = "tools/germinate/engine/components.py"
+#: module-name prefixes the component loader gives a loaded handlers module (T-5477) or a pinned
+#: handlers/helper module (T-5506); none may exist after plan() (import_handlers=False).
+GERMINATE_LOADED_PREFIXES = ("_germinate_handlers_", "_germinate_pinned_")
 #: (file, enclosing function or "<module>", kind, name) -> count. Exactly the
 #: lazy loader (its module-level ``from importlib import import_module`` and the
 #: single ``import_module(module)`` call inside ``__getattr__``) plus the named
@@ -182,15 +185,22 @@ SANCTIONED_DYNAMIC_IMPORTS = {
     (LAZY_LOADER_FILE, "__getattr__", "name", "import_module"): 1,
     # T-5533 (finding 3 widened the scan to every closure file): the germinate
     # component loader runs a digest-pinned handlers module from the verified
-    # bytes (T-5477). The broker reaches the file only through
-    # registry.validate._merged_op_registry, which calls discover_doc with
-    # import_handlers=False, so _import never runs there; the runtime probe below
-    # proves no _germinate_handlers_* module loads when plan() executes.
-    (GERMINATE_COMPONENTS, "<module>", "module", "importlib"): 1,
-    (GERMINATE_COMPONENTS, "_import", "name", "spec_from_file_location"): 1,
-    (GERMINATE_COMPONENTS, "_import", "name", "module_from_spec"): 1,
-    (GERMINATE_COMPONENTS, "_import", "builtin", "exec"): 1,
-    (GERMINATE_COMPONENTS, "_import", "builtin", "compile"): 1,
+    # bytes (T-5477). T-5506 extends that to the pinned helpers: every entry below
+    # executes only digest-verified in-memory bytes for a pinned component (a scoped
+    # __import__ resolves component-local imports to them, never to disk or a .pyc).
+    # The broker reaches the file only through registry.validate._merged_op_registry,
+    # which calls discover_doc with import_handlers=False, so none of it runs there;
+    # the runtime probe below proves no _germinate_handlers_* or _germinate_pinned_*
+    # module loads when plan() executes.
+    (GERMINATE_COMPONENTS, "<module>", "module", "builtins"): 1,
+    (GERMINATE_COMPONENTS, "__init__", "subscript", "__import__"): 1,
+    (GERMINATE_COMPONENTS, "_import", "name", "exec_module"): 1,
+    (GERMINATE_COMPONENTS, "exec_module", "builtin", "compile"): 1,
+    (GERMINATE_COMPONENTS, "exec_module", "builtin", "exec"): 1,
+    (GERMINATE_COMPONENTS, "exec_module", "subscript", "__builtins__"): 1,
+    (GERMINATE_COMPONENTS, "exec_module", "sys.modules", "modules"): 2,
+    (GERMINATE_COMPONENTS, "helper", "name", "exec_module"): 1,
+    (GERMINATE_COMPONENTS, "import_", "name", "__import__"): 1,
 }
 
 #: T-5572: the receipt-validator closure moved verbatim out of runtime_controller.
@@ -707,7 +717,7 @@ class ServiceImportClosureTest(unittest.TestCase):
         self.assertEqual(
             outside(loaded_by_plan, BROKER_ALLOWED, BROKER_ALLOWED_PREFIXES), [], RENAME_OR_SANCTION
         )
-        self.assertEqual([name for name in modules if name.startswith("_germinate_handlers_")], [])
+        self.assertEqual([name for name in (*modules, *loaded_by_plan) if name.startswith(GERMINATE_LOADED_PREFIXES)], [])
 
 
 #: Runs inside the probe interpreter after the broker entry is imported.

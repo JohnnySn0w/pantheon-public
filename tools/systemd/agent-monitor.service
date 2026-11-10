@@ -36,6 +36,11 @@ OnFailure=pantheon-unit-failure-alert@%n.service
 Description=Claude Code Agent Monitor dashboard
 After=network-online.target
 Wants=network-online.target
+# T-6352: ~52 min of continuous failure (30 starts/h under the [Service] backoff) ends in
+# ONE latched failed state (OnFailure alert where wired; failed_unit_reconcile sees it
+# regardless) instead of an unbounded loop. Recover: reset-failed + start.
+StartLimitIntervalSec=3600
+StartLimitBurst=30
 
 [Service]
 Type=simple
@@ -45,6 +50,10 @@ Environment=NODE_ENV=production
 ExecStart=/usr/bin/node server/index.js
 Restart=on-failure
 RestartSec=5
+# T-6352: exponential restart backoff (5,9,18,34,64,120s). NRestarts is cumulative
+# (resets only on a manual start/restart), so 120s is also the steady per-crash delay.
+RestartSteps=5
+RestartMaxDelaySec=120
 
 # T-2346 item 2: declare a ceiling so a future kill is DELIBERATE AND
 # ATTRIBUTABLE rather than global-OOM collateral. There is no leak to fix (anon

@@ -473,10 +473,10 @@ class TestDispatchPoke(unittest.TestCase):
             poke.assert_not_called()  # SUPPRESSED — the token-saving behavior
             self.assertTrue(am.read_poke_state(sp)["escalated"])
             alert.assert_called_once()  # escalates to Recovery instead of re-poking
-            # T-3072: escalation fire is keyed on VOCAB ("stuck-poke"), not the
-            # triggering predicate ("p1c") — each escalation class tracks drift
-            # independently.
-            record_fire.assert_called_once_with("orchestrator", "stuck-poke")
+            # T-3072/T-6179: escalation fire is keyed on the ground-truthed
+            # VOCAB, not the triggering predicate. An uncapturable pane is
+            # unknown, never evidence for the old stuck/restart claim.
+            record_fire.assert_called_once_with("orchestrator", "ineffective-poke-unknown")
 
     def test_bounded_cyber_blocked_suppresses_even_when_jsonl_advanced(self) -> None:
         """The pre-poke gate: a cyber-blocked session emits refusals that ADVANCE
@@ -2249,6 +2249,73 @@ class TestMain(unittest.TestCase):
         for k in ("poke", "p1a", "p1b", "p1d"):
             m[k].assert_not_called()
 
+    # ---- T-5868 Phase A: HALTED is an incident, never an authorised pause ----
+    def _halted_hold(self):
+        return self._hold(source="seat-state", state="halted", intake_blocked=True,
+                          repair_vetoed=True, alertable=True, owner="operator", reason="fleet bringdown",
+                          rollback_cmd="python3 -m tools.germinate rollback --run r1")
+
+    def test_halted_alerts_with_rollback_cmd_and_holds_intake_T5868(self) -> None:
+        with patch.object(am, "_route_failure_alert") as alert:
+            rc, m = self._main_held(record=self._halted_hold())
+        self.assertEqual(rc, 0)
+        alert.assert_called_once()
+        self.assertIn("python3 -m tools.germinate rollback --run r1", alert.call_args[0][1])
+        m["p1a"].assert_not_called()   # intake held: queue pokes skipped
+        m["p1b"].assert_not_called()
+        m["p1d"].assert_called_once()  # liveness predicates still run
+
+    def test_halted_plus_maintenance_or_oom_still_alerts_T5868_reviewA(self) -> None:
+        maint = self._hold(source="maintenance", intake_blocked=True, remediation_vetoed=True)
+        oom = self._hold(source="oom-hold", intake_blocked=True, launch_blocked=True)
+        for kw in ({"maint": maint}, {"oom": oom}):
+            with self.subTest(kw), patch.object(am, "_route_failure_alert") as alert:
+                am._halted_state_path("orchestrator").unlink(missing_ok=True)
+                rc, m = self._main_held(record=self._halted_hold(), **kw)
+            self.assertEqual(rc, 0)
+            alert.assert_called_once()
+            self.assertIn("python3 -m tools.germinate rollback --run r1", alert.call_args[0][1])
+            for k in ("p1a", "p1b", "p1d", "poke"):
+                m[k].assert_not_called()  # the stand-down early return is unchanged
+
+    def test_maintenance_alone_is_still_silent_T5868_reviewA(self) -> None:
+        maint = self._hold(source="maintenance", intake_blocked=True, remediation_vetoed=True)
+        with patch.object(am, "_route_failure_alert") as alert:
+            rc, m = self._main_held(maint=maint)
+        self.assertEqual(rc, 0)
+        alert.assert_not_called()
+
+    def test_halted_state_file_written_atomically_T5868_reviewB(self) -> None:
+        with patch.object(am, "_route_failure_alert"):
+            self._main_held(record=self._halted_hold(), p1d=False)
+        d = am._halted_state_path("orchestrator").parent
+        self.assertEqual([p.name for p in d.glob("*.tmp*")], [])
+        self.assertIn("ts", json.loads(am._halted_state_path("orchestrator").read_text()))
+
+    def test_halted_re_alerts_each_cadence_not_one_shot_C3_T5868(self) -> None:
+        with patch.object(am, "_route_failure_alert") as alert:
+            self._main_held(record=self._halted_hold())
+            self._main_held(record=self._halted_hold())
+            self.assertEqual(alert.call_count, 1, "inside the cadence: no re-alert")
+            path = am._halted_state_path("orchestrator")
+            path.write_text(json.dumps({"ts": int(time.time()) - am.HALTED_REALERT_SECONDS - 5}))
+            self._main_held(record=self._halted_hold())
+            self.assertEqual(alert.call_count, 2, "after the cadence: alerts again")
+
+    def test_halted_alert_does_not_gate_other_predicates_T5868(self) -> None:
+        with patch.object(am, "_route_failure_alert"):
+            self._main_held(record=self._halted_hold(), p1d=False)
+        self.assertTrue(am._halted_state_path("orchestrator").exists())
+        self.assertFalse(am._state_path_for_agent("orchestrator").exists())
+
+    def test_paused_and_sleep_never_alert_halted_T5868(self) -> None:
+        for c in (self._hold(source="seat-state", state="paused-intake", intake_blocked=True),
+                  self._hold(source="seat-state", state="deep-sleep", intake_blocked=True,
+                             launch_blocked=True, remediation_vetoed=True)):
+            with patch.object(am, "_route_failure_alert") as alert:
+                self._main_held(record=c)
+            alert.assert_not_called()
+
     def test_paused_intake_skips_queue_pokes_but_keeps_liveness(self) -> None:
         # A paused seat is alive and must stay watched: P1.a/P1.b are not even
         # evaluated, but P1.d (rate-limit recovery) still runs and fires.
@@ -2684,6 +2751,99 @@ class TestCapPrePokeGate(unittest.TestCase):
         self.assertIn("spend-cap", str(alert.call_args))
         record_fire.assert_called_once_with("orchestrator", "spend-cap")  # T-3072 vocab key
 
+    def test_p1b_spend_hold_reports_and_pokes_healthy_codex_fallback(self):
+        """T-5758: a stale Claude cap must not make the available persona look down.
+
+        P1.b's upstream log verdict established that the controller-selected Codex
+        runtime is healthy and idle.  The cap remains a hold on Claude only; the
+        resulting poke must therefore target Codex, never the capped provider.
+        """
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(am, "_flush_stuck_poke", return_value=False), \
+             patch.object(am, "_pane_idle_probe", return_value=None), \
+             patch.object(am, "_session_cap_modal", return_value=None), \
+             patch.object(am, "_session_cap_state", return_value=("spend_limit", None)), \
+             patch.object(am, "_active_runtime_harness", return_value="codex"), \
+             patch.object(am, "_session_cyber_blocked", return_value=False), \
+             patch.object(am, "_poke_activity_marker", side_effect=(5000, 6000)), \
+             patch.object(am, "_gate_text_poke", return_value="codex"), \
+             patch.object(am, "_poke_suppressed_by_usage", return_value=False), \
+             patch.object(am, "_route_failure_alert") as alert, \
+             patch.object(am, "_record_fire"), \
+             patch.object(am, "send_poke", return_value=True) as poke:
+            state = Path(tmp) / "s.json"
+            rc = am._dispatch_poke(
+                self._cfg(), "orchestrator", "p1b", "P", state,
+                bounded_enabled=True, max_ineffective=1,
+            )
+            # A later successful fallback turn advances its own activity marker.
+            # The provider-hold advisory stays one-shot while P1.b remains free
+            # to nudge Codex again.
+            rc_again = am._dispatch_poke(
+                self._cfg(), "orchestrator", "p1b", "P", state,
+                bounded_enabled=True, max_ineffective=1,
+            )
+            state_data = json.loads(state.read_text())
+        self.assertEqual(rc, 0)
+        self.assertEqual(rc_again, 0)
+        self.assertEqual(poke.call_count, 2)
+        poke.assert_called_with(self._cfg(), "P", harness="codex")
+        alert.assert_called_once()
+        msg = alert.call_args.args[1]
+        self.assertIn("Claude provider", msg)
+        self.assertIn("healthy Codex fallback", msg)
+        self.assertIn("available", msg.lower())
+        self.assertNotIn("orchestrator is SPEND-CAPPED", msg)
+        self.assertNotIn("every turn errors", msg)
+        self.assertEqual(
+            state_data["provider_hold"],
+            "claude-code:spend_limit->codex",
+        )
+
+    def test_p1b_fallback_effectiveness_uses_the_codex_log_marker(self):
+        reading = am.harness_idle.IdleReading(
+            am.harness_idle.Verdict.IDLE,
+            harness="codex",
+            last_event_ts=1234.9,
+            quiet_s=900,
+        )
+        with patch.object(am, "p1b_idle_reading", return_value=reading), \
+             patch.object(
+                 am, "latest_jsonl_activity",
+                 side_effect=AssertionError("must not judge a Codex poke by Claude JSONL"),
+             ):
+            marker = am._poke_activity_marker(
+                self._cfg(), "orchestrator", "p1b", active_harness="codex"
+            )
+        self.assertEqual(marker, 1234)
+
+    def test_p1b_spend_hold_never_sends_if_runtime_changes_back_to_claude(self):
+        """T-5758 reviewer adversarial: close the harness-identity TOCTOU.
+
+        The cap branch first sees Codex, but the final pane gate re-resolves the
+        runtime.  If it now reports Claude, no text may reach the capped runtime.
+        """
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(am, "_flush_stuck_poke", return_value=False), \
+             patch.object(am, "_pane_idle_probe", return_value=None), \
+             patch.object(am, "_session_cap_modal", return_value=None), \
+             patch.object(am, "_session_cap_state", return_value=("spend_limit", None)), \
+             patch.object(am, "_active_runtime_harness", return_value="codex"), \
+             patch.object(am, "_session_cyber_blocked", return_value=False), \
+             patch.object(am, "_poke_activity_marker", return_value=5000), \
+             patch.object(am, "_gate_text_poke", return_value="claude-code"), \
+             patch.object(am, "_poke_suppressed_by_usage", return_value=False), \
+             patch.object(am, "_route_failure_alert"), \
+             patch.object(am, "_record_fire") as fire, \
+             patch.object(am, "send_poke", return_value=True) as poke:
+            rc = am._dispatch_poke(
+                self._cfg(), "orchestrator", "p1b", "P", Path(tmp) / "s.json",
+                bounded_enabled=True, max_ineffective=1,
+            )
+        self.assertEqual(rc, 0)
+        poke.assert_not_called()
+        fire.assert_called_with("orchestrator", "p1b", deferred=True)
+
     def test_no_cap_falls_through_to_cyber_gate(self):
         # The gate must be a pass-through when healthy — the cyber check still runs.
         with tempfile.TemporaryDirectory() as tmp:
@@ -3093,8 +3253,12 @@ class ProductiveLivenessShipDarkT2387(unittest.TestCase):
         import re
         src = Path(am.__file__).read_text(encoding="utf-8")
         body = src.split("def liveness_jsonl_mtime", 1)[1].split("\n\n\n", 1)[1]
-        calls = re.findall(r"^\s*(?:cur_mtime|pre_poke_jsonl_mtime)\s*=\s*latest_jsonl_activity\(",
-                           body, re.M)
+        calls = re.findall(
+            r"^\s*(?:(?:cur_mtime|pre_poke_jsonl_mtime)\s*=\s*|return\s+)"
+            r"latest_jsonl_activity\(",
+            body,
+            re.M,
+        )
         # T-5367: the turn-counting signal is now latest_jsonl_activity (newest
         # timestamped entry, still counting error turns); no bare mtime call is left.
         self.assertEqual(re.findall(r"\blatest_jsonl_mtime\(", body), [],
@@ -4022,6 +4186,7 @@ class FleetUsageGateT4510(unittest.TestCase):
         patcher = patch.dict(os.environ, {
             "PANTHEON_FLEET_USAGE_DIR": str(self.fleet),
             "PANTHEON_STATE_DIR": str(self.tmp / "state"),
+            "PANTHEON_USAGE_GATE_SCHEDULE_ENABLED": "0",
         })
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -4029,11 +4194,15 @@ class FleetUsageGateT4510(unittest.TestCase):
             am.AGENT_CONFIG["orchestrator"], {"active_runtime_harness": "claude-code"})
         runtime_patcher.start()
         self.addCleanup(runtime_patcher.stop)
+        mail_patcher = patch.object(am, "_send_usage_trip_mail", return_value=None)
+        mail_patcher.start()
+        self.addCleanup(mail_patcher.stop)
 
     def _cfg(self) -> dict:
         return {"tmux_target_pane": "x:0", "sudo_user": "claude",
                 "jsonl_dir": Path("/x"), "pantheon_config_path": Path("/x"),
-                "active_runtime_harness": "claude-code"}
+                "active_runtime_harness": "claude-code",
+                "codex_subscription_account": "codex"}
 
     def _reading(self, pct, *, seat="orchestrator", resets_in=3 * 86400, window="seven_day"):
         now = time.time()
@@ -4075,6 +4244,88 @@ class FleetUsageGateT4510(unittest.TestCase):
                 bounded_enabled=False, max_ineffective=1)
         self.assertEqual(rc, 0)
         poke.assert_called_once()
+
+    def test_codex_fallback_is_suppressed_by_canonical_consultant_usage_record(self) -> None:
+        now = time.time()
+        quota = self.fleet / "turns" / "consultant" / "quota.json"
+        quota.parent.mkdir(parents=True)
+        quota.write_text(json.dumps({
+            "schema": "pantheon-fleet-usage/v1", "harness": "codex",
+            "ts": now - 5, "seat": "consultant",
+            "seven_day": {"used_percentage": 99, "resets_at": now + 3 * 86400},
+            "five_hour": None,
+        }), encoding="utf-8")
+        cfg = self._cfg() | {"active_runtime_harness": "codex"}
+        with patch.object(am, "_flush_stuck_poke", return_value=False), \
+             patch.object(am, "_pane_idle_probe", return_value=None), \
+             patch.object(am, "_session_cap_modal", return_value=None), \
+             patch.object(am, "_session_cap_state", return_value=None), \
+             patch.object(am, "_session_cyber_blocked", return_value=False), \
+             patch.object(am, "latest_jsonl_mtime", return_value=5000), \
+             patch.object(am, "_record_fire"), \
+             patch.object(am, "send_poke", return_value=True) as poke:
+            rc = am._dispatch_poke(
+                cfg, "orchestrator", "p1a", "PROMPT", self.tmp / "codex-own.json",
+                bounded_enabled=False, max_ineffective=1)
+        self.assertEqual(rc, am.USAGE_SUPPRESSED)
+        poke.assert_not_called()
+
+    def test_codex_quota_lookup_uses_real_appserver_seat_mapping(self) -> None:
+        """The exporter publishes app-server seats, never activity-monitor personas."""
+        for account, expected in (("codex", "consultant"), ("codex-fallback", "watchman")):
+            decision = am.fleet_usage_gate.GateDecision(False, "below threshold")
+            cfg = self._cfg() | {
+                "active_runtime_harness": "codex",
+                "codex_subscription_account": account,
+            }
+            with self.subTest(account=account), \
+                 patch.object(am.fleet_usage_gate, "evaluate", return_value=decision) as evaluate:
+                self.assertFalse(am._poke_suppressed_by_usage("orchestrator", "p1a", cfg=cfg))
+            self.assertEqual(evaluate.call_args.kwargs["harness"], "codex")
+            self.assertEqual(evaluate.call_args.kwargs["seat"], expected)
+
+    def test_codex_account_mapping_fault_fails_open(self) -> None:
+        cfg = self._cfg() | {"active_runtime_harness": "codex"}
+        with patch.object(
+            am._appserver_seats, "appserver_seat_for_account",
+            side_effect=RuntimeError("mapping unavailable"),
+        ), patch.object(am.fleet_usage_gate, "evaluate") as evaluate:
+            self.assertFalse(am._poke_suppressed_by_usage("orchestrator", "p1a", cfg=cfg))
+        evaluate.assert_not_called()
+
+    def test_trip_mails_orchestrator_and_affected_seat_once_per_band(self) -> None:
+        decision = am.fleet_usage_gate.GateDecision(
+            True, "codex weekly usage 60% >= 50% (pre-midweek)",
+            "codex:seven_day:123:pre-midweek",
+        )
+        with patch.object(am, "_send_usage_trip_mail") as send:
+            am._notify_usage_trip("artisan", decision)
+            am._notify_usage_trip("artisan", decision)
+        self.assertEqual([call.args[:2] for call in send.call_args_list],
+                         [("artisan", "orchestrator"), ("artisan", "artisan")])
+        self.assertTrue(all("one ticket or enter a hold" in call.args[3]
+                            for call in send.call_args_list))
+
+    def test_trip_mail_failure_is_advisory(self) -> None:
+        decision = am.fleet_usage_gate.GateDecision(True, "claude weekend hold", "mail-fail")
+        with patch.object(am, "_send_usage_trip_mail", side_effect=RuntimeError("hub down")):
+            am._notify_usage_trip("artisan", decision)  # does not raise
+
+    def test_trip_mail_partial_failure_retries_only_failed_recipient(self) -> None:
+        decision = am.fleet_usage_gate.GateDecision(
+            True, "codex weekend hold", "codex:seven_day:456:weekend-hold")
+        attempts = []
+
+        def send(sender, recipient, _subject, _body):
+            self.assertEqual(sender, "artisan")
+            attempts.append(recipient)
+            if recipient == "artisan" and attempts.count("artisan") == 1:
+                raise RuntimeError("one delivery fault")
+
+        with patch.object(am, "_send_usage_trip_mail", side_effect=send):
+            am._notify_usage_trip("artisan", decision)
+            am._notify_usage_trip("artisan", decision)
+        self.assertEqual(attempts, ["orchestrator", "artisan", "artisan"])
 
     def test_runtime_lookup_uses_temp_record_and_fails_to_claude_default(self) -> None:
         state = self.tmp / "active-runtime.json"
@@ -4221,6 +4472,69 @@ class FleetUsageGateT4510(unittest.TestCase):
                               bounded_enabled=True, max_ineffective=1)
         esc.assert_called_once()
         poke.assert_not_called()
+
+    def test_ineffective_poke_idle_pane_is_not_labeled_stuck_or_restartable(self) -> None:
+        self._reading(99)
+        sp = self.tmp / "poke_state.json"
+        am.write_poke_state(sp, "artisan", "p1a", pre_poke_jsonl_mtime=5000,
+                            consecutive_ineffective=0)
+        with patch.object(am, "_flush_stuck_poke", return_value=False), \
+             patch.object(am, "_pane_idle_probe", return_value=True), \
+             patch.object(am, "_session_cap_modal", return_value=None), \
+             patch.object(am, "_session_cap_state", return_value=None), \
+             patch.object(am, "_session_cyber_blocked", return_value=False), \
+             patch.object(am, "latest_jsonl_mtime", return_value=5000), \
+             patch.object(am, "_record_fire"), \
+             patch.object(am, "_escalate_stuck") as esc, \
+             patch.object(am, "send_poke", return_value=True) as poke:
+            am._dispatch_poke(self._cfg(), "artisan", "p1a", "PROMPT", sp,
+                              bounded_enabled=True, max_ineffective=1)
+        esc.assert_called_once()
+        self.assertEqual(esc.call_args.kwargs["vocab"], "ineffective-poke-idle")
+        msg = esc.call_args.kwargs["msg"]
+        self.assertIn("confirmed IDLE", msg)
+        self.assertNotIn("STUCK", msg)
+        self.assertNotIn("restart", msg.lower())
+        poke.assert_not_called()
+
+    def test_ineffective_poke_that_is_now_busy_defers_without_escalation(self) -> None:
+        self._reading(99)
+        sp = self.tmp / "poke_state.json"
+        am.write_poke_state(sp, "artisan", "p1a", pre_poke_jsonl_mtime=5000,
+                            consecutive_ineffective=0)
+        with patch.object(am, "_flush_stuck_poke", return_value=False), \
+             patch.object(am, "_pane_idle_probe", side_effect=[True, False]), \
+             patch.object(am, "_session_cap_modal", return_value=None), \
+             patch.object(am, "_session_cap_state", return_value=None), \
+             patch.object(am, "_session_cyber_blocked", return_value=False), \
+             patch.object(am, "latest_jsonl_mtime", return_value=5000), \
+             patch.object(am, "_record_fire"), \
+             patch.object(am, "_escalate_stuck") as esc, \
+             patch.object(am, "send_poke", return_value=True) as poke:
+            am._dispatch_poke(self._cfg(), "artisan", "p1a", "PROMPT", sp,
+                              bounded_enabled=True, max_ineffective=1)
+        esc.assert_not_called()
+        poke.assert_not_called()
+
+    def test_ineffective_poke_unknown_pane_escalates_without_stuck_claim(self) -> None:
+        self._reading(99)
+        sp = self.tmp / "poke_state.json"
+        am.write_poke_state(sp, "artisan", "p1a", pre_poke_jsonl_mtime=5000,
+                            consecutive_ineffective=0)
+        with patch.object(am, "_flush_stuck_poke", return_value=False), \
+             patch.object(am, "_pane_idle_probe", return_value=None), \
+             patch.object(am, "_session_cap_modal", return_value=None), \
+             patch.object(am, "_session_cap_state", return_value=None), \
+             patch.object(am, "_session_cyber_blocked", return_value=False), \
+             patch.object(am, "latest_jsonl_mtime", return_value=5000), \
+             patch.object(am, "_record_fire"), \
+             patch.object(am, "_escalate_stuck") as esc, \
+             patch.object(am, "send_poke", return_value=True):
+            am._dispatch_poke(self._cfg(), "artisan", "p1a", "PROMPT", sp,
+                              bounded_enabled=True, max_ineffective=1)
+        esc.assert_called_once()
+        self.assertEqual(esc.call_args.kwargs["vocab"], "ineffective-poke-unknown")
+        self.assertNotIn("STUCK", esc.call_args.kwargs["msg"])
 
     def test_stuck_poke_flush_still_runs_at_99(self) -> None:
         self._reading(99)

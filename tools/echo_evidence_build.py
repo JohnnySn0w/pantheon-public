@@ -329,6 +329,12 @@ def run(worktree_arg: str | None, cmd: list[str], dry_run: bool) -> int:
     env["CARGO_INCREMENTAL"] = "0"
     env.pop("RUSTC_WRAPPER", None)
     env.pop("CARGO_BUILD_RUSTC_WRAPPER", None)
+    # T-6035: a non-login shell (a subagent's Bash, a systemd unit) lacks rustup's PATH
+    # entry, so `cargo` was not found (rc 127). Prepend ~/.cargo/bin when it exists.
+    cargo_bin = Path(env.get("CARGO_HOME") or Path.home() / ".cargo") / "bin"
+    path_parts = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
+    if cargo_bin.is_dir() and str(cargo_bin) not in path_parts:
+        env["PATH"] = os.pathsep.join([str(cargo_bin), *path_parts])
 
     # OPT-IN only (exactly "1"); see sccache_functional() for the measured reason.
     if os.environ.get("ECHO_EVIDENCE_SCCACHE") != "1":

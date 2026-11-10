@@ -1,0 +1,10 @@
+[Unit]
+Description=T-6115 D-3: daily codex thread-rotation check for the seat on account %i
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 UTC
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

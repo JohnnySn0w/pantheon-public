@@ -10,14 +10,15 @@ Context admission (checked first, before any parameter is read):
 * ``broker-daemon`` -- refused for every family, with the ORG-082 §2 payload
   (``SUBSTRATE_FAMILY_NOT_EXPOSED``, retry in ``bootstrap-in-process-root``).
 * ``seat`` -- refused: an unprivileged context never reaches root families.
-* ``scheduled`` -- may STAGE only, never activate (ORG-080 A-3: a scheduled run
-  never runs as root; a privileged component auto-stages, cutover stays supervised).
+* ``scheduled``: refused for every family at every phase (strict ORG-080 A-3, HO ruling 2026-11-03;
+  engine has no scheduled/root admission since #1564).
 
 Engine seam gap S6 (T-5135): the engine passes no context and ignores
 ``execution_scope``; the component handler pins the context and maps
-``staged-cutover`` to the stage phase, so this is enforced component-side only.
+``staged-cutover`` to the stage phase. The engine now refuses scheduled+root at plan
+time (engine/context.py ADMITTED); this refusal is defence in depth behind it.
 
-CURRENT (co-author recovery; D15 approved at 71fd484cc): the admission rules are Recovery-approved.
+CURRENT (co-author recovery; D15 approved 2026-11-03 for T-6048, strict-A-3 scheduled refusal; previously 71fd484cc): the admission rules are Recovery-approved.
 """
 
 from __future__ import annotations
@@ -72,8 +73,17 @@ class UnprivilegedContext(HelperRefusal):
     code = "UNPRIVILEGED_CONTEXT"
 
 
-class ScheduledActivationRefused(HelperRefusal):
-    code = "SCHEDULED_ACTIVATION_REFUSED"
+class ScheduledRootRefused(HelperRefusal):
+    """ORG-080 A-3 (strict): a scheduled run never executes a root-privileged op, at any phase."""
+
+    code = "SCHEDULED_ROOT_REFUSED"
+
+    def __init__(self, family: str):
+        super().__init__(f"{family}: a scheduled run never executes root-privileged ops, stage included (ORG-080 A-3)")
+        self.family = family
+
+    def payload(self) -> dict[str, str]:
+        return {"code": self.code, "family": self.family, "amendment": "ORG-080", "retry_context": BOOTSTRAP}
 
 
 class PreflightRefused(HelperRefusal):
@@ -192,8 +202,8 @@ class RootHelper:
             raise SubstrateFamilyNotExposed(family)
         if self.context == SEAT:
             raise UnprivilegedContext(f"{family}: an unprivileged seat context never runs root families")
-        if self.context == SCHEDULED and phase == ACTIVATE:
-            raise ScheduledActivationRefused(f"{family}: a scheduled run may stage but never activate (ORG-080 A-3)")
+        if self.context == SCHEDULED:
+            raise ScheduledRootRefused(family)
         try:
             resolved = F.resolve(family, params, self.manifest)
         except F.ParamError as exc:

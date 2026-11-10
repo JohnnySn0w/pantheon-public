@@ -107,6 +107,20 @@ have taken the whole fleet's comms down.
 1. **Disable dependent monitors in the SAME change.** A liveness monitor left armed against a
    deliberately stopped service manufactures exactly the alert noise the pruning was meant to
    remove. (Same class as the T-0536 wire-hook-update-allowlist-together rule.)
+   1b. **Sweep REVERSE dependencies, not just monitors (T-5936).** Step 1 catches what would
+   ALARM on the stopped service. The silent failures are mechanisms keyed on it that would NOT
+   alarm: guards and gates matching its path or name, allowlists naming it, health probes, CI
+   actions or hooks that push to or wait on it, auto-resolvers gated on it, and restore or
+   rollback paths that START it (a declared companion unit, a manifest unit list). Before the
+   change, `git grep -n -e '<service-name>' -e '<path>' -e '<unit>'` across tools/, .github/,
+   hooks, instance.yaml, rulebook/policies and registry/, and list every hit. In the SAME change,
+   re-key each to the successor or retire it. Never leave a mechanism keyed on a target that no
+   longer exists (lessons/2026-07-28-failure-presents-as-absence.md; instances: the cascade
+   Action, Recovery's auto-resolve, the worker-guard ADR path, specialist's retired ACP-bridge
+   companion entry that rollback would have restarted, T-5946).
+   1c. **Positive canary for every re-keyed gate.** After re-keying, prove the gate still
+   FIRES: plant a request it must block, or a probe it must see, and observe the positive
+   result. "Nothing was blocked" after the change is not evidence; it is the failure mode.
 2. **Prefer `disable --now` over deletion.** Reversible with one command; keeps the option open.
 3. **Do not delete accounts, data directories, or message stores** in a service-pruning change.
    Separate decision, separate diff.

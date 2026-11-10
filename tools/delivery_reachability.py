@@ -22,7 +22,7 @@ exactly the "self-targeted alert" class we do not do. Preconditions are what is 
 so READY is deliberately worded as an absence of known blockers rather than a positive guarantee —
 overclaiming here would rebuild the very substitution this module exists to break.
 
-SIX STATES (HELD added by T-5254), and the split between two of them IS the finding:
+EIGHT STATES (HELD added by T-5254; ASLEEP and SLEEP_BREACH by T-6302, see below), and the split between two of them IS the finding:
 
     READY     unit installed AND enabled, and the target (tmux session / inbox) is present.
     DISABLED  the unit exists and is switched off. SOMEBODY RAN `disable` — a deliberate act, so
@@ -63,6 +63,11 @@ PROBE_TIMEOUT = 30
 
 READY, DISABLED, MISSING, BROKEN, UNKNOWN = "READY", "DISABLED", "MISSING", "BROKEN", "UNKNOWN"
 HELD = "HELD"  # T-5254: non-alerting; deliberately held seat-maintenance window
+# T-6302: a seat the seat-state record marks expected_down (ORG-106 deep-sleep, phase asleep).
+# ASLEEP is non-alerting and never READY. SLEEP_BREACH is declared-asleep-but-pane-present: kept
+# visible and non-READY, but not in ALERTING, since recovery_watcher / fleet_health own that page.
+ASLEEP = "ASLEEP"
+SLEEP_BREACH = "SLEEP_BREACH"
 ALERTING = (MISSING, BROKEN, UNKNOWN)
 
 
@@ -257,6 +262,27 @@ def probe_agent(agent: str, mode: str, sub: dict, ops: Ops) -> dict:
             "detail": "unit enabled and the target session is present; nothing known blocks a poke"}
 
 
+def probe_asleep(agent: str, mode: str, sub: dict, ops: Ops, seat) -> dict:
+    """T-6302: verdict for an expected_down seat. Probes only the tmux session (read-only), so a
+    sleep-breach (declared asleep, pane present) is reported rather than hidden by ASLEEP."""
+    who = f"{seat.owner or '?'}: {seat.reason or '-'}; until {seat.expires or 'no expiry'}"
+    if mode == "mailbox":  # no pane to breach; hub-inbox presence says nothing about sleep
+        return {"agent": agent, "mode": mode, "state": ASLEEP,
+                "detail": f"seat-state deep-sleep, expected down ({who}); not READY, not a fault"}
+    account, pane = sub.get("account"), sub.get("pane")
+    session = ops.tmux_session_exists(account, pane) if account else None
+    if session is None:
+        return {"agent": agent, "mode": mode, "state": UNKNOWN,
+                "detail": f"declared asleep ({who}) but its tmux could not be queried"}
+    if session:
+        return {"agent": agent, "mode": mode, "state": SLEEP_BREACH,
+                "detail": (f"declared asleep ({who}) but tmux session "
+                           f"'{(pane or '').split(':')[0]}' is present. recovery_watcher "
+                           f"SLEEP_BREACH owns the page; reported here, never READY")}
+    return {"agent": agent, "mode": mode, "state": ASLEEP,
+            "detail": f"seat-state deep-sleep, expected down ({who}); pane absent on purpose"}
+
+
 def probe_all(ops: Ops | None = None, substrate: dict | None = None,
               modes: dict | None = None) -> list[dict]:
     ops = ops or Ops()
@@ -272,6 +298,8 @@ def probe_all(ops: Ops | None = None, substrate: dict | None = None,
         if _seat_in_maintenance(a):
             out.append({"agent": a, "mode": m, "state": HELD,
                         "detail": "seat-maintenance ACTIVE — held on purpose; not probed (T-5254)"})
+        elif seat is not None and seat.expected_down:
+            out.append(probe_asleep(a, m, sub.get(a, {}), ops, seat))
         elif seat is not None and seat.remediation_vetoed:
             # ORG-106 L4c: a seat in deep-sleep is down on purpose; its delivery is not a fault.
             out.append({"agent": a, "mode": m, "state": HELD,

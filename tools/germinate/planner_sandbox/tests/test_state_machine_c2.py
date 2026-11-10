@@ -188,7 +188,7 @@ _RECONCILER_CASES = [
         ),
     ),
     (
-        # ORG-080 L403 row; reconciler.py's rollback_step2_crash path.
+        # ORG-080 run-state note (notes/2026-11-02-org-080-run-state-relocated.md) §Reconciliation for every prefix state, step-2 row; reconciler.py's rollback_step2_crash path.
         "from_pending_park_admits_active_via_rollback_step2_crash",
         State.PENDING_PARK,
         {"_prior_state": State.ACTIVE.value, "_handle_written": False, "_index_written": False},
@@ -200,7 +200,7 @@ _RECONCILER_CASES = [
         ),
     ),
     (
-        # ORG-080 L404 row; reconciler.py's rollback_step3_crash path --
+        # ORG-080 run-state note (notes/2026-11-02-org-080-run-state-relocated.md) §Reconciliation for every prefix state, step-3 row; reconciler.py's rollback_step3_crash path --
         # mirror-shape of the step2 case above, distinguished only by
         # _handle_written: True (REBOUND r2 fix: this edge was declared in
         # transitions.py per r1 but not previously driven by any fixture).

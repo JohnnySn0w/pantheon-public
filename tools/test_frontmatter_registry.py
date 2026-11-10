@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from tools import _git_utils, frontmatter_registry as fr, ticket
 from tools import ticket_purpose
@@ -67,7 +67,9 @@ class _RegistryEnv(unittest.TestCase):
     def setUp(self) -> None:
         self._env = patch.dict(os.environ, {}, clear=False)
         self._env.start()
-        os.environ.pop(fr.MODE_ENV, None)
+        # T-4762: the default is refuse; most tests exercise warn behaviour, so
+        # pin it here. Tests of the default itself pop MODE_ENV explicitly.
+        os.environ[fr.MODE_ENV] = "warn"
         os.environ.pop(fr.PATH_ENV, None)
         fr.clear_cache()
         self._tmp = tempfile.TemporaryDirectory()
@@ -92,10 +94,10 @@ class _RegistryEnv(unittest.TestCase):
 
 
 class TestParseRealRegistry(_RegistryEnv):
-    def test_real_org021_parses_with_66_fields(self) -> None:
+    def test_real_org021_parses_with_67_fields(self) -> None:
         reg = fr.load_registry()
         self.assertIsNotNone(reg, "real ORG-021 registry must parse")
-        self.assertEqual(len(reg.fields), 66)  # +9 T-5678 security-gate fields
+        self.assertEqual(len(reg.fields), 67)  # +tier_rank (T-5715)
         self.assertEqual(reg.get("state").values, frozenset({"inbox", "active", "done"}))
         self.assertEqual(reg.get("blocked_by").status, "legacy")
 
@@ -154,8 +156,13 @@ class TestModes(_RegistryEnv):
         for ln in lines:
             self.assertTrue(ln.startswith("[frontmatter-registry] WARN"), ln)
 
-    def test_default_mode_is_warn(self) -> None:
-        self.assertEqual(fr.get_mode(), "warn")
+    def test_default_mode_is_refuse(self) -> None:
+        # T-4762 item 4: the default flipped from warn to refuse.
+        os.environ.pop(fr.MODE_ENV, None)
+        self.assertEqual(fr.DEFAULT_MODE, "refuse")
+        self.assertEqual(fr.get_mode(), "refuse")
+        with self.assertRaises(fr.RegistryRefusal):
+            fr.enforce_write(None, {"id": "T-1", "substate": "bogus"})
 
     def test_refuse_mode_raises(self) -> None:
         os.environ[fr.MODE_ENV] = "refuse"
@@ -609,10 +616,147 @@ class TestLintFrontmatter(_RegistryEnv):
             self.assertIn("scanned 3 tickets; 3 finding(s)", text)
             self.assertIn("[bad-value] substate: bogus — 1 ticket(s): T-0001", text)
             self.assertIn("[unknown-field] weird — 1 ticket(s): T-0002", text)
-            self.assertIn("[legacy-field use] blocked_by — 1 ticket(s): T-0002", text)
+            self.assertIn("[legacy-field use (info)] blocked_by — 1 ticket(s): T-0002", text)
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(
                     ticket.cmd_lint_frontmatter(argparse.Namespace(strict=True)), 1)
+
+
+class TestStrictSemantics(_RegistryEnv):
+    """T-4762: --strict fails on unknown-field / bad-value / unavailable
+    registry; legacy-field use on stored tickets is info only."""
+
+    def _run(self, extra_by_id: dict, strict: bool = True) -> tuple[int, str]:
+        root = self.tmp / "tickets"
+        for tid, extra in extra_by_id.items():
+            _write_ticket(root / "done" / f"{tid}.md", tid, "done", extra)
+        with patch.object(ticket, "TICKETS_ROOT", root):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = ticket.cmd_lint_frontmatter(argparse.Namespace(strict=strict))
+        return rc, out.getvalue()
+
+    def test_legacy_only_is_info_and_exits_0(self) -> None:
+        rc, text = self._run({"T-0001": ["blocked_by: T-0002"]})
+        self.assertEqual(rc, 0)
+        self.assertIn("[legacy-field use (info)] blocked_by", text)
+
+    def test_unknown_field_fails_strict(self) -> None:
+        self.assertEqual(self._run({"T-0001": ["weird: 1"]})[0], 1)
+
+    def test_bad_value_fails_strict(self) -> None:
+        self.assertEqual(self._run({"T-0001": ["substate: bogus"]})[0], 1)
+
+    def test_legacy_plus_unknown_still_fails(self) -> None:
+        self.assertEqual(
+            self._run({"T-0001": ["blocked_by: T-0002"], "T-0003": ["weird: 1"]})[0], 1)
+
+    def test_unavailable_registry_fails_strict(self) -> None:
+        os.environ[fr.PATH_ENV] = str(self.tmp / "missing.md")
+        fr.clear_cache()
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc, _ = self._run({"T-0001": []})
+        self.assertEqual(rc, 1)
+
+    def test_real_tree_strict_exits_0_and_lists_legacy(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = ticket.cmd_lint_frontmatter(argparse.Namespace(strict=True))
+        self.assertEqual(rc, 0)
+        self.assertIn("legacy-field use (info)", out.getvalue())
+
+
+class TestSystemFieldsWarnOnly(_RegistryEnv):
+    """T-4762 item 1: auto_delivered / auto_delivered_at / delivered_to never
+    refuse, even in refuse mode, even if the registry lost their entries."""
+
+    STAMP = {"id": "T-1", "auto_delivered": "true", "auto_delivered_at": "2026-10-01T00:00:00Z",
+             "delivered_to": "orchestrator"}
+
+    def _drop_system_entries(self) -> None:
+        text = _real_adr_text()
+        kept = [ln for ln in text.splitlines(keepends=True)
+                if not any(f"{{field: {n}," in ln for n in fr.SYSTEM_WARN_FIELDS)]
+        self.assertLess(len(kept), len(text.splitlines(keepends=True)))
+        self.use_registry_text("".join(kept))
+
+    def test_constant_matches_real_registry(self) -> None:
+        reg = fr.load_registry()
+        self.assertEqual(fr.SYSTEM_WARN_FIELDS,
+                         {"auto_delivered", "auto_delivered_at", "delivered_to",
+                          "auto_declined_by"})
+        for name in fr.SYSTEM_WARN_FIELDS:
+            self.assertIn(name, reg, f"{name} missing from the ORG-021 registry")
+
+    def test_unregistered_system_fields_only_warn_in_refuse(self) -> None:
+        self._drop_system_entries()
+        os.environ[fr.MODE_ENV] = "refuse"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            findings = fr.enforce_write(None, dict(self.STAMP))
+        self.assertEqual(len(findings), 3)
+        self.assertEqual(err.getvalue().count("[frontmatter-registry] WARN"), 3)
+
+    def test_mixed_write_refuses_naming_only_the_real_finding(self) -> None:
+        self._drop_system_entries()
+        os.environ[fr.MODE_ENV] = "refuse"
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(fr.RegistryRefusal) as ctx:
+                fr.enforce_write(None, {**self.STAMP, "zz": "1"})
+        self.assertIn("zz", str(ctx.exception))
+        self.assertNotIn("delivered_to", str(ctx.exception))
+
+
+class TestDeclineClearWarnOnly(_RegistryEnv):
+    """T-4762 review HIGH: the stale-lock release (T-5049) writes
+    auto_declined_by; a registry lacking it must not stall the seat's intake."""
+
+    def test_decline_clear_proceeds_and_clears_stamp_in_refuse_mode(self) -> None:
+        from tools import inbox_consumer as ic
+        path = _write_ticket(self.tmp / "tickets" / "inbox" / "T-9800.md", "T-9800", "inbox", [
+            "auto_delivered: true", "auto_delivered_at: 2026-10-01T00:00:00Z",
+            "delivered_to: orchestrator"])
+        info = ic.TicketInfo(id="T-9800", title="Example", created_str="2026-10-01T00:00:00Z",
+                             depends_on=[], labels=[], body="", path=path)
+        text = _real_adr_text()
+        kept = "".join(ln for ln in text.splitlines(keepends=True)
+                       if "{field: auto_declined_by," not in ln)
+        self.assertNotEqual(kept, text)
+        self.use_registry_text(kept)
+        os.environ[fr.MODE_ENV] = "refuse"
+        err = io.StringIO()
+        with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+                contextlib.redirect_stderr(err):
+            ok = ic._clear_auto_delivered(info, decline_agent="orchestrator")
+        self.assertTrue(ok)
+        fields = _parse(path)[0]
+        self.assertNotIn("auto_delivered", fields)
+        self.assertNotIn("delivered_to", fields)
+        self.assertEqual(fields.get("auto_declined_by"), ["orchestrator"])
+        self.assertIn("auto_declined_by", err.getvalue())
+
+
+class TestChildPreflightGatedOnRefuse(_RegistryEnv):
+    """T-4762 item 2: _preflight_child_ticket is a no-op unless refuse mode."""
+
+    def _call(self) -> None:
+        ticket._preflight_child_ticket(
+            parent_tid="T-9", parent_fields={"serves": "x"}, target="recovery",
+            intent=None, labels=["weird-nolabel"], depends_on=None)
+
+    def test_warn_mode_is_silent(self) -> None:
+        self.use_modified_real_registry(_LABELS_ENTRY, "")
+        os.environ[fr.MODE_ENV] = "warn"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._call()
+        self.assertEqual(err.getvalue(), "")
+
+    def test_refuse_mode_still_refuses(self) -> None:
+        self.use_modified_real_registry(_LABELS_ENTRY, "")
+        os.environ[fr.MODE_ENV] = "refuse"
+        with self.assertRaises(ticket.TicketRefusal):
+            self._call()
 
 
 # ---------------------------------------------------------------------------
@@ -791,7 +935,21 @@ class TestInboxStampRefusal(_RegistryEnv):
     def test_preflight_is_a_noop_in_warn_mode(self) -> None:
         self.assertIsNone(self.ic._preflight_stamp_registry(self.info, agent="orchestrator"))
 
+    def test_system_fields_never_refuse_the_stamp(self) -> None:
+        # T-4762: even with delivered_to unregistered, refuse mode proceeds.
+        os.environ[fr.MODE_ENV] = "refuse"
+        self.assertIsNone(self.ic._preflight_stamp_registry(self.info, agent="orchestrator"))
+        with patch("subprocess.run"), contextlib.redirect_stderr(io.StringIO()):
+            result = self.ic._stamp_auto_delivered(self.info, agent="orchestrator")
+        self.assertIsNot(result, self.ic.StampResult.REGISTRY_REFUSED)
+        self.assertEqual(_parse(self.path)[0].get("delivered_to"), "orchestrator")
+
     def test_preflight_reports_refusal_and_writes_nothing(self) -> None:
+        # The refusal path stays alive as a safety net: simulate it by emptying
+        # SYSTEM_WARN_FIELDS.
+        self._sys = patch.object(fr, "SYSTEM_WARN_FIELDS", frozenset())
+        self._sys.start()
+        self.addCleanup(self._sys.stop)
         os.environ[fr.MODE_ENV] = "refuse"
         before = self.path.read_bytes()
         msg = self.ic._preflight_stamp_registry(self.info, agent="orchestrator")
@@ -803,6 +961,9 @@ class TestInboxStampRefusal(_RegistryEnv):
         self.assertIsNone(self.ic._preflight_stamp_registry(self.info, agent=None))
 
     def test_stamp_classifies_refusal_distinctly(self) -> None:
+        self._sys = patch.object(fr, "SYSTEM_WARN_FIELDS", frozenset())
+        self._sys.start()
+        self.addCleanup(self._sys.stop)
         os.environ[fr.MODE_ENV] = "refuse"
         before = self.path.read_bytes()
         err = io.StringIO()

@@ -14,7 +14,7 @@
 # solely by the L3 PersonaDefinition. The binding layer (instance.yaml) must not
 # author role_ids; it may carry a read-only, digest-bound projection."
 #
-# WHY A NEW FILE, NOT instance.yaml. ORG-085 §253 (field-ownership table) is
+# WHY A NEW FILE, NOT instance.yaml. ORG-085 §Field ownership and authority (field-ownership table) is
 # explicit: "functional Role membership and default | L3 | PersonaDefinition;
 # PersonaBinding and instance role-key MUST NOT duplicate membership." instance.yaml
 # is the BINDING layer (role-key -> persona/account/harness) — putting role_ids

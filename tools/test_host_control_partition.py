@@ -33,8 +33,11 @@ from tools.host_control.planner import (
     SEAT_LOCAL_ACTION_PREFIX,
     SEAT_LOCAL_CAPABILITY_PREFIX,
     SEAT_LOCAL_RESIDUE_LIMIT,
+    SEAT_PERIODIC_TIMER_LIMIT,
+    is_seat_periodic_timer_op,
     launch_routed_operation_ids,
     partition_installer_plan,
+    residue_bucket_counts,
     seat_local_residue,
 )
 
@@ -81,7 +84,10 @@ class PartitionFunctionTests(unittest.TestCase):
                 # T-5470 (HO ruling 2026-10-26): routed launches have their own
                 # bound; the B8 cap covers only the out-of-envelope residue
                 out_of_envelope = [op for op in residue if op.operation_id not in routed]
-                self.assertLessEqual(len(out_of_envelope), SEAT_LOCAL_RESIDUE_LIMIT)
+                # T-5961 (orchestrator ruling on B8): two buckets, general and periodic-timer
+                general, periodic = residue_bucket_counts((op.kind, op.target) for op in out_of_envelope)
+                self.assertLessEqual(general, SEAT_LOCAL_RESIDUE_LIMIT)
+                self.assertLessEqual(periodic, SEAT_PERIODIC_TIMER_LIMIT)
                 residue_kinds.update(op.kind for op in out_of_envelope)
                 routed_kinds.update(op.kind for op in residue if op.operation_id in routed)
         self.assertGreater(count, 0)
@@ -167,6 +173,121 @@ class PartitionFunctionTests(unittest.TestCase):
         )
         with self.assertRaises(PolicyDenied):
             partition_installer_plan(_core._plan_replace(plan, operations=plan.operations + extras))
+
+    # T-5961 (orchestrator ruling on B8): the allowlisted fleet-usage periodic-timer ops are a
+    # separate bucket capped at SEAT_PERIODIC_TIMER_LIMIT (4 timer pairs, T-6125).
+    def _orchestrator_plan(self):
+        return next(p for p in self._real_plans() if p.persona == "orchestrator" and p.selected_harness == "claude")
+
+    @staticmethod
+    def _timer_pair(template, stem: str, instance: str, unit_dir: str = "/home/x/.config/systemd/user"):
+        def op(suffix, kind, target):
+            return dataclasses.replace(template, operation_id=f"extra.{stem}.{instance}.{suffix}",
+                                       kind=kind, target=target, precondition={}, desired={})
+        return (
+            op("service-unit", "seat-periodic-unit-install", f"{unit_dir}/{stem}@.service"),
+            op("timer-unit", "seat-periodic-unit-install", f"{unit_dir}/{stem}@.timer"),
+            op("timer-enable", "seat-periodic-timer-enable", f"{stem}@{instance}.timer"),
+            op("timer-observe", "seat-periodic-timer-observe", f"{stem}@{instance}.timer"),
+        )
+
+    def _buckets(self, plan):
+        return residue_bucket_counts(
+            (op.kind, op.target) for op in plan.operations if op.kind not in EXECUTOR_KIND_CLASSES
+        )
+
+    def test_the_periodic_timer_predicate(self) -> None:
+        user = "/home/a/.config/systemd/user"
+        for kind in ("seat-periodic-timer-enable", "seat-periodic-timer-observe"):
+            self.assertTrue(is_seat_periodic_timer_op(kind, "pantheon-fleet-usage-prune@mason.timer"))
+            self.assertTrue(is_seat_periodic_timer_op(kind, "pantheon-tmp-session-prune@mason.timer"))
+            for stem in ("pantheon-codex-handoff-checkpoint", "pantheon-codex-thread-rotate"):  # T-6125
+                self.assertTrue(is_seat_periodic_timer_op(kind, f"{stem}@codex-fallback.timer"))
+            self.assertFalse(is_seat_periodic_timer_op(kind, "pantheon-codex-modal-monitor@x.timer"))
+        # T-6121: the non-instanced echo-target-prune stem (exact names only)
+        for kind in ("seat-periodic-timer-enable", "seat-periodic-timer-observe"):
+            self.assertTrue(is_seat_periodic_timer_op(kind, "pantheon-echo-target-prune.timer"))
+            for bad in ("pantheon-echo-target-prune.service", "pantheon-echo-target-prune@x.timer",
+                        "pantheon-echo-target-prune.timer\n", "pantheon-echo-target-prunex.timer",
+                        "Pantheon-echo-target-prune.timer", f"{user}/pantheon-echo-target-prune.timer"):
+                self.assertFalse(is_seat_periodic_timer_op(kind, bad), (kind, bad))
+        for name in ("pantheon-echo-target-prune.service", "pantheon-echo-target-prune.timer"):
+            self.assertTrue(is_seat_periodic_timer_op("seat-periodic-unit-install", f"{user}/{name}"))
+        for bad in ("pantheon-echo-target-prune@.service", "pantheon-echo-target-prunex.timer",
+                    "pantheon-echo-target-prune.timer.d/x.conf"):
+            self.assertFalse(is_seat_periodic_timer_op("seat-periodic-unit-install", f"{user}/{bad}"), bad)
+        self.assertFalse(is_seat_periodic_timer_op(
+            "seat-periodic-unit-install", "/etc/.config/systemd/user/pantheon-echo-target-prune.timer"))
+        for name in ("pantheon-fleet-usage-codex-export@.service", "pantheon-fleet-usage-prune@.timer",
+                     "pantheon-tmp-session-prune@.service", "pantheon-tmp-session-prune@.timer"):
+            self.assertTrue(is_seat_periodic_timer_op("seat-periodic-unit-install", f"{user}/{name}"))
+        for kind, target in (
+            # T-5962/T-5961 review LOW-2: only the exact installer shapes, never a suffix match
+            ("seat-periodic-unit-install", "/etc/.config/systemd/user/pantheon-fleet-usage-prune@.service"),
+            ("seat-periodic-unit-install", "/home/.config/systemd/user/pantheon-fleet-usage-prune@.service"),
+            ("seat-periodic-unit-install", ".config/systemd/user/pantheon-fleet-usage-prune@.service"),
+            ("seat-periodic-unit-install",
+             "/home/x/.config/systemd/user/../../../../etc/systemd/system/.config/systemd/user/"
+             "pantheon-fleet-usage-prune@.service"),
+            ("seat-periodic-unit-install", "/home/x/.config/systemd/user/./pantheon-fleet-usage-prune@.service"),
+            ("seat-periodic-unit-install", "/home/x//.config/systemd/user/pantheon-fleet-usage-prune@.service"),
+            ("seat-periodic-unit-install", f"{user}/pantheon-fleet-usage-prune@mason.service"),  # instance file
+            ("seat-periodic-unit-install", "pantheon-fleet-usage-prune@mason.timer"),  # bare name
+            ("seat-periodic-unit-install", f"{user}/pantheon-fleet-usage-prune@.timer.d/x.conf"),
+            ("seat-periodic-timer-enable", "pantheon-fleet-usage-prune@mason.service"),  # not a timer
+            ("seat-periodic-timer-observe", "pantheon-fleet-usage-prune@.timer"),  # template, no instance
+            ("seat-periodic-timer-enable", f"{user}/pantheon-fleet-usage-prune@mason.timer"),  # a path
+            ("seat-periodic-timer-enable", "pantheon-fleet-usage-prune@mason.timer\n"),
+            ("seat-periodic-timer-enable", "pantheon-fleet-usage-prunex@mason.timer"),
+            ("seat-periodic-unit-install", f"{user}/pantheon-keep-going@.timer"),  # not allowlisted
+            ("seat-periodic-timer-enable", "pantheon-fleet-usage-other@mason.timer"),
+            ("seat-periodic-unit-install", "/etc/systemd/system/pantheon-fleet-usage-prune@.service"),
+            ("seat-periodic-timer-enable", "pantheon-fleet-usage-prune@Mason.timer"),
+            ("user-unit-install", f"{user}/pantheon-fleet-usage-prune@.service"),  # other kind
+            ("codex-telegram-mcp-check", "pantheon-fleet-usage-prune@mason.timer"),
+        ):
+            self.assertFalse(is_seat_periodic_timer_op(kind, target), (kind, target))
+
+    def test_periodic_timer_bucket_has_its_own_cap_of_four_pairs(self) -> None:
+        orchestrator = self._orchestrator_plan()
+        general, periodic = self._buckets(orchestrator)
+        # The real plan carries fleet-usage, echo-target, tmp-session, and Chronicle prune pairs.
+        self.assertEqual(periodic, SEAT_PERIODIC_TIMER_LIMIT)
+        partition_installer_plan(orchestrator)  # exactly 16 remains accepted
+        template = orchestrator.operations[1]
+        fifth = self._timer_pair(template, "pantheon-fleet-usage-prune", "x5")
+        over = _core._plan_replace(orchestrator, operations=orchestrator.operations + fifth)
+        self.assertEqual(self._buckets(over), (general, SEAT_PERIODIC_TIMER_LIMIT + 4))
+        with self.assertRaises(PolicyDenied) as caught:
+            partition_installer_plan(over)
+        self.assertEqual(caught.exception.reason_code, "family_denied")
+
+    def test_non_allowlisted_periodic_kinds_count_as_general_residue(self) -> None:
+        orchestrator = self._orchestrator_plan()
+        general, _periodic = self._buckets(orchestrator)
+        template = orchestrator.operations[1]
+        fill = tuple(
+            dataclasses.replace(template, operation_id=f"fill{index}", kind="codex-telegram-mcp-check")
+            for index in range(SEAT_LOCAL_RESIDUE_LIMIT - general)
+        )
+        full = _core._plan_replace(orchestrator, operations=orchestrator.operations + fill)
+        partition_installer_plan(full)  # general bucket exactly at 32
+        for stray in (
+            self._timer_pair(template, "pantheon-keep-going", "x1")[:1],  # name not allowlisted
+            self._timer_pair(template, "pantheon-fleet-usage-prune", "x1", "/etc/systemd/system")[:1],
+        ):
+            with self.subTest(target=stray[0].target), self.assertRaises(PolicyDenied):
+                partition_installer_plan(_core._plan_replace(orchestrator, operations=full.operations + stray))
+
+    def test_summary_refuses_periodic_timer_bucket_over_its_cap(self) -> None:
+        orchestrator = self._orchestrator_plan()
+        broker, _residue = partition_installer_plan(orchestrator)
+        seat_local_residue(broker)  # 16: at the cap
+        action = next(a for a in broker.operator_actions
+                      if a.target == "pantheon-chronicle-prune@orchestrator.timer")
+        over = dataclasses.replace(action, action_id=f"{SEAT_LOCAL_ACTION_PREFIX}extra.17th")
+        with self.assertRaisesRegex(HostControlError, "seat-local residue exceeds its bound"):
+            seat_local_residue(_core._plan_replace(broker, operator_actions=broker.operator_actions + (over,)))
 
     # T-5617: the summary-side re-check of both bounds in seat_local_residue
     # (defence in depth: the partition enforces them first, so these feed the
@@ -268,7 +389,8 @@ class PlannerPartitionTests(unittest.TestCase):
         self.assertEqual(
             [
                 r for r in summary["seat_local_residue"]
-                if not r["operation_id"].startswith(("periodic.", "service.")) and r["kind"] not in ROUTED_KINDS
+                if not r["operation_id"].startswith(("periodic.", "service.", "harness.codex-shell-box"))  # T-5480: baseline op
+                and r["kind"] not in ROUTED_KINDS
             ],
             [
                 {"operation_id": "injected.0", "kind": "codex-telegram-mcp-check", "status": "pending-seat-local"},
@@ -287,7 +409,8 @@ class PlannerPartitionTests(unittest.TestCase):
             [
                 r
                 for r in json.loads(plain.summary_json)["seat_local_residue"]
-                if not r["operation_id"].startswith(("periodic.", "service.")) and r["kind"] not in ROUTED_KINDS
+                if not r["operation_id"].startswith(("periodic.", "service.", "harness.codex-shell-box"))  # T-5480: baseline op
+                and r["kind"] not in ROUTED_KINDS
             ],
             [],
         )

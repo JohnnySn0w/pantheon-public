@@ -1,13 +1,15 @@
 ---
 aliases: [ORG-013]
 title: Relational triggers on ticket resolve (auto-unblock cascade + blocked-revisit digest)
-status: Ratified 2026-06-07 by the operator (authored 2026-05-14)
+status: "Ratified 2026-06-07 by the operator (authored 2026-05-14, T-0328); in force as amended by ORG-019 (2026-05-19), T-3933 (2026-09-22) and T-4186 (2026-09-29)"
 date: 2026-05-14
 build_disposition: built
 ---
 # ORG-013 — Relational triggers on ticket resolve (auto-unblock cascade + blocked-revisit digest)
 
 **Status:** **Ratified 2026-06-07 by the operator.** Authored 2026-05-14; Implementation already landed at pantheon-config@107301a (T-0328); this ADR captures the decisions that shaped that implementation per the operator verdict msg_~1497-window ("this should be an adr not an sop"). Replaces draft SOP `sop/standard/relational-triggers-on-ticket-resolve.md` (Recovery-authored 2026-05-14; retired in favor of this ADR per [[ORG-012]] §Promotion #5 SOP→ADR conversion path — architectural-decision-among-alternatives with named tradeoffs is ADR-shape, not SOP-shape).
+
+**Status note 2026-11-03 (T-6062):** in force as amended below. The ORG-019 amendment (2026-05-19) also mooted the prior-claim-aware restore that §Decision chose ("Option F rejection"): with `blocked/` retired there is no prior state to restore, and `_restore_state_for_dep` was removed from `tools/ticket.py` in 93f167c9a1 (2026-05-19). The decision text is unchanged.
 
 **Amended 2026-05-19 by ORG-019:** `blocked/` directory retired. Cascade-unblock semantics shift from "blocked → inbox/active dir move" to "dependant in inbox/ with `depends_on` gate clears when last dep resolves (frontmatter rewrite; file stays in inbox/)." Blocked-revisit digest section retires entirely. See §1 (amended) and §2 (retired) below for the post-ORG-019 mechanism shape.
 

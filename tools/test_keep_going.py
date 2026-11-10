@@ -47,6 +47,7 @@ def setUpModule():
     # inject do_idle_reading or a fake reader.
     _FLEET_ENV_PATCH = mock.patch.dict(
         os.environ, {"PANTHEON_FLEET_USAGE_DIR": "/nonexistent/pantheon-fleet-usage-hermetic",
+                     "PANTHEON_USAGE_GATE_SCHEDULE_ENABLED": "0",
                      "KEEP_GOING_IDLE_SOURCE": "pane"})
     _FLEET_ENV_PATCH.start()
     # Runtime selection is host state. Existing unit tests exercise Claude-default
@@ -113,7 +114,7 @@ class HarnessAwareDeliveryTest(unittest.TestCase):
             state.write_text(json.dumps({"runtime": "codex/interactive-chatgpt"}))
             self.assertEqual(_ORIG_ACTIVE_HARNESS("orchestrator", cfg, state_path=state), "codex")
 
-    def test_codex_runtime_does_not_consume_claude_fleet_usage_gate(self):
+    def test_codex_runtime_consumes_its_own_fleet_usage_gate(self):
         cfg = {"unix_user": "claude", "harness": "claude-code"}
         suppressed = mock.Mock(suppress=True, reason="claude at 95%", window_key="w")
         with mock.patch.object(kg, "active_harness", return_value="codex"), \
@@ -123,8 +124,29 @@ class HarnessAwareDeliveryTest(unittest.TestCase):
                 do_fleet_gate=lambda _now: suppressed,
                 do_find_jsonl=lambda *_args: None,
             )
-        self.assertFalse(verdict)
+        self.assertIs(verdict, suppressed)
         hit_cap.assert_not_called()
+
+    def test_codex_quota_lookup_uses_real_appserver_seat_mapping(self):
+        """The exporter writes consultant/watchman, never persona codex/watchman by accident."""
+        for agent, expected in (("codex", "consultant"), ("watchman", "watchman")):
+            decision = kg._fug.GateDecision(False, "below threshold")
+            with self.subTest(agent=agent), \
+                 mock.patch.object(kg, "active_harness", return_value="codex"), \
+                 mock.patch.object(kg._fug, "evaluate", return_value=decision) as evaluate:
+                verdict = kg.cap_or_usage_gate(kg.AGENT_PANE[agent], agent, 1)
+            self.assertFalse(verdict)
+            self.assertEqual(evaluate.call_args.kwargs["harness"], "codex")
+            self.assertEqual(evaluate.call_args.kwargs["seat"], expected)
+
+    def test_codex_account_mapping_fault_fails_open(self):
+        with mock.patch.object(kg, "active_harness", return_value="codex"), \
+             mock.patch.object(kg._appserver_seats, "appserver_seat_for_account",
+                               side_effect=RuntimeError("mapping unavailable")), \
+             mock.patch.object(kg._fug, "evaluate") as evaluate:
+            verdict = kg.cap_or_usage_gate(kg.AGENT_PANE["codex"], "codex", 1)
+        self.assertFalse(verdict)
+        evaluate.assert_not_called()
 
     def test_idle_with_hidden_task_list_footer(self):
         # Regression (2026-06-28): orchestrator keeps a hidden task list, so its idle footer
@@ -341,6 +363,20 @@ class SeatHoldTest(unittest.TestCase):
         rc, cap, inj, out = self._run(record=c)
         self.assertEqual((rc, cap, inj), (0, [], []))
         self.assertIn("seat-state", out)
+
+    def test_halted_holds_intake_and_logs_incident_with_rollback_T5868(self):
+        c = self._state(source="seat-state", state="halted", intake_blocked=True, repair_vetoed=True,
+                        alertable=True, rollback_cmd="python3 -m tools.germinate rollback --run r1")
+        rc, cap, inj, out = self._run(record=c)
+        self.assertEqual((rc, cap, inj), (0, [], []))
+        self.assertIn("HALTED", out)
+        self.assertIn("INCIDENT", out)
+        self.assertIn("python3 -m tools.germinate rollback --run r1", out)
+
+    def test_paused_log_is_not_the_incident_line_T5868(self):
+        c = self._state(source="seat-state", state="paused-intake", intake_blocked=True)
+        _, _, _, out = self._run(record=c)
+        self.assertNotIn("INCIDENT", out)
 
     def test_maintenance_now_honoured(self):
         c = self._state(source="maintenance", intake_blocked=True, remediation_vetoed=True)
@@ -1245,6 +1281,7 @@ class FleetUsageGateT4510(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {
             "PANTHEON_STATE_DIR": str(Path(self._tmp.name) / "state"),
             "PANTHEON_FLEET_USAGE_DIR": str(self.fleet),
+            "PANTHEON_USAGE_GATE_SCHEDULE_ENABLED": "0",
         })
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -1252,6 +1289,9 @@ class FleetUsageGateT4510(unittest.TestCase):
         hit = mock.patch.object(kg, "is_usage_capped", return_value=False)
         self.hit_cap = hit.start()
         self.addCleanup(hit.stop)
+        trip = mock.patch.object(kg, "_send_usage_trip_mail")
+        self.trip_mail = trip.start()
+        self.addCleanup(trip.stop)
         self.kw = dict(do_work_ts=lambda cfg: None, do_session_id=lambda cfg: None,
                        do_capture=lambda pt, uu: IDLE_PANE, do_inject=self._inject_ok)
 
@@ -1278,6 +1318,27 @@ class FleetUsageGateT4510(unittest.TestCase):
         self.assertEqual(self.injected, [])
         self.assertIn("fleet usage gate", out)
         self.assertIn("99", out)
+
+    def test_keep_going_trip_mails_orchestrator_and_affected_seat_once_per_window(self):
+        self._reading(99)
+        self._run()
+        self._run(now_ts=FLEET_NOW + 60)
+        self.assertEqual(
+            [(call.args[0], call.args[1]) for call in self.trip_mail.call_args_list],
+            [("recovery", "orchestrator"), ("recovery", "recovery")],
+        )
+        for call in self.trip_mail.call_args_list:
+            self.assertIn("T-4889 usage pacing trip", call.args[2])
+            self.assertIn("99%", call.args[3])
+
+    def test_keep_going_trip_mail_failure_is_advisory_and_retried(self):
+        self._reading(99)
+        self.trip_mail.side_effect = RuntimeError("hub down")
+        rc, _ = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.trip_mail.call_count, 2)
+        self._run(now_ts=FLEET_NOW + 60)
+        self.assertEqual(self.trip_mail.call_count, 4)
 
     def test_at_exactly_95_the_nudge_is_skipped(self):
         self._reading(95)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -83,6 +84,7 @@ class HarnessIntegration(Protocol):
         expected: Literal["present", "absent"],
         *,
         backend: Any | None = None,
+        wait: bool = True,
     ) -> ReceiverStateProof:
         ...
 
@@ -554,15 +556,23 @@ def _codex_top_level_rollouts(
                     continue
             except OSError:
                 continue
-            meta = _first_record(candidate)
-            payload = meta.get("payload") if isinstance(meta.get("payload"), dict) else {}
-            if meta.get("type") == "session_meta" and (
-                payload.get("parent_thread_id") or payload.get("source") == "exec"
-                or payload.get("originator") == "codex_exec"
-            ):
+            if not _codex_is_top_level(candidate):
                 continue
             found.append(candidate)
     return found
+
+
+def _codex_is_top_level(candidate: Path) -> bool:
+    """Not a subagent/worker thread (parent_thread_id) and not a ``codex exec`` run."""
+    meta = _first_record(candidate)
+    payload = meta.get("payload") if isinstance(meta.get("payload"), dict) else {}
+    return not (meta.get("type") == "session_meta" and (
+        payload.get("parent_thread_id") or payload.get("source") == "exec"
+        or payload.get("originator") == "codex_exec"
+    ))
+
+
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 _CODEX_ROLLOUT_RE = re.compile(r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(?P<session>.+)$")
@@ -580,11 +590,12 @@ class _BaseIntegration:
         del binding, adapter, cwd
 
     def session_transcript(
-        self, *, account_home: Path, started_at: datetime | None, cwd: Path | None = None
+        self, *, account_home: Path, started_at: datetime | None, cwd: Path | None = None,
+        session_id: str | None = None,
     ) -> SessionTranscript | None:
         """The native transcript of the session that started at ``started_at``
         (T-5016). No transcript surface is known by default."""
-        del account_home, started_at, cwd
+        del account_home, started_at, cwd, session_id
         return None
 
     def successor_read_observed(
@@ -651,7 +662,7 @@ class _BaseIntegration:
             if actual != expected_sha256:
                 raise ValueError("operator handoff target hash mismatch")
 
-    def prove_receiver_state(self, binding: Any, expected: Literal["present", "absent"], *, backend: Any | None = None) -> ReceiverStateProof:
+    def prove_receiver_state(self, binding: Any, expected: Literal["present", "absent"], *, backend: Any | None = None, wait: bool = True) -> ReceiverStateProof:
         if backend is not None and hasattr(backend, "prove_receiver_state"):
             proof = backend.prove_receiver_state(binding, expected)
             if isinstance(proof, ReceiverStateProof):
@@ -677,11 +688,14 @@ class ClaudeIntegration(_BaseIntegration):
         prepare_claude_launch(binding, cwd=cwd)
 
     def session_transcript(
-        self, *, account_home: Path, started_at: datetime | None, cwd: Path | None = None
+        self, *, account_home: Path, started_at: datetime | None, cwd: Path | None = None,
+        session_id: str | None = None,
     ) -> SessionTranscript | None:
         """Claude Code: ``~/.claude/projects/<slug>/<session-id>.jsonl`` (T-5016).
         Scoped to the launch cwd's project slug when known; top level only, so
-        subagent transcripts (nested under the session dir) never qualify."""
+        subagent transcripts (nested under the session dir) never qualify. ``session_id`` (T-6118) is
+        accepted for interface symmetry; Claude's newest-top-level pick does not need it."""
+        del session_id
         projects = account_home / ".claude" / "projects"
         if cwd is not None:
             newest, count = _newest_session_file(
@@ -734,8 +748,8 @@ class ClaudeIntegration(_BaseIntegration):
         del target
         return _run_telegram_receiver_handoff(previous, direction, "post", backend=backend, reason=reason)
 
-    def prove_receiver_state(self, binding: Any, expected: Literal["present", "absent"], *, backend: Any | None = None) -> ReceiverStateProof:
-        return _prove_telegram_receiver_state(binding, expected, backend=backend)
+    def prove_receiver_state(self, binding: Any, expected: Literal["present", "absent"], *, backend: Any | None = None, wait: bool = True) -> ReceiverStateProof:
+        return _prove_telegram_receiver_state(binding, expected, backend=backend, wait=wait)
 
 
 class CodexIntegration(_BaseIntegration):
@@ -756,18 +770,41 @@ class CodexIntegration(_BaseIntegration):
         prepare_codex_launch(binding, cwd=cwd)
 
     def session_transcript(
-        self, *, account_home: Path, started_at: datetime | None, cwd: Path | None = None
+        self, *, account_home: Path, started_at: datetime | None, cwd: Path | None = None,
+        session_id: str | None = None,
     ) -> SessionTranscript | None:
         """Codex: ``~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<session-id>.jsonl``
-        (the codex_context_lifecycle.py shape) (T-5016)."""
+        (the codex_context_lifecycle.py shape) (T-5016).
+
+        T-6118: only the seat's own TOP-LEVEL rollouts qualify (no subagent/worker threads, no
+        ``codex exec`` runs). With ``session_id`` (the supervisor knows its thread) the pick is that
+        thread's rollout; without it, the newest top-level rollout modified since the session
+        start, bounded to CODEX_SESSION_DAYS_CAP day dirs and the last 12 days."""
         del cwd
-        newest, count = _newest_session_file(
-            account_home / ".codex" / "sessions", "rollout-*.jsonl", since=started_at)
-        if newest is None:
+        if session_id and _SESSION_ID_RE.match(session_id):
+            sessions = account_home / ".codex" / "sessions"
+            hits = []
+            for candidate in sessions.glob(f"*/*/*/rollout-*-{session_id}.jsonl"):
+                try:
+                    if candidate.is_file() and _codex_is_top_level(candidate):
+                        hits.append((candidate.stat().st_mtime, candidate))
+                except OSError:
+                    continue
+            if hits:
+                return SessionTranscript(max(hits)[1], session_id, 1)
+        from datetime import timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        floor = now - timedelta(days=12)
+        if started_at is not None and started_at.tzinfo is None:
+            started_at = started_at.replace(tzinfo=timezone.utc)
+        since = max(started_at, floor) if started_at is not None else floor
+        rollouts = _codex_top_level_rollouts(account_home, since=since, now=now, search_from=now - timedelta(days=13))
+        if not rollouts:
             return None
+        newest = max(rollouts, key=lambda item: item.stat().st_mtime)
         match = _CODEX_ROLLOUT_RE.match(newest.stem)
-        session_id = match.group("session") if match else newest.stem
-        return SessionTranscript(newest, session_id, count)
+        return SessionTranscript(newest, match.group("session") if match else newest.stem, len(rollouts))
 
     def successor_read_observed(
         self, *, account_home: Path, cwd: Path | None, since: datetime, evidence_path: str,
@@ -807,8 +844,8 @@ class CodexIntegration(_BaseIntegration):
         del target
         return _run_telegram_receiver_handoff(previous, direction, "post", backend=backend, reason=reason)
 
-    def prove_receiver_state(self, binding: Any, expected: Literal["present", "absent"], *, backend: Any | None = None) -> ReceiverStateProof:
-        return _prove_telegram_receiver_state(binding, expected, backend=backend)
+    def prove_receiver_state(self, binding: Any, expected: Literal["present", "absent"], *, backend: Any | None = None, wait: bool = True) -> ReceiverStateProof:
+        return _prove_telegram_receiver_state(binding, expected, backend=backend, wait=wait)
 
 
 class HermesIntegration(_BaseIntegration):
@@ -835,7 +872,8 @@ class HermesIntegration(_BaseIntegration):
         adapter.prepare_launch(binding, cwd=cwd)
 
     def session_transcript(
-        self, *, account_home: Path, started_at: datetime | None, cwd: Path | None = None
+        self, *, account_home: Path, started_at: datetime | None, cwd: Path | None = None,
+        session_id: str | None = None,
     ) -> SessionTranscript | None:
         """Hermes keeps its sessions under ``$HERMES_HOME`` (``~/.hermes``); the
         exact layout is the hermes release's, so take the newest top-level file
@@ -871,8 +909,9 @@ class HermesIntegration(_BaseIntegration):
         expected: Literal["present", "absent"],
         *,
         backend: Any | None = None,
+        wait: bool = True,
     ) -> ReceiverStateProof:
-        del binding, expected, backend
+        del binding, expected, backend, wait
         return ReceiverStateProof("not-applicable", {"harness": "hermes", "reason": "no-receiver"})
 
     def run_receiver_handoff(
@@ -993,11 +1032,21 @@ def _telegram_subprocess(binding: Any, *args: str, timeout_seconds: int = 90) ->
     return payload
 
 
+def _accepts_wait(method: Any) -> bool:
+    # Exists for legacy test fakes whose _require_* predate the `wait` kwarg.
+    try:
+        params = inspect.signature(method).parameters
+    except (ValueError, TypeError):
+        return False
+    return "wait" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _prove_telegram_receiver_state(
     binding: Any,
     expected: Literal["present", "absent"],
     *,
     backend: Any | None,
+    wait: bool = True,
 ) -> ReceiverStateProof:
     if backend is not None and hasattr(backend, "prove_receiver_state"):
         proof = backend.prove_receiver_state(binding, expected)
@@ -1007,7 +1056,12 @@ def _prove_telegram_receiver_state(
     if backend is not None:
         method = getattr(backend, "_require_present" if expected == "present" else "_require_absent", None)
         if method is not None:
-            method(binding, kind=kind)
+            if wait:
+                method(binding, kind=kind)
+            elif _accepts_wait(method):
+                method(binding, kind=kind, wait=False)
+            else:
+                method(binding, kind=kind)
             return ReceiverStateProof(expected, {"kind": kind, "backend": type(backend).__name__})
     payload = _telegram_subprocess(
         binding,
@@ -1019,6 +1073,7 @@ def _prove_telegram_receiver_state(
         "--expected",
         expected,
         "--json",
+        *(() if wait else ("--no-wait",)),
     )
     state = str(payload.get("state", "ambiguous"))
     evidence_raw = payload.get("evidence")

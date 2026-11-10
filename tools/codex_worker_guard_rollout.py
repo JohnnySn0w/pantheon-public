@@ -9,6 +9,12 @@ verifying that per home. Run it AS the seat account:
 
     python3 tools/codex_worker_guard_rollout.py status   # read-only verdict
     python3 tools/codex_worker_guard_rollout.py apply    # upgrade/trust now, then the verdict
+    python3 tools/codex_worker_guard_rollout.py apply --upgrade-rollback   # also move v1 to v2
+
+The canonical guard is worker-guard-v2.py (T-6123). A home whose one guard entry is the exact v1
+``-I`` command is an operator ROLLBACK: ``apply`` keeps it on v1 (trust only) and status reports
+generation "rollback-v1" (ok when trusted); ``--upgrade-rollback`` is the explicit choice to move
+it to v2.
 
 Prints one JSON object. Exit 0: ON DISK the block is current, enabled and trusted under a
 matching hash (ok). Exit 1: not ok. Exit 3: could not measure (the app-server read failed or
@@ -39,6 +45,8 @@ EXIT_OK, EXIT_NOT_OK, EXIT_UNMEASURABLE = 0, 1, 3
 def main(argv: list[str] | None = None, *, read_hooks=read_codex_app_server_hooks) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("action", choices=("status", "apply"))
+    p.add_argument("--upgrade-rollback", action="store_true",
+                   help="apply only: also upgrade a v1 rollback guard to v2 (default: keep v1)")
     p.add_argument("--account-home", type=Path, default=Path.home())
     p.add_argument("--codex-home", type=Path, default=None, help="default: <account-home>/.codex")
     p.add_argument("--codex-bin", type=Path, default=Path("/usr/bin/codex"))
@@ -50,7 +58,7 @@ def main(argv: list[str] | None = None, *, read_hooks=read_codex_app_server_hook
             # trust_marker=False: the ops surface always asks codex, never the T-4428 launch cache.
             report["changed"] = ensure_worker_guard_hook(
                 codex_home, args.account_home, executable=args.codex_bin, read_hooks=read_hooks,
-                trust_marker=False)
+                trust_marker=False, upgrade_rollback=args.upgrade_rollback)
         report["status"] = worker_guard_hook_status(
             codex_home, args.account_home, executable=args.codex_bin, read_hooks=read_hooks)
     except Exception as exc:  # noqa: BLE001 - unparseable config etc.: not a verdict

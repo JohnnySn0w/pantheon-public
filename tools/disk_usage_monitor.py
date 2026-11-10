@@ -20,6 +20,11 @@ Classify root-FS usage (first match wins):
   WARN    — used% >= warn   threshold (default 85) — reclaim soon
   OK      — otherwise
 
+Related (T-6121): the shared echo cargo target is the usual driver of a breach (~10G/h
+under live builds). tools/echo_target_prune.py --max-gb bounds it automatically when no
+build holds a .cargo-lock; while builds run continuously the cap cannot fire, so this
+alert is the backstop for that case.
+
 On breach the alert appends a best-effort top-consumers breakdown (per-home sizes)
 so it is actionable at a glance; that breakdown is wrapped so it can never break the
 core check. Default-safe (T-0261): refuses a flagless run. Exit 0 always — a monitor

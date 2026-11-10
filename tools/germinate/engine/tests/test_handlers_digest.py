@@ -54,7 +54,7 @@ def test_function_level_helper_import_is_covered_and_binds_helper_bytes(tmp_path
 
 def test_helpers_are_followed_transitively_in_every_import_spelling(tmp_path):
     d = _dir(tmp_path)
-    entry = _write(d, "c_handlers.py", f"import {PKG}.h_one\n")
+    entry = _write(d, "c_handlers.py", f"from {PKG} import h_one\n")
     _write(d, "h_one.py", f"from {PKG}.h_two import Y\n")
     _write(d, "h_two.py", f"from {PKG} import h_one\nY = 1\n")  # a cycle terminates
     assert HD.compute(entry).files == ("c_handlers.py", "h_one.py", "h_two.py")
@@ -156,7 +156,14 @@ def test_a_refused_form_in_a_helper_names_the_helper(tmp_path):
 
 def test_the_real_components_pin_their_helpers():
     root = Path(__file__).resolve().parents[2] / "components"
-    assert HD.compute(root / "harness-manager_handlers.py").files == ("harness-manager_handlers.py", "harness_manager_verify.py")
+    assert HD.compute(root / "harness-manager_handlers.py").files == (
+        "harness-manager_handlers.py",
+        "harness_manager_preflight.py",  # T-5921: the PREFLIGHT hook's checks, imported by the handlers
+        "harness_manager_remove.py",  # T-5859: the remove leg's checks and tables, imported by the handlers
+        "harness_manager_run_state.py",  # T-5858: configure run_state's checks, imported by the handlers
+        "harness_manager_supervisor.py",  # T-5830: configure sub-op (a)'s checks, imported by the handlers
+        "harness_manager_verify.py",
+    )
 
 
 # --- discover(): verify before import, fail closed ----------------------------
@@ -282,5 +289,122 @@ def test_the_validator_path_runs_no_code_and_checks_no_pin_at_discover(tmp_path)
 
 def test_the_entry_runs_from_the_verified_bytes_not_a_re_read(tmp_path):
     path = _write(_dir(tmp_path), "c_handlers.py", "X = 'on-disk'\n")
-    module = components._import(path, "c", b"X = 'verified'\n")
+    pinned = HD.HandlersDigest(digest="sha256:x", entry_source=b"X = 'verified'\n", files=("c_handlers.py",), sources={"c_handlers.py": b"X = 'verified'\n"})
+    module = components._import(path, "c", pinned)
     assert module.X == "verified"
+
+
+# --- T-5506: helpers run from the verified bytes ------------------------------
+
+import importlib.util as _ilu
+import py_compile
+import sys as _sys
+
+CANON = "tools.germinate.components"
+
+
+def _comp_dir(repo: Path) -> Path:
+    return repo / "tools" / "germinate" / "components"
+
+
+def _pinned_repo(tmp_path: Path, entry: str, helpers: dict[str, str]) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    H.write_contract(repo, "comp-a")
+    for name, src in helpers.items():
+        (_comp_dir(repo) / f"{name}.py").write_text(src, encoding="utf-8")
+    digest = H.write_handlers(repo, "comp-a", entry)
+    H.make_checkout(repo, [H.row("comp-a", digest)])
+    return repo
+
+
+@pytest.fixture(autouse=True)
+def _purge_canonical_t5506_modules():
+    """A mutant that falls through to the real import would leave canonical entries behind; never let them couple tests."""
+
+    yield
+    for name in [n for n in _sys.modules if n.startswith(f"{CANON}.t5506_") or n.startswith("_t5506_control_")]:
+        del _sys.modules[name]
+    if hasattr(_sys.modules.get(CANON), "__path__"):
+        _sys.modules[CANON].__path__ = [str(Path(__file__).resolve().parents[2] / "components")]
+
+
+def test_a_planted_pyc_for_a_helper_is_ignored(tmp_path):
+    repo = _pinned_repo(tmp_path, f"from {CANON} import t5506_pyc as V\nHANDLERS = (V.WHO,)\n", {"t5506_pyc": "WHO = 'pyc-verified'\n"})
+    evil = tmp_path / "evil.py"
+    evil.write_text("WHO = 'pyc-EVIL'\n", encoding="utf-8")
+    helper = _comp_dir(repo) / "t5506_pyc.py"
+    cache = _ilu.cache_from_source(str(helper))
+    Path(cache).parent.mkdir(exist_ok=True)
+    # an UNCHECKED_HASH pyc is accepted by CPython for any source: the strongest shadow a planter can leave
+    py_compile.compile(
+        str(evil), cfile=cache, doraise=True, invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH
+    )
+    # control: the normal import machinery DOES accept this pyc, so the planted shadow is live
+    spec = _ilu.spec_from_file_location("_t5506_control_pyc", helper)
+    control = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(control)
+    assert control.WHO == "pyc-EVIL"
+    [reg] = _discover(repo)
+    assert reg.handlers == ("pyc-verified",)
+
+
+def test_a_post_discover_edit_of_a_lazily_imported_helper_is_not_executed(tmp_path):
+    entry = f"def go():\n    from {CANON} import t5506_edit as V\n    return V.WHO\nHANDLERS = (go,)\n"
+    repo = _pinned_repo(tmp_path, entry, {"t5506_edit": "WHO = 'edit-verified'\n"})
+    [reg] = _discover(repo)
+    (_comp_dir(repo) / "t5506_edit.py").write_text("WHO = 'edit-edited'\n", encoding="utf-8")
+    assert reg.handlers[0]() == "edit-verified"
+
+
+def test_helper_to_helper_lazy_import_resolves_to_pinned_bytes_after_an_edit(tmp_path):
+    helpers = {
+        "t5506_la": f"def go():\n    from {CANON}.t5506_lb import WHO\n    return WHO\n",
+        "t5506_lb": "WHO = 'lazy-verified'\n",
+    }
+    entry = f"from {CANON} import t5506_la as A\nHANDLERS = (A.go,)\n"
+    repo = _pinned_repo(tmp_path, entry, helpers)
+    [reg] = _discover(repo)
+    (_comp_dir(repo) / "t5506_lb.py").write_text("WHO = 'lazy-edited'\n", encoding="utf-8")
+    assert reg.handlers[0]() == "lazy-verified"
+
+
+def test_a_repo_root_differing_from_the_importable_checkout_runs_the_repo_root_helper(tmp_path):
+    real = Path(__file__).resolve().parents[2] / "components"
+    decoy = real / "t5506_decoy_probe.py"
+    assert not decoy.exists()
+    decoy.write_text("WHO = 'sys.path'\n", encoding="utf-8")
+    try:
+        repo = _pinned_repo(
+            tmp_path, f"from {CANON} import t5506_decoy_probe as V\nHANDLERS = (V.WHO,)\n", {"t5506_decoy_probe": "WHO = 'repo-root'\n"}
+        )
+        [reg] = _discover(repo)
+        assert reg.handlers == ("repo-root",)
+        assert f"{CANON}.t5506_decoy_probe" not in _sys.modules
+    finally:
+        decoy.unlink()
+
+
+def test_discover_leaves_the_canonical_helper_modules_alone(tmp_path):
+    from tools.germinate.components import watch_evidence as canonical
+
+    repo = _pinned_repo(tmp_path, f"from {CANON} import t5506_can as V\nHANDLERS = (V,)\n", {"t5506_can": "X = 1\n"})
+    [reg] = _discover(repo)
+    assert _sys.modules[f"{CANON}.watch_evidence"] is canonical
+    assert reg.handlers[0].__name__.startswith("_germinate_pinned_")
+
+
+def test_an_unpinned_components_import_is_refused_at_runtime(tmp_path):
+    entry = f"def go():\n    from {CANON} import t5506_unp as V\n    return V\nHANDLERS = (go,)\n"
+    repo = _pinned_repo(tmp_path, entry, {"t5506_unp": "X = 1\n"})
+    [reg] = _discover(repo)
+    scope = reg.handlers[0].__globals__["__builtins__"]["__import__"].__self__
+    with pytest.raises(ImportError, match="not a pinned helper"):
+        scope.import_(CANON + ".t5506_other", None, None, ("X",), 0)
+
+
+def test_the_dotted_import_spelling_is_refused_by_the_walk(tmp_path):
+    d = _dir(tmp_path)
+    entry = _write(d, "c_handlers.py", f"import {CANON}.h_one\n")
+    with pytest.raises(HD.HandlersDigestError, match="binds the name 'tools'"):
+        HD.compute(entry)

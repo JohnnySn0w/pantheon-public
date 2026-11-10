@@ -202,9 +202,15 @@ def main(argv: list[str] | None = None) -> int:
             _log(f"SKIP {repair.seat}/{repair.axis_id}: seat-maintenance armed.")
             continue
         # ORG-106 L4c: a sleeping seat is not repaired back up (remediation_vetoed).
-        held_by = _seat_state_mod().safe_effective_for(repair.seat)
-        if held_by is not None and held_by.remediation_vetoed:
-            _log(f"SKIP {repair.seat}/{repair.axis_id}: seat-state {held_by.state} vetoes repair.")
+        # T-5918: nor is a seat a harness-manager run_state pause (U5) took down on purpose
+        # (repair_vetoed); vetoes_repair() covers both and is False for an unknown reader.
+        ss = _seat_state_mod()
+        held_by = ss.safe_effective_for(repair.seat)
+        if ss.vetoes_repair(held_by):
+            why = ("remediation_vetoed" if held_by.remediation_vetoed
+                   else "repair_vetoed: HALTED mid-pause, roll back first" if held_by.alertable is True
+                   else "repair_vetoed: a run_state pause")
+            _log(f"SKIP {repair.seat}/{repair.axis_id}: seat-state {held_by.state} ({why}) vetoes repair.")
             continue
         account = resolve_account(repair.seat, seats)
         if account is None:

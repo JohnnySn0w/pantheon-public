@@ -78,6 +78,12 @@ AMBIGUOUS = "ambiguous"
 STATES = (QUEUED, ACCEPTED, DELIVERED, FAILED, AMBIGUOUS)
 
 SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
+# T-6112: thread/resume answers with the thread's initialTurnsPage, so its latency grows with the
+# rollout (consultant 2026-11-03: 114 MB rollout, 31.5s over the unix-socket WebSocket vs 6.3s stdio).
+# Resume therefore never inherits a short generic request timeout. T-6115 D-5: 300 -> 120s once
+# the O(n^2) WS reader was fixed (#1618): the same 116 MB rollout then resumed in 20.4s over WS vs
+# 20.7s over stdio at load ~12 (transport parity), a ~6x margin. Thread rotation (D-3) bounds it.
+RESUME_TIMEOUT_S = 120.0
 SANDBOX_RANK = {mode: i for i, mode in enumerate(SANDBOX_MODES)}
 _SANDBOX_WIRE = {"read-only": "readOnly", "workspace-write": "workspaceWrite",
                  "danger-full-access": "dangerFullAccess"}
@@ -333,7 +339,7 @@ class UnixWebSocketTransport:
         self.sock.settimeout(connect_timeout)
         self.sock.connect(path)
         self._wlock = threading.Lock()
-        self._buf = b""
+        self._buf = bytearray()
         key = base64.b64encode(os.urandom(16)).decode()
         self.sock.sendall((
             "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
@@ -347,19 +353,24 @@ class UnixWebSocketTransport:
             buf += chunk
             if len(buf) > 65536:
                 raise ConnectionError("oversized WebSocket handshake response")
-        head, self._buf = buf.split(b"\r\n\r\n", 1)
+        head, rest = buf.split(b"\r\n\r\n", 1)
+        self._buf = bytearray(rest)
         status = head.split(b"\r\n", 1)[0]
         if b" 101 " not in status + b" ":
             raise ConnectionError("WebSocket upgrade refused: %r" % status[:120])
         self.sock.settimeout(None)
 
     def _read(self, n: int) -> bytes:
+        # T-6115 D-6: a bytearray consumed in place. `bytes +=` re-copied the whole
+        # buffer per 64 KiB chunk, so one large frame (thread/resume's initialTurnsPage)
+        # cost O(n^2): 32 MiB took 12.5s, and consultant's resume 31.5s vs 6.3s over stdio.
         while len(self._buf) < n:
-            chunk = self.sock.recv(65536)
+            chunk = self.sock.recv(max(65536, min(n - len(self._buf), 1 << 22)))
             if not chunk:
                 raise EOFError
             self._buf += chunk
-        out, self._buf = self._buf[:n], self._buf[n:]
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
         return out
 
     @staticmethod
@@ -390,7 +401,7 @@ class UnixWebSocketTransport:
         self._send_frame(0x1, json.dumps(obj).encode())
 
     def recv(self) -> Optional[dict]:
-        msg = b""
+        msg = bytearray()
         try:
             while True:
                 b0, b1 = self._read(2)
@@ -416,7 +427,7 @@ class UnixWebSocketTransport:
                     try:
                         return json.loads(msg)
                     except ValueError:
-                        msg = b""
+                        msg = bytearray()
                         continue
         except (EOFError, OSError, ConnectionError):
             return None
@@ -818,7 +829,8 @@ class CodexDeliveryClient:
         eff = self.policy.constrain(sandbox=sandbox, approval_policy=approval_policy, model=model,
                                     network_access=network_access)
         self.thread_id = thread_id
-        res = self.request("thread/resume", eff.resume_params(thread_id))
+        res = self.request("thread/resume", eff.resume_params(thread_id),
+                           timeout=max(self.request_timeout, RESUME_TIMEOUT_S))
         eff.verify_reported(res)
         self.policy_effective = eff
         thread = res.get("thread") or {}

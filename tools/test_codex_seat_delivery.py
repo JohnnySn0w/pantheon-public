@@ -42,11 +42,15 @@ class SeatServer(FakeAppServer):
         self.account = {"type": "chatgpt", "email": "consultant@example.test", "planType": "pro"}
         self.hang_heartbeat = False
         self.resume_error = None
+        self.resume_frame = None        # a recorded frame, sent verbatim (T-6130)
         self.turn_error = None
 
     def h_thread_resume(self, msg):
         if self.resume_error:
             self.error(msg["id"], *self.resume_error)
+            return
+        if self.resume_frame is not None:
+            self.out(dict(self.resume_frame, id=msg["id"]))
             return
         self.resume_overrides.setdefault("cwd", CWD)
         super().h_thread_resume(msg)
@@ -635,7 +639,7 @@ class HeartbeatTests(Base):
         p = self.path(heartbeat_timeout=0.05)
         self.enqueue("dm", "operator_dm", "dm-0001")
         p.tick()
-        self.assertTrue(wait_for(lambda: self.state_of("dm-0001") == cd.ACCEPTED))
+        self.assertTrue(wait_for(lambda: self.state_of("dm-0001") in (cd.ACCEPTED, cd.DELIVERED)), self.state_of("dm-0001"))
         self.server.hang_heartbeat = True
         for _ in range(3):
             self.clock.t += sd.HEARTBEAT_EVERY_S
@@ -1092,7 +1096,7 @@ class CompactionTests(Base):
         p = self.path()
         self.enqueue("please read X", "operator_dm", "dm-0001")
         p.tick()
-        self.assertTrue(wait_for(lambda: self.state_of("dm-0001") == cd.ACCEPTED))
+        self.assertTrue(wait_for(lambda: self.state_of("dm-0001") in (cd.ACCEPTED, cd.DELIVERED)), self.state_of("dm-0001"))
         return p
 
     def resteers(self):
@@ -1143,7 +1147,7 @@ class ReplayAndCliTests(Base):
         p = self.path()
         self.enqueue("dm", "operator_dm", "dm-0001")
         p.tick()
-        self.assertTrue(wait_for(lambda: self.state_of("dm-0001") == cd.ACCEPTED))
+        self.assertTrue(wait_for(lambda: self.state_of("dm-0001") in (cd.ACCEPTED, cd.DELIVERED)), self.state_of("dm-0001"))
         self.conns[-1].drop()
         self.settle(p, "dm-0001", cd.AMBIGUOUS)
         self.server.history.clear()     # a restarted server: no turn, nothing running
@@ -1220,6 +1224,112 @@ class FromBindingTests(Base):
         self.assertIn("--seat consultant", execs[0])
         self.assertIn("RestartPreventExitStatus=5", unit)
         self.assertEqual(sd.EXIT_DUPLICATE, 5)
+
+
+_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "codex_appserver" / "resume_no_rollout.json"
+
+
+def recorded_no_rollout_frame():
+    """The thread/resume reply a REAL codex app-server 0.147.0 sent for a thread that
+    never ran a turn (recorded, see the fixture's provenance), with the test's thread
+    id swapped in for the recorded one."""
+    doc = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+    frame = json.loads(json.dumps(doc["frame"]).replace(doc["recorded_thread_id"], THREAD))
+    return frame
+
+
+class UnmaterializedThreadTests(Base):
+    """T-6130: a FRESH thread has no rollout until its first turn, so thread/resume
+    answers -32600 'no rollout found'. That is a wait, not a hold."""
+
+    def record(self, **fields):
+        (self.state / "thread.json").write_text(json.dumps(dict({"thread_id": THREAD}, **fields)))
+
+    def test_recorded_frame_parses_to_the_error_the_writer_matches_on(self):
+        frame = recorded_no_rollout_frame()
+        self.assertEqual(frame["error"]["code"], -32600)
+        self.assertEqual(frame["error"]["message"], f"no rollout found for thread id {THREAD}")
+        self.server.resume_frame = frame
+        self.record(materialized=False)
+        p = self.path()
+        p.tick()
+        self.assertIsNone(p.hold)
+
+    def test_unmaterialized_thread_backs_off_instead_of_holding(self):
+        self.record(materialized=False)
+        self.server.resume_frame = recorded_no_rollout_frame()
+        self.enqueue("dm", "operator_dm", "dm-0001")
+        p = self.path()
+        p.tick()
+        self.assertIsNone(p.hold)
+        self.assertEqual(self.page_keys(), [])
+        self.assertIsNone(p.client)
+        self.assertEqual(self.server.requests("thread/start"), [])
+        self.assertEqual(self.starts(), [])
+        # Backoff: no reconnect before the delay, a retry after it.
+        p.tick()
+        self.assertEqual(len(self.server.requests("thread/resume")), 1)
+        self.clock.t += 2
+        p.tick()
+        self.assertEqual(len(self.server.requests("thread/resume")), 2)
+        # The TUI's first turn materializes the thread; the next retry resumes it
+        # and the queued mail flows.
+        self.server.resume_frame = None
+        self.record(materialized=True)
+        self.clock.t += 5
+        p.tick()
+        self.assertIsNotNone(p.client)
+        self.assertIsNone(p.hold)
+        p.tick()
+        self.assertTrue(wait_for(lambda: self.state_of("dm-0001") in (cd.ACCEPTED, cd.DELIVERED)), self.state_of("dm-0001"))
+
+    def test_persisting_past_the_bound_pages_once_and_never_holds(self):
+        self.record(materialized=False)
+        self.server.resume_frame = recorded_no_rollout_frame()
+        p = self.path()
+        p.tick()
+        for _ in range(10):
+            self.clock.t += sd.UNMATERIALIZED_PAGE_AFTER_S / 5
+            p.tick()
+        self.assertEqual(self.page_keys(), ["thread_unmaterialized"])
+        self.assertIsNone(p.hold)
+        self.clock.t += 600
+        p.tick()
+        self.assertEqual(self.page_keys(), ["thread_unmaterialized"], "paged more than once")
+
+    def test_no_page_before_the_bound(self):
+        self.record(materialized=False)
+        self.server.resume_frame = recorded_no_rollout_frame()
+        p = self.path()
+        p.tick()
+        self.clock.t += sd.UNMATERIALIZED_PAGE_AFTER_S - 10
+        p.tick()
+        self.assertEqual(self.page_keys(), [])
+
+    def test_materialized_thread_that_wont_resume_keeps_the_hard_hold(self):
+        self.record(materialized=True)
+        self.server.resume_frame = recorded_no_rollout_frame()
+        p = self.path()
+        p.tick()
+        self.assertEqual(p.hold, sd.HOLD_THREAD)
+        self.assertEqual(self.page_keys(), ["hold:thread_wont_resume"])
+
+    def test_record_without_materialized_key_keeps_the_hard_hold(self):
+        self.server.resume_frame = recorded_no_rollout_frame()
+        p = self.path()
+        p.tick()
+        self.assertEqual(p.hold, sd.HOLD_THREAD)
+
+    def test_other_resume_errors_on_an_unmaterialized_record_still_hold(self):
+        self.record(materialized=False)
+        self.server.resume_error = (-32600, "invalid thread id")
+        p = self.path()
+        p.tick()
+        self.assertEqual(p.hold, sd.HOLD_THREAD)
+        self.server.resume_error = (-32603, f"no rollout found for thread id {THREAD}")
+        p2 = self.path()
+        p2.tick()
+        self.assertEqual(p2.hold, sd.HOLD_THREAD)
 
 
 if __name__ == "__main__":

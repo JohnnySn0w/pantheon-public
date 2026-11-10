@@ -18,9 +18,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import unittest.mock
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -37,12 +41,15 @@ LIVE_SPECIALIST_RATE_LIMITS = {
 }
 
 
-def reading_doc(seat, ts, seven=None, five=None):
+def reading_doc(seat, ts, seven=None, five=None, harness=None):
     """A tap-shaped record. seven/five are (pct, resets_at) or None."""
     def win(w):
         return None if w is None else {"used_percentage": w[0], "resets_at": w[1]}
-    return {"schema": fug.SCHEMA, "ts": ts, "seat": seat,
-            "seven_day": win(seven), "five_hour": win(five)}
+    doc = {"schema": fug.SCHEMA, "ts": ts, "seat": seat,
+           "seven_day": win(seven), "five_hour": win(five)}
+    if harness is not None:
+        doc["harness"] = harness
+    return doc
 
 
 class _TmpDirCase(unittest.TestCase):
@@ -57,6 +64,9 @@ class _TmpDirCase(unittest.TestCase):
             json.dumps(reading_doc(seat, ts, seven, five)), encoding="utf-8")
 
     def cfg(self, **kw):
+        # Most of this file pins T-4510's flat-threshold substrate. T-4889's
+        # schedule is exercised separately below; production config enables it.
+        kw.setdefault("schedule_enabled", False)
         return fug.GateConfig(dir=self.dir, **kw)
 
     def decide(self, **kw):
@@ -102,6 +112,113 @@ class ThresholdTest(_TmpDirCase):
         self.put("a", NOW - 5, seven=(True, SEVEN_RESET))
         self.assertFalse(self.decide().suppress)
         self.assertEqual(fug.load_readings(self.dir, NOW), {})
+
+
+class ScheduledPacingTest(_TmpDirCase):
+    CHICAGO = ZoneInfo("America/Chicago")
+
+    @classmethod
+    def epoch(cls, value: str) -> float:
+        return datetime.fromisoformat(value).replace(tzinfo=cls.CHICAGO).timestamp()
+
+    def scheduled(self, now: float, pct: float, *, harness="claude", seat="orchestrator"):
+        reset = self.epoch("2026-10-11T12:00:00") if harness == "claude" else self.epoch("2026-10-10T14:15:00")
+        path = self.dir / f"{harness}-{seat}.json"
+        if harness == "codex":
+            path = self.dir / "turns" / seat / "quota.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(
+            reading_doc(seat, now - 5, seven=(pct, reset), harness=harness)
+        ), encoding="utf-8")
+        cfg = fug.GateConfig(dir=self.dir, schedule_enabled=True)
+        return fug.evaluate(now, cfg, harness=harness, seat=seat if harness == "codex" else None)
+
+    def test_before_midpoint_50_is_the_slowdown_ceiling(self):
+        now = self.epoch("2026-10-07T23:59:00")
+        self.assertFalse(self.scheduled(now, 49.9).suppress)
+        decision = self.scheduled(now, 50.0)
+        self.assertTrue(decision.suppress)
+        self.assertEqual(decision.band, "pre-midweek")
+        self.assertEqual(decision.effective_threshold, 50.0)
+
+    def test_between_midpoint_and_friday_ceiling_rises_linearly_to_95(self):
+        midpoint = self.epoch("2026-10-08T00:00:00")
+        friday = self.epoch("2026-10-09T18:00:00")
+        now = midpoint + (friday - midpoint) / 2
+        self.assertFalse(self.scheduled(now, 72.49).suppress)
+        decision = self.scheduled(now, 72.5)
+        self.assertTrue(decision.suppress)
+        self.assertEqual(decision.band, "paced")
+        self.assertAlmostEqual(decision.effective_threshold, 72.5)
+
+    def test_friday_evening_starts_weekend_hold_even_below_the_curve(self):
+        now = self.epoch("2026-10-09T18:00:00")
+        decision = self.scheduled(now, 1.0)
+        self.assertTrue(decision.suppress)
+        self.assertEqual(decision.band, "weekend-hold")
+        self.assertIn("weekend", decision.reason)
+
+    def test_reset_releases_the_weekend_hold(self):
+        reset = self.epoch("2026-10-11T12:00:00")
+        self.assertTrue(self.scheduled(reset - 1, 1.0).suppress)
+        # The old record expires exactly at reset, preserving fail-open semantics
+        # until the first record from the new window arrives.
+        self.assertFalse(self.scheduled(reset, 99.0).suppress)
+
+    def test_codex_uses_its_own_midpoint_and_saturday_reset(self):
+        midpoint = self.epoch("2026-10-07T02:15:00")
+        before = self.scheduled(midpoint - 1, 50.0, harness="codex", seat="consultant")
+        self.assertTrue(before.suppress)
+        self.assertEqual(before.reading.seat, "consultant")
+        reset = self.epoch("2026-10-10T14:15:00")
+        self.assertFalse(self.scheduled(reset, 99.0, harness="codex", seat="consultant").suppress)
+
+    def test_95_is_an_absolute_ceiling_even_when_curve_override_is_higher(self):
+        now = self.epoch("2026-10-09T17:59:00")
+        self.assertTrue(self.scheduled(now, 95.0).suppress)
+
+    def test_friday_boundary_wins_if_provider_moves_reset_past_the_old_schedule(self):
+        # Live Codex on 2026-11-04 reported a Tuesday reset, putting its cycle
+        # midpoint on Friday evening. The weekend rule still begins at 18:00.
+        now = self.epoch("2026-11-06T18:00:00")
+        reset = self.epoch("2026-11-10T08:05:00")
+        quota = self.dir / "turns" / "consultant" / "quota.json"
+        quota.parent.mkdir(parents=True)
+        quota.write_text(json.dumps(
+            reading_doc("consultant", now - 5, seven=(1.0, reset), harness="codex")
+        ), encoding="utf-8")
+        decision = fug.evaluate(
+            now, fug.GateConfig(dir=self.dir, schedule_enabled=True),
+            harness="codex", seat="consultant",
+        )
+        self.assertTrue(decision.suppress)
+        self.assertEqual(decision.band, "weekend-hold")
+
+
+class ProviderIsolationTest(_TmpDirCase):
+    def put_provider(self, filename, seat, harness, pct, ts=NOW - 5):
+        path = self.dir / filename
+        if harness == "codex":
+            path = self.dir / "turns" / seat / "quota.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(
+            reading_doc(seat, ts, seven=(pct, SEVEN_RESET), harness=harness)
+        ), encoding="utf-8")
+
+    def test_claude_ignores_codex_records(self):
+        self.put_provider("codex-consultant.json", "consultant", "codex", 99)
+        self.put("orchestrator", NOW - 10, seven=(10, SEVEN_RESET))
+        self.assertFalse(fug.evaluate(NOW, self.cfg(), harness="claude").suppress)
+
+    def test_codex_pool_is_seat_specific(self):
+        self.put_provider("codex-consultant.json", "consultant", "codex", 99)
+        self.put_provider("codex-watchman.json", "watchman", "codex", 10, ts=NOW - 1)
+        self.assertTrue(fug.evaluate(NOW, self.cfg(), harness="codex", seat="consultant").suppress)
+        self.assertFalse(fug.evaluate(NOW, self.cfg(), harness="codex", seat="watchman").suppress)
+
+    def test_codex_without_a_matching_pool_fails_open(self):
+        self.put_provider("codex-consultant.json", "consultant", "codex", 99)
+        self.assertFalse(fug.evaluate(NOW, self.cfg(), harness="codex", seat="artisan").suppress)
 
 
 class ExpiryTest(_TmpDirCase):
@@ -358,14 +475,17 @@ class ConfigTest(_TmpDirCase):
         self.assertEqual(cfg.seven_day_pct, 95.0)
         self.assertIsNone(cfg.five_hour_pct)
         self.assertEqual(cfg.dir, Path(fug.DEFAULT_DIR))
+        self.assertTrue(cfg.schedule_enabled)
 
     def test_env_overrides(self):
         cfg = fug.config_from_env({
             fug.ENV_SEVEN_DAY_PCT: "90", fug.ENV_FIVE_HOUR_PCT: "97.5",
-            fug.ENV_DIR: "/x/y", fug.ENV_ENABLED: "1"})
+            fug.ENV_DIR: "/x/y", fug.ENV_ENABLED: "1",
+            fug.ENV_SCHEDULE_ENABLED: "0"})
         self.assertEqual(cfg.seven_day_pct, 90.0)
         self.assertEqual(cfg.five_hour_pct, 97.5)
         self.assertEqual(cfg.dir, Path("/x/y"))
+        self.assertFalse(cfg.schedule_enabled)
 
     def test_malformed_env_falls_back_to_defaults(self):
         cfg = fug.config_from_env({fug.ENV_SEVEN_DAY_PCT: "lots",
@@ -452,6 +572,166 @@ class LogOnceTest(_TmpDirCase):
                 os.environ["PANTHEON_STATE_DIR"] = old
 
 
+class TripMailOnceTest(_TmpDirCase):
+    def decision(self):
+        return fug.GateDecision(
+            True, "codex weekly usage 60% >= 50% (pre-midweek)",
+            "codex:seven_day:123:pre-midweek",
+        )
+
+    def test_distinct_per_user_state_roots_share_one_fleet_receipt(self):
+        sent = []
+        env = {"PANTHEON_FLEET_USAGE_DIR": str(self.dir)}
+        with unittest.mock.patch.dict(os.environ, env | {"PANTHEON_STATE_DIR": "/tmp/user-a"}):
+            fug.notify_usage_trip_once(
+                "artisan", self.decision(), lambda recipient, *_: sent.append(recipient))
+        with unittest.mock.patch.dict(os.environ, env | {"PANTHEON_STATE_DIR": "/tmp/user-b"}):
+            fug.notify_usage_trip_once(
+                "artisan", self.decision(), lambda recipient, *_: sent.append(recipient))
+        self.assertEqual(sent, ["orchestrator", "artisan"])
+        self.assertTrue((self.dir / ".gate-state" / "trip-mail" / "artisan_orchestrator.json").is_file())
+
+    def test_concurrent_callers_cannot_double_send(self):
+        sent = []
+        sent_lock = threading.Lock()
+        start = threading.Barrier(3)
+
+        def send(recipient, _subject, _body):
+            time.sleep(0.02)  # widen the old unlocked due -> send -> record race
+            with sent_lock:
+                sent.append(recipient)
+
+        def caller():
+            start.wait()
+            fug.notify_usage_trip_once(
+                "artisan", self.decision(), send,
+                state_dir=self.dir / "shared-trip-state",
+            )
+
+        threads = [threading.Thread(target=caller) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(sorted(sent), ["artisan", "orchestrator"])
+
+    def test_component_creation_race_reopens_the_winner_directory(self):
+        state = self.dir / "raced-state"
+        real_mkdir = os.mkdir
+        raced = False
+
+        def mkdir_with_competitor(component, mode=0o777, *, dir_fd=None):
+            nonlocal raced
+            if component == state.name and not raced:
+                raced = True
+                real_mkdir(component, mode=mode, dir_fd=dir_fd)
+                raise FileExistsError(component)
+            return real_mkdir(component, mode=mode, dir_fd=dir_fd)
+
+        sent = []
+        with unittest.mock.patch.object(fug.os, "mkdir", side_effect=mkdir_with_competitor):
+            fug.notify_usage_trip_once(
+                "artisan", self.decision(), lambda recipient, *_: sent.append(recipient),
+                state_dir=state,
+            )
+        self.assertTrue(raced)
+        self.assertEqual(sent, ["orchestrator", "artisan"])
+
+    def test_failed_send_is_not_recorded_and_retries(self):
+        attempts = []
+
+        def send(recipient, _subject, _body):
+            attempts.append(recipient)
+            if recipient == "artisan" and attempts.count("artisan") == 1:
+                raise RuntimeError("one delivery fault")
+
+        state = self.dir / "shared-trip-state"
+        fug.notify_usage_trip_once("artisan", self.decision(), send, state_dir=state)
+        fug.notify_usage_trip_once("artisan", self.decision(), send, state_dir=state)
+        self.assertEqual(attempts, ["orchestrator", "artisan", "artisan"])
+
+    def test_restrictive_umask_still_writes_group_readable_receipts(self):
+        intermediate = self.dir / ".gate-state"
+        state = intermediate / "trip-mail"
+        old_umask = os.umask(0o077)
+        try:
+            fug.notify_usage_trip_once("artisan", self.decision(), lambda *_: None,
+                                       state_dir=state)
+        finally:
+            os.umask(old_umask)
+        self.assertEqual(stat.S_IMODE(intermediate.stat().st_mode), 0o2770)
+        self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o2770)
+        for receipt in (state / "artisan_orchestrator.json", state / "artisan_artisan.json"):
+            self.assertEqual(stat.S_IMODE(receipt.stat().st_mode), 0o660)
+
+    def test_prepositioned_temp_symlink_is_never_followed_or_sent_through(self):
+        state = self.dir / "shared-trip-state"
+        state.mkdir()
+        victim = self.dir / "victim.txt"
+        victim.write_text("KEEP", encoding="utf-8")
+        key = self.decision().window_key
+        digest = fug.hashlib.sha256(f"artisan\0orchestrator\0{key}".encode()).hexdigest()[:16]
+        token = "ab" * 16
+        temp = state / f".artisan_orchestrator.json.tmp.{os.getpid()}.{digest}.{token}"
+        temp.symlink_to(victim)
+        sent, logs = [], []
+        with unittest.mock.patch.object(fug.secrets, "token_hex", return_value=token):
+            fug.notify_usage_trip_once(
+                "artisan", self.decision(), lambda recipient, *_: sent.append(recipient),
+                log=logs.append, state_dir=state,
+            )
+        self.assertEqual(victim.read_text(encoding="utf-8"), "KEEP")
+        self.assertNotIn("orchestrator", sent)
+        self.assertTrue(any("FileExistsError" in line for line in logs), logs)
+
+    def test_prepositioned_lock_and_receipt_symlinks_are_not_followed(self):
+        for hostile_name in ("artisan_orchestrator.lock", "artisan_orchestrator.json"):
+            with self.subTest(hostile_name=hostile_name):
+                state = self.dir / hostile_name.replace(".", "-")
+                state.mkdir()
+                victim = self.dir / f"victim-{hostile_name.replace('.', '-')}"
+                victim.write_text("KEEP", encoding="utf-8")
+                (state / hostile_name).symlink_to(victim)
+                sent, logs = [], []
+                fug.notify_usage_trip_once(
+                    "artisan", self.decision(), lambda recipient, *_: sent.append(recipient),
+                    log=logs.append, state_dir=state,
+                )
+                self.assertEqual(victim.read_text(encoding="utf-8"), "KEEP")
+                self.assertNotIn("orchestrator", sent)
+                self.assertTrue(logs)
+
+    def test_prepositioned_root_symlink_is_rejected_before_chmod_or_send(self):
+        victim = self.dir / "victim-dir"
+        victim.mkdir(mode=0o700)
+        state = self.dir / "shared-trip-state"
+        state.symlink_to(victim, target_is_directory=True)
+        sent, logs = [], []
+        fug.notify_usage_trip_once(
+            "artisan", self.decision(), lambda recipient, *_: sent.append(recipient),
+            log=logs.append, state_dir=state,
+        )
+        self.assertEqual(stat.S_IMODE(victim.stat().st_mode), 0o700)
+        self.assertEqual(sent, [])
+        self.assertTrue(logs)
+
+    def test_prepositioned_intermediate_symlink_is_never_traversed(self):
+        victim = self.dir / "outside-fleet-root"
+        victim.mkdir()
+        intermediate = self.dir / ".gate-state"
+        intermediate.symlink_to(victim, target_is_directory=True)
+        sent, logs = [], []
+        fug.notify_usage_trip_once(
+            "artisan", self.decision(), lambda recipient, *_: sent.append(recipient),
+            log=logs.append, state_dir=intermediate / "trip-mail",
+        )
+        self.assertEqual(list(victim.iterdir()), [])
+        self.assertEqual(sent, [])
+        self.assertTrue(logs)
+
+
 MOD_DIR = REPO_ROOT / "tools" / "mods" / "fleet-usage"
 CONTRACT_TS = MOD_DIR / "contract" / "fleet-usage-record.ts"
 
@@ -503,9 +783,12 @@ class ModContractTest(_TmpDirCase):
 
     def test_the_mod_observes_the_session_and_touches_no_prompt(self):
         # the operator TG 10725: the producer only reads rateLimits and writes the seat file.
+        # T-4536 adds ONE more observe-only hook, turn.complete (the per-turn usage ledger:
+        # token counts only, never content); still nothing on the prompt.
         import re
         src = (MOD_DIR / "hooks" / "register.ts").read_text(encoding="utf-8")
-        self.assertEqual(re.findall(r"""\bon\(\s*['"]([^'"]+)['"]""", src), ["session.measure"])
+        self.assertEqual(re.findall(r"""\bon\(\s*['"]([^'"]+)['"]""", src),
+                         ["session.measure", "turn.complete"])
         code = re.sub(r"//.*", "", src)           # comments may mention it; code may not
         self.assertNotIn("prompt", code.lower())
         self.assertNotIn("$.session.append", code)

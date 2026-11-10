@@ -109,6 +109,39 @@ def test_real_runner_bounds_and_parses(tmp_path):
     assert garbage["status"] == "runner-error"
 
 
+def test_chronicle_group_command_is_direct_when_live_process_has_group(monkeypatch):
+    monkeypatch.setattr(rc.os, "geteuid", lambda: 1003)
+    monkeypatch.setattr(rc.os, "getegid", lambda: 1004)
+    monkeypatch.setattr(rc.os, "getgroups", lambda: [1003])
+    monkeypatch.setattr(rc.grp, "getgrnam", lambda _name: mock.Mock(gr_gid=1003))
+    monkeypatch.setattr(rc.pwd, "getpwuid", lambda _uid: mock.Mock(pw_name="seat", pw_gid=1004))
+    monkeypatch.setattr(rc.os, "getgrouplist", lambda _name, _gid: [1003, 1004])
+    assert rc._session_chronicle_group_command(["python3", "tool.py"]) == ["python3", "tool.py"]
+
+
+def test_chronicle_group_command_wraps_configured_member_with_stale_live_groups(monkeypatch):
+    monkeypatch.setattr(rc.os, "geteuid", lambda: 1003)
+    monkeypatch.setattr(rc.os, "getegid", lambda: 1004)
+    monkeypatch.setattr(rc.os, "getgroups", lambda: [1004])
+    monkeypatch.setattr(rc.grp, "getgrnam", lambda _name: mock.Mock(gr_gid=1003))
+    monkeypatch.setattr(rc.pwd, "getpwuid", lambda _uid: mock.Mock(pw_name="seat", pw_gid=1004))
+    monkeypatch.setattr(rc.os, "getgrouplist", lambda _name, _gid: [1003, 1004])
+    assert rc._session_chronicle_group_command(["python3", "tool with space.py"]) == [
+        "/usr/bin/sg", "pantheon-shared", "-c", "python3 'tool with space.py'"
+    ]
+
+
+def test_chronicle_group_command_does_not_wrap_unconfigured_account(monkeypatch):
+    monkeypatch.setattr(rc.os, "geteuid", lambda: 1003)
+    monkeypatch.setattr(rc.os, "getegid", lambda: 1004)
+    monkeypatch.setattr(rc.os, "getgroups", lambda: [1004])
+    monkeypatch.setattr(rc.grp, "getgrnam", lambda _name: mock.Mock(gr_gid=1003))
+    monkeypatch.setattr(rc.pwd, "getpwuid", lambda _uid: mock.Mock(pw_name="seat", pw_gid=1004))
+    monkeypatch.setattr(rc.os, "getgrouplist", lambda _name, _gid: [1004])
+    argv = ["python3", "tool.py"]
+    assert rc._session_chronicle_group_command(argv) == argv
+
+
 def test_rearm_only_after_a_closed_tap(tmp_path):
     binding = _binding(tmp_path)
     with mock.patch.object(rc, "_run_submit_helper") as helper:
@@ -188,6 +221,8 @@ class _Outcome:
         (rc.MidSessionCapSwapOutcome(modal_kind="x", cooldown_until=rc._utc_now(), cooldown_source="t"), "cap-swap"),
         (rc.FallbackReturnOutcome(target_ref="claude/x"), "fallback-return"),
         (rc.OperatorSwapOutcome(destination_ref="claude/x"), None),  # review M1: skipped
+        # T-5622: an ORG-106 deep-sleep drain end is "sleep", not a death.
+        (rc.SeatSleepOutcome(drain_outcome="drained"), "sleep"),
     ],
 )
 def test_h2_archives_after_the_supervised_session_ends(tmp_path, outcome, cause):
@@ -309,3 +344,26 @@ def test_h2_failure_does_not_change_the_attempt_record(tmp_path, monkeypatch):
 def test_session_chronicle_is_in_the_runtime_source_manifest():
     assert "tools/session_chronicle.py" in rc.RUNTIME_SOURCE_HASH_PATHS
     assert "tools/chronicle.py" in rc.RUNTIME_SOURCE_HASH_PATHS
+    assert "tools/chronicle_export.py" in rc.RUNTIME_SOURCE_HASH_PATHS  # T-6118: imported at session end
+    assert "tools/appserver_seats.py" in rc.RUNTIME_SOURCE_HASH_PATHS
+    assert "tools/harness_adapter/integration.py" not in rc.RUNTIME_SOURCE_HASH_PATHS  # follow-up, not this PR
+
+
+def test_t5622_sleep_is_an_accepted_chronicle_cause_and_not_a_death():
+    from tools import session_chronicle
+    assert "sleep" in session_chronicle.CAUSES
+    assert rc._SESSION_END_CAUSE_BY_OUTCOME["SeatSleepOutcome"] == "sleep"
+    # only a drain outcome relabels; a bare death (None) and unknown outcomes stay death
+    assert rc._SESSION_END_CAUSE_BY_OUTCOME.get("NoneType", "death") == "death"
+
+
+def test_t5622_sleep_end_is_not_counted_as_a_respawn_loop_death(tmp_path, monkeypatch):
+    from tools import channel_liveness_monitor as clm
+    recs = [
+        {"event": "chronicle_session_end", "cause": "sleep", "recorded_at": "2026-11-04T00:00:00Z", "transition_id": "a"},
+        {"event": "chronicle_session_end", "cause": "death", "recorded_at": "2026-11-04T00:00:01Z", "transition_id": "b"},
+    ]
+    monkeypatch.setattr(clm, "_respawn_evidence_records", lambda *a, **k: recs)
+    monkeypatch.setattr(clm, "_runtime_state_path_for_agent", lambda *a, **k: None)
+    now = clm._iso_epoch("2026-11-04T00:00:10Z")
+    assert clm._session_deaths_in_window("orchestrator", now, 3600) == 1

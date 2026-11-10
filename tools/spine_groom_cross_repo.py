@@ -28,6 +28,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tools import _git_utils  # noqa: E402
 from tools.spine_index_groom import (  # noqa: E402
     SENTINEL_START,
     SENTINEL_END,
@@ -94,6 +95,25 @@ def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True)
 
 
+def _mirror_leg(repo_root: Path) -> str | None:
+    """ORG-101 section 2 dual-write leg (T-4705), called ONLY after origin accepted the push.
+
+    The origin push stays a bare `git push` (push.default pushes the current branch
+    to its same-name upstream), so the mirror gets the same ref: HEAD:<branch>. A
+    detached HEAD has no such branch, so the leg is skipped. Inert (None) until
+    repos.yaml marks a writable mirror for this repo's origin. Never raises: origin
+    already landed, so nothing here may change the push result.
+    """
+    try:
+        rp = _git(["rev-parse", "--abbrev-ref", "HEAD"], repo_root)
+        branch = rp.stdout.strip()
+        if rp.returncode != 0 or not branch or branch == "HEAD":
+            return "mirror leg skipped (no current branch)"
+        return _git_utils.mirror_push_after_origin(repo_root, f"HEAD:{branch}")
+    except Exception as exc:  # noqa: BLE001 -- best-effort leg; never undo origin
+        return f"mirror push failed ({exc!r}); reconciler will heal"
+
+
 def groom_one_dir(repo_root: Path, subdir: str, handler, *, apply: bool, push: bool) -> str:
     """Bootstrap (if needed) + groom one doc dir. Returns a status line."""
     d = repo_root / subdir
@@ -147,6 +167,9 @@ def run_cross_repo(base: Path, *, apply: bool, push: bool,
                 pp = _git(["push"], repo_root)
                 if pp.returncode == 0:
                     results.append(f"{repo_name}: push ok")
+                    note = _mirror_leg(repo_root)
+                    if note is not None:
+                        results.append(f"{repo_name}: {note}")
                 else:
                     # Never leave a divergent local main: revert to the exact
                     # pre-commit SHA (a protected branch or transient push failure

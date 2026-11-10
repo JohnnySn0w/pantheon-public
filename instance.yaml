@@ -121,7 +121,7 @@ manifest_version: 2
 # Read-only, digest-bound projection of the L3 PersonaRoleMembership source
 # (ORG-088 D-2; T-3757). This block NEVER authors role_ids — it carries only a
 # reference to the sole authority (persona_roles.yaml) plus the expected freshness
-# (revision) + integrity (digest) the reader binds against. ORG-085 §253 forbids
+# (revision) + integrity (digest) the reader binds against. ORG-085 §Field ownership and authority forbids
 # the binding layer (this file) from duplicating functional-role membership; a
 # ref+digest is not a copy, so no second authority is created. tools/agent_role_map.py
 # (functional_roles/role_members) recomputes persona_roles.yaml's digest and REFUSES
@@ -145,6 +145,14 @@ persona_installer:
     repo: pantheon-config
     unit_dir: .config/systemd/user
     state_dir: .local/state/pantheon/persona-installer
+  # T-6118 PR-1: installer-owned chronicle-export tree. Every seat's plan carries three
+  # ownership-enforcing mkdir ops: <root> (root:<group> 2750), <root>/<seat> (<seat account>:<group>
+  # 2750) and <root>/.ingested (<ingest_account>:<group> 2755). ingest_account is the memex
+  # ingester that reads the tree and writes only under .ingested/. Absent block = no ops.
+  chronicle_export:
+    root: /var/lib/pantheon/chronicle-export
+    group: pantheon-shared
+    ingest_account: exocortex
   mailbox:
     hub: /home/post-office/mailbox
     group: pantheon-mailbox
@@ -204,6 +212,22 @@ persona_installer:
     authority: tools/mcp_allowlist.yaml
     service_template: tools/systemd/pantheon-mcp-allowlist-audit.service
     timer_template: tools/systemd/pantheon-mcp-allowlist-audit.timer
+  # T-6125 (from T-6115): the daily codex HANDOFF-checkpoint and thread-rotate timers.
+  # owner_persona (recovery, the head-system-orchestrator seat) runs them AS each listed seat's
+  # account, so they are installed on the owner only, one timer pair per account of `personas`
+  # (instance = account; the tools derive the persona from it). Default off: an absent key or
+  # an unlisted persona plans nothing. watchman (account codex-fallback) is added HERE, and to
+  # tools/systemd/expected-units.yaml, after the T-5740 soak. Its live rotation stays refused
+  # by the tool itself until T-6113, whatever this list says.
+  codex_seat_timers:
+    owner_persona: recovery
+    personas: [codex]
+  # T-6121: the shared echo cargo target prune (hourly, --max-gb 16) is installer-owned on ONE
+  # seat: it prunes the host-global /var/lib/pantheon/echo-target, so it is not instanced.
+  # Default off: an absent key plans nothing. Cutover from the hand-installed pair is manual
+  # (tools/systemd/README.md): the installer does not adopt the old units.
+  echo_target_prune:
+    owner_persona: orchestrator
   quota_check:
     cadence_minutes: 30
     randomized_delay_seconds: 300
@@ -456,6 +480,13 @@ harness_runtime:
           mode: interactive
           meter: subscription
           quota_source: statusline
+        # T-4531 step 2 / T-6005: staged INERT. No role references this profile;
+        # base_url and the override flag belong to the future worker role binding.
+        openrouter-api:
+          executable: "{account_home}/.npm-global/bin/claude"
+          mode: interactive
+          meter: api
+          quota_source: provider-api
         batch-sdk:
           executable: "{account_home}/.npm-global/bin/claude"
           mode: batch
@@ -469,6 +500,17 @@ harness_runtime:
           mode: interactive
           meter: subscription
           quota_source: app-server
+    # T-6222 stages the account-keyed H7 watcher surface before the first
+    # session chooses a persona. The role binding below is likewise
+    # persona-neutral; H4 adds roles.system-orchestrator-2 only after naming.
+    hermes:
+      default_profile: deepseek-direct
+      profiles:
+        deepseek-direct:
+          executable: /opt/pantheon/hermes-agent/v0.22.0/bin/hermes
+          mode: interactive
+          meter: api
+          quota_source: provider-api
   roles:
     head-engineering-orchestrator:
       fallbacks:
@@ -754,6 +796,29 @@ harness_runtime:
           config_overrides:
             approval_policy: never
             model_reasoning_effort: high
+    system-orchestrator-2:
+      # T-4924 H4/H7: the account is fixed, while the persona is deliberately
+      # absent until the model self-names. These absolute USD thresholds are
+      # the reviewed $20 top-up shape: page below $10, self-cap at $1, and
+      # alarm on a >$5 drop in 24h. The watcher remains action-inert.
+      fallbacks: []
+      tmux:
+        session: deepseek-fallback-main
+      hermes:
+        profile: deepseek-direct
+        model: deepseek-v4-pro
+        native:
+          provider: deepseek
+          base_url: https://deepseek-proxy.invalid:8448/v1
+          terminal_backend: local
+          busy_input_mode: queue
+          approvals:
+            mode: off
+          balance:
+            currency: USD
+            low_water: "10"
+            hard_floor: "1"
+            burn_alarm_24h: "5"
 
 instance:
   id: pantheon-vps-0
@@ -762,10 +827,19 @@ instance:
   harness_default: claude-code
 
 # role → binding. Roles are the portable axis (ORG-027); personas/accounts are instance data.
+# T-5827 (T-5091 U2; T-5829 ruling (2), option alpha approved by mason 2026-11-02): each role's
+# `identity:` is the typed seat-identity block (uid, shell, home_mode, groups, acl, root_half) read by
+# tools/germinate/components/harness_manager_root.py. Values for the existing seats were read from
+# getent passwd/group, stat and getfacl on 2026-11-02; harness_manager_root.drift_check proves they
+# still match. Every existing seat is `root_half: observe-only` (drift-checked, never root-managed):
+# families account.ensure derives gid == uid, and codex, suborch1, suborch2, exocortex and
+# codex-fallback have a different private gid. `acl: []` means the home ACL is not managed (orchestrator's
+# live user:kino:--x traverse entry is left as is). A new seat is `managed` and its block is the source.
 roles:
   head-engineering-orchestrator:
     persona: orchestrator
     account: claude
+    identity: {uid: 1000, shell: /bin/bash, home_mode: "0750", groups: [pantheon-mailbox, pantheon-shared, sudo, users], acl: [], root_half: observe-only}
     harness: claude-code
     billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; claude Max
                                         # subscription via OAuth. T-3751 tranche 2 amendment
@@ -847,6 +921,7 @@ roles:
   specialist:
     persona: specialist
     account: claude-research
+    identity: {uid: 1002, shell: /bin/bash, home_mode: "0750", groups: [pantheon-mailbox, pantheon-shared], acl: [], root_half: observe-only}
     harness: claude-code
     billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; claude subscription
                                         # via OAuth. T-3751 tranche 2 amendment 2026-09-16.
@@ -874,10 +949,21 @@ roles:
     companion_units:
       - unit: pantheon-acp-bridge@specialist.service
         tmux_session: acp-bridge-specialist
+    # T-5862: SOP §2 units harness-manager run_state (U5) pauses and restores that no other
+    # data source declares (the installer plan, companion_units, the bridge receivers and
+    # schedules/<persona>.yaml cover the rest). Read only by the U5 planner
+    # (harness_manager_run_state.parse_run_state_units); an undeclared live §2 unit still
+    # refuses. A timer's oneshot is always <stem>.service (no override). Repo evidence: the 2026-08-01
+    # fleet pause manifest (knowledge/episodic/2026-08-01-fleet-daemon-pause/) and T-3034.
+    # A declared unit that is absent or disabled on the seat is simply not paused.
+    run_state_units:
+      - unit: pantheon-acp-bridge-backlog@specialist.timer   # SOP §2 wake timers row
+      - unit: specialist-a2a.service                         # SOP 3.3 (A2A loopback server, tools/a2a/)
     domain: research, knowledge/watch reports, doc-research dispatches
   head-system-orchestrator:
     persona: recovery
     account: claude-fallback
+    identity: {uid: 1001, shell: /bin/bash, home_mode: "0750", groups: [pantheon-health, pantheon-mailbox, pantheon-shared, systemd-journal], acl: [], root_half: observe-only}
     harness: claude-code
     billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; claude subscription
                                         # via OAuth. T-3751 tranche 2 amendment 2026-09-16.
@@ -909,6 +995,7 @@ roles:
   peer-daemon-codex:
     persona: codex
     account: codex
+    identity: {uid: 1003, shell: /bin/bash, home_mode: "0750", groups: [pantheon-mailbox, pantheon-shared], acl: [], root_half: observe-only}
     harness: codex
     # T-5748: the installer replaces this bespoke cadence with the shared,
     # harness-aware pantheon-keep-going@codex timer; never leave both armed.
@@ -944,6 +1031,7 @@ roles:
   engineering-orchestrator-1:
     persona: mason
     account: suborch1
+    identity: {uid: 1007, shell: /bin/bash, home_mode: "0750", groups: [pantheon-mailbox, pantheon-shared], acl: [], root_half: observe-only}
     harness: claude-code
     billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; claude subscription
                                         # via OAuth. T-3751 tranche 2 amendment 2026-09-16.
@@ -965,10 +1053,11 @@ roles:
     # `supervisor: control-plane` (the cutover-COMPLETION marker) was added by T-5299 once the session
     # lived on the control plane; a premature add had been reverted TWICE (T-3098, T-3082), see the restart block below.
     account: suborch2
+    identity: {uid: 1008, shell: /bin/bash, home_mode: "0750", groups: [pantheon-mailbox, pantheon-shared], acl: [], root_half: observe-only}
     harness: claude-code
     billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; claude subscription
                                         # via OAuth. T-3751 tranche 2 amendment 2026-09-16.
-    token_ref: ~/.ssh/pantheon_config_deploy (per-repo deploy key; sole key on the account) +
+    token_ref: ~/.ssh/pantheon_config_deploy (per-repo deploy key; NOT the only key on the account, see the T-2893 inventory notes/2026-09-28-t2893-credential-inventory.md) +
                # ~/.claude/.credentials.json (claude OAuth). NO gh_token.env and `gh` is
                # UNAUTHENTICATED — verified first-hand 2026-07-21 (T-1922 §Readiness gap): the
                # deploy key pushes git fine but cannot open PRs (no API surface).
@@ -996,6 +1085,7 @@ roles:
   head-memory-orchestrator:
     persona: archivist
     account: exocortex
+    identity: {uid: 1006, shell: /bin/bash, home_mode: "0750", groups: [pantheon-mailbox, pantheon-shared], acl: [], root_half: observe-only}
     harness: claude-code
     billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; claude subscription
                                         # via OAuth. Corrected T-4016 (archivist-confirmed, orchestrator
@@ -1014,6 +1104,12 @@ roles:
     restart_mode: user
     restart_pane: claude-telegram-bot-exocortex:0
     supervisor: control-plane
+    # T-5862: see roles.specialist.run_state_units. Her ACP bridge was retired 2026-09-20
+    # (T-3832) and exocortex.service with the app (T-5064), so neither is declared: either
+    # one found live makes a pause refuse (or report residue), on purpose. Her two snapshot
+    # timers are not wake paths (SOP §2) and stay untouched.
+    run_state_units:
+      - unit: pantheon-acp-bridge-backlog@archivist.timer   # SOP §2 wake timers row
     domain: second head of the two-hemisphere topology (ORG-042); mailbox-first residency.
             # Role-key name `head-memory-orchestrator` carries the operator's T-3807 ratified roles
             # vocabulary (renamed from the ORG-042 title-language key by that arc); the ORG-042
@@ -1028,6 +1124,7 @@ roles:
   system-orchestrator-1:
     persona: watchman
     account: codex-fallback
+    identity: {uid: 1011, shell: /bin/bash, home_mode: "0750", groups: [pantheon-health, pantheon-mailbox, pantheon-shared, systemd-journal], acl: [], root_half: observe-only}
     harness: codex
     billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; ChatGPT OAuth via
                                         # codex-cli, same meter-shape as peer-daemon-codex.

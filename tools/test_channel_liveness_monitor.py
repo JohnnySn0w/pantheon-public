@@ -443,6 +443,14 @@ class SessionUnitDisabledTest(unittest.TestCase):
 
 
 class RestartWindowTest(unittest.TestCase):
+    def setUp(self):
+        # T-5871: AGENT is a real persona, so the unstubbed controller read returns
+        # the host's live respawn ts and every fake `now` reads as in-window.
+        # Tests that exercise the controller path patch it again themselves.
+        patcher = mock.patch.object(clm, "_controller_respawn_ts", return_value=0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_reads_context_fill_state_files(self):
         import json as _json
         from tempfile import TemporaryDirectory
@@ -1000,6 +1008,79 @@ class SeatStateT5527(unittest.TestCase):
         ret, alert, _, _ = self._check("down", None)
         self.assertEqual(ret, "down")
         alert.assert_called_once()
+
+
+@unittest.skipIf(os.geteuid() == 0, "root bypasses the permission bits these cases rely on")
+class AbsenceProbeRealShell(unittest.TestCase):
+    """T-6038: run _absence_probe_script through a real bash against real dirs.
+
+    The scripted-_run tests above pin the verdict -> status mapping; these pin the
+    shell's own verdicts, which is where T-6038 lived (an absent channels/telegram
+    dir read UNKNOWN forever, so seats with no bridge never reached no_bridge)."""
+
+    def setUp(self):
+        self._td = TemporaryDirectory()
+        self.home = Path(self._td.name) / "home dir"  # a space: quoting is exercised
+        self.home.mkdir()
+        self.tg = self.home / ".claude" / "channels" / "telegram"
+        self.pid = self.tg / "bot.pid"
+        self._chmod_restore: list[Path] = []
+
+    def tearDown(self):
+        for d in self._chmod_restore:
+            d.chmod(0o755)
+        self._td.cleanup()
+
+    def _verdict(self, path: Path) -> str:
+        rc, out = clm._run(["bash", "-c", clm._absence_probe_script(str(path))])
+        self.assertEqual(rc, 0)
+        return out
+
+    def _lock(self, d: Path) -> None:
+        d.chmod(0o000)
+        self._chmod_restore.append(d)
+
+    def test_no_claude_dir_at_all_is_absent(self):
+        self.assertEqual(self._verdict(self.pid), "ABSENT")
+
+    def test_no_channels_telegram_dir_is_absent(self):
+        """THE T-6038 CASE: ~/.claude exists, channels/telegram does not (mason/artisan)."""
+        (self.home / ".claude").mkdir()
+        self.assertEqual(self._verdict(self.pid), "ABSENT")
+
+    def test_telegram_dir_without_pidfile_is_absent(self):
+        self.tg.mkdir(parents=True)
+        self.assertEqual(self._verdict(self.pid), "ABSENT")
+
+    def test_present_pidfile_is_present(self):
+        self.tg.mkdir(parents=True)
+        self.pid.write_text("123\n")
+        self.assertEqual(self._verdict(self.pid), "PRESENT")
+
+    def test_present_pidfile_under_non_traversable_parent_is_unknown(self):
+        """T-2359 measured case: a failed stat under an unsearchable dir is EACCES,
+        not absence. Before T-6038 the bare `-d dirname` test called this ABSENT."""
+        self.tg.mkdir(parents=True)
+        self.pid.write_text("123\n")
+        self._lock(self.tg)
+        self.assertEqual(self._verdict(self.pid), "UNKNOWN")
+
+    def test_unreadable_ancestor_is_unknown(self):
+        channels = self.home / ".claude" / "channels"
+        channels.mkdir(parents=True)
+        self._lock(channels)
+        self.assertEqual(self._verdict(self.pid), "UNKNOWN")
+
+    def test_seat_without_bridge_probes_no_bridge_end_to_end(self):
+        """T-6038 acceptance: no channels/telegram dir -> probe_bridge says no_bridge."""
+        (self.home / ".claude").mkdir()
+        cfg = clm.AGENT_CONFIG[AGENT]
+        with mock.patch.object(clm, "_bot_pid_path_for", return_value=str(self.pid)), \
+                mock.patch.object(clm, "_bridge_env_path_for", return_value=str(self.tg / ".env")), \
+                mock.patch.object(clm, "_sudo_prefix", return_value=[]), \
+                mock.patch.object(clm, "_codex_poller_serves_bridge", return_value=False):
+            status, detail = clm.probe_bridge(AGENT, cfg)
+        self.assertEqual(status, "no_bridge", detail)
 
 
 if __name__ == "__main__":

@@ -63,14 +63,28 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools import persona_continuity as pc  # noqa: E402
+from tools import harness_state as hs  # noqa: E402
 
 PERSONA = "recovery"
 ORGANISM = "pantheon"
-DEFAULT_HOME = Path("/home/claude-fallback")
-DEFAULT_CONTINUITY_ROOT = DEFAULT_HOME / ".local/state/pantheon/personas/recovery/continuity"
-DEFAULT_STATE_ROOT = DEFAULT_HOME / ".local/state/pantheon/personas"
-
 PURPOSES = ("hydrate-runtime", "checkpoint-boundary", "verify-candidate")
+RECOVERY_HOME = Path("/home/claude-fallback")
+
+
+def _default_home() -> Path:
+    """Recovery's identity-source home, even when another account drives the build."""
+    return RECOVERY_HOME
+
+
+def _default_state_root() -> Path:
+    """The personas dir, resolved exactly as the runtime planes resolve it (T-6285):
+    PANTHEON_PERSONA_STATE_DIR, else $PANTHEON_STATE_DIR/personas, else Recovery's home
+    default; a disagreeing pair is refused (HarnessStateError), not guessed."""
+    return hs.state_root_from_env(default=_default_home() / ".local/state/pantheon") / "personas"
+
+
+def _default_continuity_root() -> Path:
+    return _default_state_root() / "recovery/continuity"
 
 
 @dataclass(frozen=True)
@@ -470,10 +484,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Author Recovery's canonical continuity bundle + checkpoint (T-3178 G3)")
     sub = parser.add_subparsers(dest="command", required=True)
     build = sub.add_parser("build", help="stage sources, author descriptor+policy, capture verified checkpoint")
-    build.add_argument("--continuity-root", default=str(DEFAULT_CONTINUITY_ROOT))
+    build.add_argument("--continuity-root", default=str(_default_continuity_root()))
     build.add_argument("--repo-root", default=str(REPO_ROOT))
-    build.add_argument("--home", default=str(DEFAULT_HOME))
-    build.add_argument("--state-root", default=str(DEFAULT_STATE_ROOT))
+    build.add_argument("--home", default=str(_default_home()))
+    build.add_argument("--state-root", default=str(_default_state_root()))
     build.add_argument("--force", action="store_true", help="rebuild an existing continuity root")
     build.add_argument("--allow-dirty", action="store_true",
                        help="build even if the worktree is dirty (pinned-object provenance caveat)")

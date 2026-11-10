@@ -253,7 +253,8 @@ def _claim_removal_offenders(src: str) -> list[str]:
             name = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else None
             if name == "_claim_path" and fn.name not in _CLAIM_PATH_USERS:
                 offenders.append(f"{fn.name}:{node.lineno}:_claim_path")
-            if name in _REMOVERS and fn.name != "release":
+            if name in _REMOVERS and fn.name != "release" and not (fn.name == "takeover" and name == "replace"):
+                # takeover (T-5875) swaps the claim with one atomic replace under the release flock: never absent
                 receiver = func.value if isinstance(func, ast.Attribute) else None
                 args = list(node.args) + [k.value for k in node.keywords]
                 if (receiver is not None and _names_claim(receiver)) or any(_names_claim(a) for a in args):
@@ -295,3 +296,91 @@ def test_remover_pin_catches_a_planted_removal(planted, expect):
     """Self-test on source strings (no real edit): the pin flags each planted shape."""
 
     assert [o.rsplit(":", 1)[1] for o in _claim_removal_offenders(planted)] == expect
+
+
+# --- T-5875: coordinator.takeover, the atomic hand-over of a claim --------------------------------
+
+
+def _takeover(gates, expected="OLD"):
+    coordinator.takeover(gates, INST, COMP, expected_run_id=expected, run_id="NEW", scope="system", uid=os.getuid(), verb="apply")
+
+
+def test_takeover_swaps_the_holder_atomically(gates):
+    _claim(gates, "OLD")
+    _takeover(gates)
+    claim = coordinator.read_claim(gates, INST, COMP)
+    assert claim["run_id"] == "NEW" and claim["verb"] == "apply"
+    assert [p.name for p in _leaf(gates).iterdir()] == ["_component_gate.claim"]  # no temp left behind
+
+
+def test_takeover_by_the_wrong_expected_run_changes_nothing(gates):
+    _claim(gates, "OTHER")
+    with pytest.raises(ClaimHolderMismatch):
+        _takeover(gates)
+    assert _holder(gates) == "OTHER"
+
+
+def test_takeover_of_an_absent_claim_is_refused(gates):
+    with pytest.raises(ClaimHolderMismatch):
+        _takeover(gates)
+    assert _holder(gates) is None
+
+
+def test_takeover_of_a_malformed_claim_fails_closed(gates):
+    (_leaf(gates) / "_component_gate.claim").write_text("not json")
+    with pytest.raises(PrimitiveUnavailable):
+        _takeover(gates)
+    assert (_leaf(gates) / "_component_gate.claim").read_text() == "not json"
+
+
+def test_takeover_with_a_busy_lock_fails_closed(gates, monkeypatch):
+    _claim(gates, "OLD")
+    monkeypatch.setattr(coordinator, "_RELEASE_LOCK_WAIT_S", 0.05)
+    fd = os.open(_leaf(gates), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with pytest.raises(PrimitiveUnavailable, match="busy"):
+            _takeover(gates)
+    finally:
+        os.close(fd)
+    assert _holder(gates) == "OLD"
+
+
+def test_takeover_before_swap_runs_under_the_lock_and_a_refusal_swaps_nothing(gates, monkeypatch):
+    _claim(gates, "OLD")
+    monkeypatch.setattr(coordinator, "_RELEASE_LOCK_WAIT_S", 0.05)
+    seen = []
+
+    def check():
+        with pytest.raises(PrimitiveUnavailable, match="busy"):  # the claim lock is held while the hook runs
+            with coordinator.claim_lock(gates, INST, COMP):
+                pass
+        seen.append(_holder(gates))  # the claim has not been swapped yet
+        raise RuntimeError("precondition failed")
+
+    with pytest.raises(RuntimeError, match="precondition failed"):
+        coordinator.takeover(gates, INST, COMP, expected_run_id="OLD", run_id="NEW", scope="system", uid=os.getuid(),
+                             verb="apply", before_swap=check)
+    assert seen == ["OLD"] and _holder(gates) == "OLD"
+    assert [p.name for p in _leaf(gates).iterdir()] == ["_component_gate.claim"]
+
+
+def test_claim_lock_fails_closed_when_busy_and_when_the_leaf_is_missing(gates, monkeypatch, tmp_path):
+    monkeypatch.setattr(coordinator, "_RELEASE_LOCK_WAIT_S", 0.05)
+    with coordinator.claim_lock(gates, INST, COMP):
+        with pytest.raises(PrimitiveUnavailable, match="busy"):
+            with coordinator.claim_lock(gates, INST, COMP):
+                pass
+    with coordinator.claim_lock(gates, INST, COMP):  # released again on exit
+        pass
+    with pytest.raises(PrimitiveUnavailable, match="unopenable"):
+        with coordinator.claim_lock(tmp_path / "never", INST, COMP):
+            pass
+
+
+def test_takeover_already_locked_runs_inside_the_callers_claim_lock(gates):
+    _claim(gates, "OLD")
+    with coordinator.claim_lock(gates, INST, COMP):  # a second flock would block; already_locked skips it
+        coordinator.takeover(gates, INST, COMP, expected_run_id="OLD", run_id="NEW", scope="system", uid=os.getuid(),
+                             verb="apply", already_locked=True)
+    assert _holder(gates) == "NEW"

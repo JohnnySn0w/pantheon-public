@@ -1226,6 +1226,92 @@ class PresenceContractTests(unittest.TestCase):
         ok(self, readiness(fresh_waiver, frozenset({fresh_waiver.data["lifecycle"]["waiver"]["waiver_digest"]})), pr.PresenceReadiness)  # type: ignore[index]
         self.assertNotEqual(fresh_waiver.data["lifecycle"]["waiver"]["waiver_digest"], waiver["waiver_digest"])  # type: ignore[index]
 
+    def test_install_anchor_binds_preinstall_state_and_install_evidence(self) -> None:
+        initial = new_surface()
+        before = initial.data["lifecycle"]["provisioning_anchor"]  # type: ignore[index]
+        installed_x = step(initial, event("install", "verified"))
+        installed_y = step(initial, dataclasses.replace(event("install", "verified"), evidence_digest=SHA_Y))
+        anchor_x = installed_x.data["lifecycle"]["provisioning_anchor"]  # type: ignore[index]
+        anchor_y = installed_y.data["lifecycle"]["provisioning_anchor"]  # type: ignore[index]
+        self.assertNotEqual(anchor_x, before)
+        self.assertNotEqual(anchor_x, anchor_y)
+        self.assertEqual(
+            anchor_x,
+            pr._sha_json({"pre_install_state_digest": initial.digest, "install_evidence_digest": SHA_X}),
+        )
+
+    def test_waiver_surface_and_adapter_checks_each_fail_with_matching_anchor(self) -> None:
+        source = ready_surface("surface-a", skip=("configure",))
+        source = pr.waive_presence_lifecycle_legs(
+            source, waiver_id="waiver:1", waived_legs=("configure",), reason="r",
+            review_ref="review:1", reviewed_at=ago(60), expires_at=z(NOW + timedelta(days=1)),
+            expected_state_digest=source.digest, now=NOW,
+        )
+        assert isinstance(source, pr.PresenceSurfaceState)
+        original = dict(source.data["lifecycle"]["waiver"])  # type: ignore[index]
+
+        for target in (
+            ready_surface("surface-b", skip=("configure",)),
+            ready_surface("surface-a", skip=("configure",), adapter_id="adapter:other"),
+        ):
+            waiver = copy.deepcopy(original)
+            waiver["provisioning_anchor"] = target.data["lifecycle"]["provisioning_anchor"]  # type: ignore[index]
+            waiver["waiver_digest"] = pr._digest_record(waiver, "waiver_digest")
+            data = presence_json(target)
+            data["lifecycle"]["waiver"] = waiver  # type: ignore[index]
+            attached = pr.parse_presence_surface_state(resign(data, "state_digest"))
+            assert isinstance(attached, pr.PresenceSurfaceState)
+            self.reason(readiness(attached, frozenset({str(waiver["waiver_digest"])})), "lifecycle-waiver-invalid")
+
+    def test_server_owned_fields_require_exact_builtin_types(self) -> None:
+        class Text(str):
+            pass
+
+        class Number(int):
+            pass
+
+        class Moment(datetime):
+            pass
+
+        class Raising:
+            def __eq__(self, other: object) -> bool:
+                raise RuntimeError("eq")
+
+            def __hash__(self) -> int:
+                raise RuntimeError("hash")
+
+        world = self.world
+        projection = world.projection()
+        state = ready_surface()
+        good_ready = ready(state)
+        cases = (
+            lambda: world.build(companion=world.companion(availability=Text("available"))),
+            lambda: apply(state, dataclasses.replace(event("health", "healthy"), leg=Raising())),
+            lambda: pr.render_presence(
+                projection, surface=state, readiness=dataclasses.replace(good_ready, surface_id=Raising()),
+                adapter=adapter(), now=NOW, freshness=FRESH,
+            ),
+            lambda: pr.render_presence(
+                projection, surface=state, readiness=good_ready, adapter=adapter(),
+                now=Moment(2026, 10, 26, 12, tzinfo=timezone.utc), freshness=FRESH,
+            ),
+            lambda: pr.render_presence(
+                projection, surface=state, readiness=good_ready, adapter=adapter(), now=NOW,
+                freshness=b.FreshnessWindow(Number(60)),
+            ),
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                result = case()
+                self.assertIsInstance(result, pr.PresenceRefusal)
+        consent_result = pr.accept_presence_interaction(
+            envelope(request(projection)), current=projection, surface=state, readiness=good_ready,
+            context=world.context,
+            consent_evidence=[dataclasses.replace(grant(world), purpose=Text("companionship"))],
+            replay_cache=b.ConsentReplayCache(), now=NOW, freshness=FRESH,
+        )
+        self.reason(consent_result, "wrong-type")
+
     def test_presence_public_apis_never_raise_on_hostile_input(self) -> None:
         world = self.world
         rng = random.Random(3227)
@@ -1399,8 +1485,8 @@ class PresenceContractTests(unittest.TestCase):
             func = getattr(pr, parser)
             for raw in (lone, json.dumps({"x": lone}), '{"a": "\\ud800"}'):
                 check(parser, func, {"raw": raw}, (pr.PresenceProjection, pr.PresenceInteractionRequest))
-        self.reason(pr.parse_presence_interaction_request(lone), "malformed-input")
-        self.reason(accept(world, projection, state, lone), "malformed-input")
+        self.reason(pr.parse_presence_interaction_request(lone), "malformed-json")
+        self.reason(accept(world, projection, state, lone), "malformed-json")
         self.reason(render(projection, state, RaisingFlagAdapter()), "adapter-not-fixture")
         self.reason(render(projection, state, ReturningAdapter(RaisingIterDict(a=1))), "malformed-input")
         self.reason(pr.waive_presence_lifecycle_legs(

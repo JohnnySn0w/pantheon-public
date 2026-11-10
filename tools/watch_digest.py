@@ -34,7 +34,7 @@ from tools._git_utils import commit_scoped, pull_repo_or_warn  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REPORTS_ROOT = REPO_ROOT / "knowledge" / "watch" / "reports"
 
-# Bot token: same resolution chain as ticket_grooming / ticket_lint / artifact_gc /
+# Bot token: same resolution chain as ticket_grooming / ticket_lint /
 # mirror_drift_sweep — prefer the per-bot `pantheon.env` when present, else the
 # `.env` the Telegram MCP plugin reads. T-4131: the systemd unit used to pin
 # PANTHEON_TELEGRAM_ENV to pantheon.env; dropping that pin must not move specialist's
@@ -475,11 +475,33 @@ def collect_day_index_drift() -> tuple[int, int, str] | str | None:
     return items, len(findings), min(findings)
 
 
+SPOT_ALERT_MIN_WEEKS = 4
+SPOT_ALERT_MIN_SAMPLES = 15
+
+
+def spot_check_alert(tally: dict | None) -> str | None:
+    """T-4877: a decision line only when more than 30% of sampled claims were
+    non-SUPPORTED across 4+ weeks and 15+ samples; otherwise None (silent)."""
+    try:
+        if not tally:
+            return None
+        n, sup, weeks = int(tally["samples"]), int(tally["supported"]), int(tally["weeks"])
+        if n < SPOT_ALERT_MIN_SAMPLES or weeks < SPOT_ALERT_MIN_WEEKS:
+            return None
+        if (n - sup) * 10 <= n * 3:  # exactly 30% does not fire
+            return None
+        return (f"🔎 *Spot-check:* {n - sup}/{n} sampled claims were not SUPPORTED "
+                f"over {weeks} weeks. Consider the phase-2 gate (skip filing when unverified)?")
+    except Exception:
+        return None
+
+
 def build_digest(
     date_iso: str,
     rows: list[tuple[str, bool, str, str | None]],
     leans: list[tuple[str, str, int, Path, datetime | None]] | None = None,
     drift: tuple[int, int, str] | str | None = None,
+    spot_alert: str | None = None,
 ) -> str:
     """Render the watch digest as Markdown for Telegram.
 
@@ -517,6 +539,9 @@ def build_digest(
         return ["", f"⚠️ *Day-index drift:* {items} item(s) across {dirs} dir(s), "
                     f"oldest `{oldest}` — `python3 tools/lint_report_day_index.py`"]
 
+    def _spot_block() -> list[str]:
+        return ["", spot_alert] if spot_alert else []
+
     # A quiet watch day is EXACTLY when a parked ticket most needs carrying: the
     # no-reports branch used to return before anything else could be appended, so
     # the days with least noise were the days a lean could not ride out at all.
@@ -528,7 +553,7 @@ def build_digest(
     # has-reports branch would have blinded it on its own highest-yield days.
     if not rows:
         head = f"📭 [Specialist · watch · {date_iso}]\nNo reports today."
-        tail = "\n".join(_lean_block() + _drift_block())
+        tail = "\n".join(_lean_block() + _drift_block() + _spot_block())
         return head + tail if tail else head
     above = [r for r in rows if r[1]]
     below = [r for r in rows if not r[1]]
@@ -552,6 +577,7 @@ def build_digest(
             parts.append(f"• `{slug}` — {summary}")
     parts.extend(_lean_block())
     parts.extend(_drift_block())
+    parts.extend(_spot_block())
     parts.append("")
     parts.append(f"Full reports: `pantheon-config/knowledge/watch/reports/{date_iso}/`")
     return "\n".join(parts)
@@ -720,7 +746,12 @@ def main() -> int:
     rows = collect_today(REPORTS_ROOT / date_iso)
     leans = collect_operator_leans(TICKETS_ROOT)
     drift = collect_day_index_drift()
-    digest = build_digest(date_iso, rows, leans, drift)
+    try:
+        from tools import watch_runner  # lazy: never a hard dep of the digest
+        spot_alert = spot_check_alert(watch_runner.spot_check_tally(REPORTS_ROOT, d))
+    except Exception:
+        spot_alert = None
+    digest = build_digest(date_iso, rows, leans, drift, spot_alert)
     print(digest)
     # --no-send and the missing-token path BOTH return before any stamp is
     # written. A dry run that recorded a delivery would be T-2182's dry-run-primes-

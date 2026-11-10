@@ -26,6 +26,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -47,6 +48,7 @@ TIMER = f"pantheon-persona-consume@{PERSONA}.timer"
 CONSUME = f"pantheon-persona-consume@{PERSONA}.service"
 CONTROLLER = f"pantheon-runtime-controller@{PERSONA}.service"
 STAMP = "20000101T000000Z"
+SESSION = "pantheon-seat"
 ROLE_OF = {TIMER: "timer", CONSUME: "consume", CONTROLLER: "controller"}
 PURPOSE_VALUE = {purpose.name: purpose.value for purpose in ReadPurpose}
 RESIDUE = (
@@ -75,11 +77,20 @@ class _Case(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.qdir = self.persona_root / f".installer-quarantine-{STAMP}"
+        # T-5612: no seat tmux socket unless a test makes one (== today's behaviour)
+        self.socket_stat = mock.Mock(side_effect=FileNotFoundError("no socket"))
+        pane = mock.patch.object(engine_module.ExecutorEngine, "_pane_stat", staticmethod(self.socket_stat))
+        pane.start()
+        self.addCleanup(pane.stop)
+        self.children: list = []
 
     # -- helpers ----------------------------------------------------------
 
     def op(self, **desired):
-        values = {"persona_state_root": str(self.state_root), "persona": PERSONA, "timer": TIMER}
+        values = {
+            "persona_state_root": str(self.state_root), "persona": PERSONA, "timer": TIMER,
+            "tmux_session": SESSION,
+        }
         values.update(desired)
         return fx.op(OP_ID, KIND, str(self.persona_root), values)
 
@@ -191,6 +202,131 @@ class DeclaredReadsTests(_Case):
         self.assertFalse(hasattr(port, "start_unit") or hasattr(port, "enable_now") or hasattr(port, "reload"))
 
 
+class PaneSignalTests(_Case):
+    """T-5612: a FAILED controller whose pane is alive must not be admitted. The probe targets the
+    SEAT's socket (-S /tmp/tmux-<seat uid>/default), because this executor runs as the seat."""
+
+    def socket_of(self, uid=None, mode=0o140600):
+        uid = self.fixture.identity.uid if uid is None else uid
+        self.socket_stat.side_effect = None
+        self.socket_stat.return_value = mock.Mock(st_mode=mode, st_uid=uid)
+
+    def child(self, returncode, stderr=""):
+        def run(argv, **kwargs):
+            self.children.append((argv, kwargs))
+            return mock.Mock(returncode=returncode, stdout="", stderr=stderr)
+
+        orig = self.fixture.engine
+        self.fixture.engine = lambda **o: orig(**{"run_child": run, **o})
+
+    def refused(self):
+        if not (self.persona_root / "notes.txt").exists():
+            self.seed()
+        before = self.tree()
+        self.fake.units[CONTROLLER] = {"ActiveState": "failed"}
+        result = self.check()
+        self.assertEqual(self.tree(), before)
+        return result
+
+    def test_failed_controller_with_a_live_pane_is_refused_naming_the_pane(self) -> None:
+        self.socket_of()
+        self.child(0)
+        result = self.refused()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.classification, "conflicting")
+        self.assertIn(SESSION, result.detail)
+        self.assertIn("live pane", result.detail)
+
+    def test_probe_argv_targets_the_seat_socket_with_a_fixed_env_and_no_server_verbs(self) -> None:
+        self.socket_of()
+        self.child(0)
+        self.refused()
+        (argv, kwargs), = self.children
+        uid = self.fixture.identity.uid
+        self.assertEqual(argv, ["/usr/bin/tmux", "-S", f"/tmp/tmux-{uid}/default", "has-session", "-t", f"={SESSION}"])
+        self.assertEqual(self.socket_stat.call_args.args, (f"/tmp/tmux-{uid}/default",))
+        self.assertEqual(kwargs["env"]["PATH"], engine_module.DIRECT_FIRE_PATH)
+        self.assertEqual(set(kwargs["env"]), {"PATH", "HOME", "LANG"})
+        self.assertFalse([k for k in kwargs["env"] if k.startswith("TMUX")])
+        self.assertIs(kwargs["check"], False)
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertGreater(kwargs["timeout"], 0)
+        self.assertNotIn("shell", kwargs)
+
+    def test_missing_socket_is_absent_and_spawns_nothing(self) -> None:
+        self.child(0)
+        self.seed()
+        self.fake.units[CONTROLLER] = {"ActiveState": "failed"}
+        self.assertEqual(self.check().classification, "ready")
+        self.assertEqual(self.children, [])
+
+    def test_no_server_and_no_session_are_absent(self) -> None:
+        self.socket_of()
+        self.seed()
+        for stderr in ("no server running on /tmp/tmux-1/default", "can't find session: =pantheon-seat"):
+            with self.subTest(stderr=stderr):
+                self.children.clear()
+                self.child(1, stderr)
+                self.fake.units[CONTROLLER] = {"ActiveState": "failed"}
+                self.assertEqual(self.check().classification, "ready")
+
+    def test_socket_present_but_probe_errors_refuses(self) -> None:
+        # the uid-mismatch shape: the path exists, the server will not talk to us
+        self.socket_of()
+        self.child(1, "error connecting to /tmp/tmux-1/default (Permission denied)")
+        result = self.refused()
+        self.assertFalse(result.ok)
+        self.assertIn("unreadable", result.detail)
+
+    def test_socket_not_owned_by_the_seat_uid_refuses_without_probing(self) -> None:
+        self.socket_of(uid=self.fixture.identity.uid + 1)
+        self.child(1, "no server running")
+        result = self.refused()
+        self.assertFalse(result.ok)
+        self.assertIn("unreadable", result.detail)
+        self.assertEqual(self.children, [])
+
+    def test_unreadable_socket_path_and_a_non_socket_refuse(self) -> None:
+        self.child(1, "no server running")
+        self.socket_stat.side_effect = PermissionError("denied")
+        self.assertFalse(self.refused().ok)
+        self.socket_of(mode=0o100600)
+        self.assertFalse(self.refused().ok)
+
+    def test_missing_tmux_binary_or_timeout_refuses(self) -> None:
+        self.socket_of()
+        for exc in (FileNotFoundError("tmux"), subprocess.TimeoutExpired("tmux", 1)):
+            with self.subTest(exc=type(exc).__name__):
+                def run(argv, _exc=exc, **kwargs):
+                    raise _exc
+
+                orig = self.fixture.engine
+                self.fixture.engine = lambda **o: orig(**{"run_child": run, **o})
+                self.assertFalse(self.refused().ok)
+                self.fixture.engine = orig
+
+    def test_plan_without_a_tmux_session_refuses(self) -> None:
+        self.seed()
+        op = fx.op(OP_ID, KIND, str(self.persona_root), {
+            "persona_state_root": str(self.state_root), "persona": PERSONA, "timer": TIMER})
+        engine = self.fixture.engine()
+        engine._deadline = engine._clock() + 60.0
+        result = engine._quarantine_check(op)
+        self.assertFalse(result.ok)
+        self.assertIn("unreadable", result.detail)
+
+    def test_apply_refuses_a_live_pane_and_moves_nothing(self) -> None:
+        self.socket_of()
+        self.child(0)
+        self.seed()
+        before = self.tree()
+        self.fake.units[CONTROLLER] = {"ActiveState": "failed"}
+        result = self.execute(self.op())
+        self.assertEqual(self.tree(), before)
+        self.assertFalse(self.qdir.exists())
+        self.assertNotEqual(result.outcome if hasattr(result, "outcome") else "failed", "ok")
+
+
 class PreflightTests(_Case):
     def test_live_or_unreadable_seat_refuses_before_anything_changes(self) -> None:
         self.seed()
@@ -258,7 +394,8 @@ class PreflightTests(_Case):
         self.assertEqual(gate.call_count, 2)
         self.assertEqual(gate.call_args_list[0], gate.call_args_list[1])
         self.assertEqual(
-            gate.call_args_list[0].args[0], {CONTROLLER: "inactive", CONSUME: "inactive"}
+            gate.call_args_list[0].args[0],
+            {CONTROLLER: "inactive", CONSUME: "inactive", f"tmux-session:{SESSION}": "absent"},
         )
         self.assertIs(engine_module._residue_quarantine_check, PI._residue_quarantine_check)
 
@@ -279,6 +416,8 @@ class PreflightTests(_Case):
                         backend._runtime_liveness = lambda persona: {
                             unit: (state or None) for unit, state in states.items()
                         }
+                        # the pane half is covered by PaneSignalTests; absent == no objection
+                        backend._quarantine_liveness = lambda operation, persona: backend._runtime_liveness(persona)
                         installer = PI.LocalHostBackend._residue_quarantine_preflight(backend, self.op())
                         mine = self.check()
                         if controller is None or consume is None:
@@ -394,6 +533,26 @@ class ApplyTests(_Case):
         self.assertIn("restored", result.evidence[0].detail)
         self.assertEqual(self.tree(), before)
 
+    def test_a_mkdir_that_created_then_failed_leaves_no_quarantine_dir(self) -> None:
+        # T-5635 (2): SeatChangeIncomplete from mkdir means the dir WAS created
+        self.seed()
+        before = self.tree()
+        real = seat_files_module.SeatFiles.mkdir
+        calls = {"n": 0}
+
+        def created_then_failed(files, target, mode):
+            calls["n"] += 1
+            created = real(files, target, mode)
+            if calls["n"] == 1:
+                raise seat_files_module.SeatChangeIncomplete("directory created but finishing failed: OSError")
+            return created
+
+        with mock.patch.object(seat_files_module.SeatFiles, "mkdir", created_then_failed):
+            result = self.execute(self.op())
+        self.assertFalse(result.ok)
+        self.assertEqual(result.mutations, ())
+        self.assertEqual(self.tree(), before)
+
     def test_an_unfinishable_restore_keeps_the_receipt_for_what_stayed_moved(self) -> None:
         self.seed()
         real = seat_files_module.SeatFiles.rename_within
@@ -437,6 +596,40 @@ class RollbackTests(_Case):
         self.assertTrue(result.ok, result.evidence)
         self.assertEqual(self.tree(), self.before)
         self.assertEqual(result.mutations[0].after_fingerprint, "restored")
+
+    def test_an_unfinishable_restore_returns_only_the_still_quarantined_subset(self) -> None:
+        # T-5635 (3): the partial-restore record names what is STILL quarantined
+        mutation = self.applied()
+        original = json.loads(mutation.before["moved"])
+        self.assertGreaterEqual(len(original), 3)
+        real = seat_files_module.SeatFiles.rename_within
+        state = {"n": 0}
+        stranded = {}
+
+        def flaky(files, source, destination):
+            state["n"] += 1
+            if state["n"] == 3:
+                raise OSError("disk full")  # third restore fails -> undo the first two
+            if ".installer-quarantine-" in destination and not stranded and state["n"] > 3:
+                stranded["dest"] = destination
+                raise OSError("cannot re-quarantine")  # the undo of the LAST done pair fails
+            return real(files, source, destination)
+
+        with mock.patch.object(seat_files_module.SeatFiles, "rename_within", flaky):
+            result = self.execute(self.op(), rollback=[self.mutation_dict(mutation)])
+        self.assertFalse(result.ok)
+        self.assertEqual(len(result.mutations), 1)
+        partial = result.mutations[0]
+        self.assertEqual(partial.after_fingerprint, "partially-restored")
+        subset = json.loads(partial.before["moved"])
+        # the undo walks done in reverse, so the first undo is of the second restored pair
+        self.assertEqual(subset, [item for item in original if item != original[1]])
+        self.assertEqual({k: v for k, v in partial.before.items() if k != "moved"},
+                         {k: v for k, v in mutation.before.items() if k != "moved"})
+        # and that record drives a retried rollback to a fully restored tree
+        retried = self.execute(self.op(), rollback=[self.mutation_dict(partial)])
+        self.assertTrue(retried.ok, retried.evidence)
+        self.assertEqual(self.tree(), self.before)
 
     def test_a_re_created_original_refuses_the_whole_rollback(self) -> None:
         mutation = self.applied()
@@ -518,6 +711,51 @@ class SeatFilesMoveTests(_Case):
             self.files.rename_within(str(self.persona_root / "b"), destination)
         self.assertEqual(Path(destination).read_text(), "a")  # never replaced
         self.assertEqual((self.persona_root / "b").read_text(), "b")
+
+    def test_rename_within_refuses_a_destination_created_after_the_check(self) -> None:
+        # T-5635 (1): the existing-destination check races a seat process re-creating the
+        # file; the kernel-level NOREPLACE rename must still refuse, never overwrite
+        destination = self.persona_root / "dir" / "a"
+        destination.write_text("seat", encoding="utf-8")
+        real = seat_files_module.SeatFiles._final_stat
+
+        def blind_to_destination(files, parent, name):
+            return None if name == "a" and parent is not None and name == destination.name else real(files, parent, name)
+
+        (self.persona_root / "dir" / "src").write_text("moving", encoding="utf-8")
+        with mock.patch.object(seat_files_module.SeatFiles, "_final_stat", blind_to_destination):
+            with self.assertRaises(seat_files_module.SeatPathRefused):
+                self.files.rename_within(str(self.persona_root / "dir" / "src"), str(destination))
+        self.assertEqual(destination.read_text(), "seat")
+        self.assertEqual((self.persona_root / "dir" / "src").read_text(), "moving")
+
+    def test_rename_within_falls_back_only_when_renameat2_is_unsupported(self) -> None:
+        import ctypes
+        import errno as errno_module
+
+        def fake_returning(code):
+            def call(*_args):
+                ctypes.set_errno(code)
+                return -1
+            return call
+
+        source, destination = str(self.persona_root / "a"), str(self.persona_root / "dir" / "a")
+        for label, provider in (
+            ("no libc symbol", lambda: None),
+            ("EINVAL", lambda: fake_returning(errno_module.EINVAL)),
+            ("ENOSYS", lambda: fake_returning(errno_module.ENOSYS)),
+        ):
+            with self.subTest(label), mock.patch.object(seat_files_module, "_renameat2_function", provider):
+                self.files.rename_within(source, destination)  # fallback: check-then-rename
+                self.assertEqual(Path(destination).read_text(), "a")
+                self.files.rename_within(destination, source)  # and back for the next case
+        with mock.patch.object(
+            seat_files_module, "_renameat2_function", lambda: fake_returning(errno_module.EACCES)
+        ):
+            with self.assertRaises(OSError) as caught:
+                self.files.rename_within(source, destination)
+        self.assertEqual(caught.exception.errno, errno_module.EACCES)
+        self.assertEqual(Path(source).read_text(), "a")  # any other errno raises; no silent fallback
 
     def test_rename_within_refuses_absent_outside_and_symlinked_paths(self) -> None:
         outside = self.fixture.root / "outside"

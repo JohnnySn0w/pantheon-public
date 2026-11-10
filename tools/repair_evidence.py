@@ -14,6 +14,31 @@ Pure functions, no git, no state. RFC-004 sections implemented here:
     ticket is re-routed same-account or paged. Liveness and page are INJECTED
     callables (grants are BT4; this module never looks up the live fleet).
 
+ROUTE TABLE (T-5998; the three BT2/BT3b specs: faulted harness claude, account claude-fallback,
+``candidates=(RECOVERY_CANDIDATE,)`` = watchman@codex, ``any_live_fallback=(RECOVERY_CANDIDATE,)``).
+Liveness is BINARY (``org076_ports.make_liveness``): a deep-sleep / parked / modal watchman counts as
+NOT live, so its episodes go to Recovery (any_live) or page. ``requested`` is never passed by ``_route``.
+BEFORE T-5998 = the same table with no fallback column. Recovery = RECOVERY_CANDIDATE, live or not.
+
+  evidence     watchman   subject     BEFORE                  AFTER
+  not deferred live       other       other_harness watchman  other_harness watchman
+  not deferred live       recovery        other_harness watchman  other_harness watchman
+  not deferred live       watchman    page                    any_live recovery (Recovery live) / page
+  not deferred NOT live   other       page                    any_live recovery (Recovery live) / page
+  not deferred NOT live   recovery        page                    page (Recovery is the subject; the route record and
+                                                                  page body now carry excluded_subject=['recovery'],
+                                                                  kind/target unchanged)
+  not deferred NOT live   watchman    page                    any_live recovery (Recovery live) / page
+  deferred, origin claude-fallback (every existing spec), watchman live or not, any subject:
+                                      page                    page (fallback skipped: B(ii) declined)
+  deferred, origin codex-fallback (no existing spec; generic): same_account watchman if live, else page;
+                                      unchanged (the fallback is never consulted for deferred evidence).
+Registry specs (``REPAIR_CANDIDATES``) get ``any_live_fallback=()``: unchanged. The registry detectors'
+sample-FRESHNESS domains (``org076_sample_freshness.spec_for(..., detector=)``, candidates=(watchman,))
+DO get the Recovery any_live fallback; the registry DropDetector specs themselves do not. Known limit: the route
+is cached in the episode (``delivery.route``, including a ``page`` route), so a transient not-live
+reading at first routing pins that episode to its page route.
+
 Redaction patterns are copied (not imported -- chronicle drags in a lot) from:
   * ``tools/chronicle.py`` ``_CRED_PATTERNS`` (Authorization header, ``sk-`` keys)
   * ``tools/git_reconciler.py`` ``_redact`` (auth header with token scheme, URL
@@ -137,12 +162,39 @@ class Candidate:
 # codex-fallback). Every ORG-076 detector routes repair episodes here (T-5058).
 RECOVERY_CANDIDATE = Candidate("watchman", "codex", "codex-fallback")
 
+# RFC-004 section 5 (fault-domain matrix, codex row) / ORG-076 section 4: codex harness down -> the
+# claude repair tier (Recovery). T-5999 (BT5.0): the generic-detector repair set. Order matters: watchman
+# stays FIRST so a claude-faulted episode still routes other_harness -> watchman@codex, and a
+# codex-faulted one routes other_harness -> recovery@claude.
+# SCOPE (T-5999 Option A, refined by Recovery's T-5998 B(i)/B(ii) ruling): only the runner's drop-detector
+# REGISTRY specs use this set as ``candidates``. The BT2/BT3b specs (quota_probe_detector,
+# org076_sample_freshness, org076_meta) keep ``candidates=(RECOVERY_CANDIDATE,)`` and add Recovery ONLY as
+# ``any_live_fallback`` (any_live case, never same_account / deferred evidence).
+RECOVERY_CANDIDATE = Candidate("recovery", "claude", "claude-fallback")
+REPAIR_CANDIDATES = (RECOVERY_CANDIDATE, RECOVERY_CANDIDATE)
+
 
 @dataclasses.dataclass(frozen=True)
 class Route:
     kind: str                       # other_harness | any_live | same_account | page
     target: Candidate | None
     refused_cross_account: tuple[str, ...] = ()
+    excluded_subject: tuple[str, ...] = ()   # candidates dropped for being the episode's own subject
+
+
+_SUBJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")  # == quota_probe_detector.PERSONA_RE
+
+
+def subject_of(fault_id: object) -> "str | None":
+    """The persona an episode is ABOUT, parsed from a ``<kind>:<persona>`` fault_id (the last
+    ``:``-separated part; detector-scoped ids like ``<kind>:<detector>:<persona>`` also resolve to the
+    persona). Fault ids not in that shape (no ``:``, empty kind, a tail that is not a persona name, a
+    non-string) have NO subject: they get no exclusion and never raise. Example: the store-liveness
+    meta-detector's ``cycle-rate-low``."""
+    if not isinstance(fault_id, str):
+        return None
+    kind, sep, who = fault_id.rpartition(":")
+    return who if sep and kind and _SUBJECT_RE.match(who) else None
 
 
 def resolve_route(faulted_harness: str, candidates: Sequence[Candidate], *,
@@ -151,12 +203,30 @@ def resolve_route(faulted_harness: str, candidates: Sequence[Candidate], *,
                   evidence_deferred: bool = False,
                   origin_account: str | None = None,
                   requested: Candidate | None = None,
-                  subject: str = "ORG-076 repair route: no eligible repair target") -> Route:
-    """Pick the repair target. Never silently drops: no eligible target => ``page``."""
+                  subject: str = "ORG-076 repair route: no eligible repair target",
+                  episode_subject: str | None = None,
+                  any_live_fallback: Sequence[Candidate] = ()) -> Route:
+    """Pick the repair target. Never silently drops: no eligible target => ``page``.
+
+    ``episode_subject`` (T-5999, Recovery condition): the persona the episode is ABOUT (``subject_of`` its
+    fault_id). That candidate is removed from the pool BEFORE every route kind (requested,
+    other_harness, same_account, any_live): a seat never repairs itself. If nothing remains, the episode
+    PAGES. ``None`` => no exclusion (the pre-T-5999 behaviour). ``subject`` is the page's subject line.
+
+    ``any_live_fallback`` (T-5998, Recovery's B(i)): candidates consulted LAST, only when the normal pool
+    produced no live target AND the evidence is NOT deferred; the first live one that is not the
+    episode subject wins as ``any_live``. It never joins ``candidates``, so ``requested`` /
+    ``other_harness`` / ``same_account`` are untouched and a deferred ticket never reaches it (B(ii) stays
+    declined: no episode about Recovery's account routes to Recovery). See the route table in the module docstring."""
     refused: list[str] = []
     pool: list[Candidate] = list(candidates)
     if requested is not None and requested not in pool:
         pool.insert(0, requested)
+    excluded = tuple(c.name for c in pool if episode_subject is not None and c.name == episode_subject)
+    if excluded:
+        pool = [c for c in pool if c.name != episode_subject]
+        if requested is not None and requested.name == episode_subject:
+            requested = None
     if evidence_deferred:
         keep: list[Candidate] = []
         for c in pool:
@@ -167,12 +237,22 @@ def resolve_route(faulted_harness: str, candidates: Sequence[Candidate], *,
         pool = keep
     live = [c for c in pool if liveness(c)]
     if requested is not None and requested in live:
-        return Route("same_account" if evidence_deferred else "requested", requested, tuple(refused))
+        return Route("same_account" if evidence_deferred else "requested", requested, tuple(refused), excluded)
     other = [c for c in live if c.harness != faulted_harness]
     if other:
-        return Route("same_account" if evidence_deferred else "other_harness", other[0], tuple(refused))
+        return Route("same_account" if evidence_deferred else "other_harness", other[0], tuple(refused), excluded)
     if live:
-        return Route("same_account" if evidence_deferred else "any_live", live[0], tuple(refused))
-    page(subject, f"faulted_harness={faulted_harness} deferred={evidence_deferred} "
-                  f"refused_cross_account={sorted(refused)} candidates={[c.name for c in candidates]}")
-    return Route("page", None, tuple(refused))
+        return Route("same_account" if evidence_deferred else "any_live", live[0], tuple(refused), excluded)
+    if not evidence_deferred:  # T-5998 B(i): never for deferred evidence (B(ii) declined)
+        for c in any_live_fallback:
+            if c.name == episode_subject and episode_subject is not None:
+                excluded = excluded if c.name in excluded else (*excluded, c.name)
+                continue
+            if liveness(c):
+                return Route("any_live", c, tuple(refused), excluded)
+    body = (f"faulted_harness={faulted_harness} deferred={evidence_deferred} "
+            f"refused_cross_account={sorted(refused)} candidates={[c.name for c in candidates]}")
+    if excluded:
+        body += f" excluded_subject={list(excluded)}"
+    page(subject, body)
+    return Route("page", None, tuple(refused), excluded)

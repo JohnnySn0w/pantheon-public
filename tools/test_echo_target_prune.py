@@ -428,5 +428,195 @@ class PruneTest(unittest.TestCase):
         self.assertTrue(self.exists(".fingerprint", "echo-core-" + H_NEW))
 
 
+class CapTest(unittest.TestCase):
+    """--max-gb (T-6121): whole-profile clear, only when over the cap AND every lock is free."""
+
+    MB = 1024 * 1024
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.target = os.path.realpath(self.tmp.name)
+        self.p = os.path.join(self.target, "debug")
+        touch(os.path.join(self.p, ".cargo-lock"), b"")
+        patcher = mock.patch.object(ep, "atime_supported", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # hermetic: the real host may be building right now (the backstop scans /proc)
+        busy = mock.patch.object(ep, "cargo_process_running", return_value=None)
+        busy.start()
+        self.addCleanup(busy.stop)
+
+    def run_prune(self, **kw):
+        kw.setdefault("lock_timeout", 0.2)
+        return ep.prune_target(self.target, log=lambda *_: None, **kw)
+
+    def exists(self, *parts):
+        return os.path.lexists(os.path.join(self.p, *parts))
+
+    def _fill(self, profile, mb, name="serde", h=H_NEW):
+        make_unit(profile, name, h, 1)  # fresh: the normal prune keeps it
+        touch(os.path.join(profile, "deps", "big-%s.bin" % h), b"x" * (mb * self.MB), age_days=1)
+
+    def _cap(self, mb):
+        return mb / 1024.0
+
+    def _hold(self, profile):
+        fd = os.open(os.path.join(profile, ".cargo-lock"), os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def _release_ok(self, profile):
+        fd = ep.acquire_lock(profile, 0.2)
+        self.assertIsNotNone(fd, "lock leaked: %s" % profile)
+        os.close(fd)
+
+    def test_cap_keeps_every_cargo_lock_file(self):
+        # review of #1634: a live profile carries .cargo-lock (shared) plus
+        # .cargo-build-lock / .cargo-artifact-lock (exclusive builder-vs-builder);
+        # unlinking any of them swaps the inode under a waiting builder.
+        for name in (".cargo-build-lock", ".cargo-artifact-lock"):
+            touch(os.path.join(self.p, name), b"")
+        self._fill(self.p, 3)
+        out = self.run_prune(max_gb=self._cap(1))
+        self.assertEqual(out.cap["status"], "cleared")
+        self.assertEqual(sorted(os.listdir(self.p)),
+                         [".cargo-artifact-lock", ".cargo-build-lock", ".cargo-lock"])
+
+    def test_vanishing_file_during_the_size_walk_is_a_logged_skip_not_a_crash(self):
+        self._fill(self.p, 3)
+        with mock.patch.object(ep, "_target_bytes", side_effect=FileNotFoundError("gone")):
+            out = self.run_prune(max_gb=self._cap(1))
+        self.assertEqual(out.cap["status"], "skipped-measure")
+        self.assertTrue(self.exists("deps"))
+
+    def test_cli_exits_zero_when_the_size_walk_fails(self):
+        self._fill(self.p, 3)
+        with mock.patch.object(ep, "_target_bytes", side_effect=FileNotFoundError("gone")), \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            rc = ep.main(["--target", self.target, "--max-gb", "0.001", "--lock-timeout", "0.2"])
+        self.assertEqual(rc, 0)
+
+    def test_a_running_cargo_or_rustc_process_skips_the_cap(self):
+        self._fill(self.p, 3)
+        with mock.patch.object(ep, "cargo_process_running", return_value="rustc (pid 42)"):
+            out = self.run_prune(max_gb=self._cap(1))
+        self.assertEqual(out.cap["status"], "skipped-busy")
+        self.assertTrue(self.exists("deps"))
+        self._release_ok(self.p)
+
+    def test_cargo_process_running_reads_comm_under_a_proc_root(self):
+        with tempfile.TemporaryDirectory() as proc:
+            for pid, comm in (("1", "systemd"), ("7", "python3"), ("self", "x")):
+                touch(os.path.join(proc, pid, "comm"), (comm + "\n").encode())
+            self.assertIsNone(ep._scan_cargo(proc))
+            touch(os.path.join(proc, "99", "comm"), b"cargo\n")
+            self.assertIn("99", ep._scan_cargo(proc))
+            os.makedirs(os.path.join(proc, "100"))   # vanished/unreadable comm: ignored
+            self.assertIn("99", ep._scan_cargo(proc))
+
+    def test_over_cap_and_idle_clears_every_profile_but_keeps_lock_file(self):
+        rel = os.path.join(self.target, "release")
+        touch(os.path.join(rel, ".cargo-lock"), b"")
+        self._fill(self.p, 3)
+        self._fill(rel, 3, "tokio", H_OLD)
+        res = self.run_prune(max_gb=self._cap(2))
+        self.assertEqual(res.cap["status"], "cleared")
+        for prof in (self.p, rel):
+            self.assertEqual(sorted(os.listdir(prof)), [".cargo-lock"])
+            self._release_ok(prof)
+
+    def test_over_cap_with_one_lock_held_deletes_nothing_and_releases_others(self):
+        rel = os.path.join(self.target, "release")
+        touch(os.path.join(rel, ".cargo-lock"), b"")
+        self._fill(self.p, 3)
+        self._fill(rel, 3, "tokio", H_OLD)
+        self._hold(rel)
+        logs = []
+        res = ep.prune_target(self.target, lock_timeout=0.2, max_gb=self._cap(2), log=logs.append)
+        self.assertEqual(res.cap["status"], "skipped-locked")
+        self.assertTrue(self.exists("deps", "big-%s.bin" % H_NEW))
+        self.assertTrue(os.path.exists(os.path.join(rel, "deps", "big-%s.bin" % H_OLD)))
+        self._release_ok(self.p)
+        self.assertTrue(any("cap" in l and "build running" in l for l in logs))
+
+    def test_under_cap_does_nothing(self):
+        self._fill(self.p, 1)
+        res = self.run_prune(max_gb=1.0)
+        self.assertEqual(res.cap["status"], "under-cap")
+        self.assertTrue(self.exists("deps", "big-%s.bin" % H_NEW))
+
+    def test_cap_off_by_default(self):
+        self._fill(self.p, 3)
+        res = self.run_prune()
+        self.assertIsNone(res.cap)
+        self.assertTrue(self.exists("deps", "big-%s.bin" % H_NEW))
+
+    def test_noatime_refusal_unchanged_and_cap_not_attempted(self):
+        self._fill(self.p, 3)
+        with mock.patch.object(ep, "atime_supported", return_value=False):
+            with self.assertRaises(ep.Refused):
+                ep.prune_target(self.target, max_gb=0.001, log=lambda *_: None)
+            with mock.patch("sys.stderr"):
+                self.assertEqual(ep.main(["--target", self.target, "--max-gb", "0.001"]), 2)
+        self.assertTrue(self.exists("deps", "big-%s.bin" % H_NEW))
+
+    def test_dry_run_reports_but_deletes_nothing(self):
+        self._fill(self.p, 3)
+        res = self.run_prune(max_gb=self._cap(2), dry_run=True)
+        self.assertEqual(res.cap["status"], "would-clear")
+        self.assertTrue(self.exists("deps", "big-%s.bin" % H_NEW))
+        self._release_ok(self.p)
+
+    def test_dry_run_with_lock_held_reports_skip(self):
+        self._fill(self.p, 3)
+        self._hold(self.p)
+        res = self.run_prune(max_gb=self._cap(2), dry_run=True)
+        self.assertEqual(res.cap["status"], "skipped-locked")
+
+    def test_size_is_measured_after_normal_prune(self):
+        # stale unit is dropped by the normal prune, bringing the target under the cap
+        make_unit(self.p, "old", H_OLD, 30)
+        touch(os.path.join(self.p, "deps", "old-%s.bin" % H_OLD), b"x" * (3 * self.MB), age_days=30)
+        self._fill(self.p, 1)
+        res = self.run_prune(max_gb=self._cap(2))
+        self.assertEqual(res.cap["status"], "under-cap")
+        self.assertTrue(self.exists("deps", "big-%s.bin" % H_NEW))
+
+    def test_cli_locked_over_cap_exits_zero_and_clear_exits_zero(self):
+        self._fill(self.p, 3)
+        fd = self._hold(self.p)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(ep.main(["--target", self.target, "--max-gb", "0.001", "--lock-timeout", "0.2"]), 0)
+        self.assertIn("cap", out.getvalue())
+        self.assertTrue(self.exists("deps", "big-%s.bin" % H_NEW))
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ep.main(["--target", self.target, "--max-gb", "0.001"]), 0)
+        self.assertEqual(sorted(os.listdir(self.p)), [".cargo-lock"])
+
+    def test_cap_clear_lock_only_layout_is_valid_on_the_next_fire(self):
+        self._fill(self.p, 3)
+        args = ["--target", self.target, "--max-gb", "0.001", "--lock-timeout", "0.2"]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ep.main(args), 0)
+        self.assertEqual(sorted(os.listdir(self.p)), [".cargo-lock"])
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(ep.main(args), 0)
+        self.assertEqual(sorted(os.listdir(self.p)), [".cargo-lock"])
+
+    def test_lock_only_profile_with_unrecognized_content_is_refused(self):
+        touch(os.path.join(self.p, "not-a-cargo-lock"), b"do not touch")
+        with mock.patch("sys.stderr"), mock.patch("sys.stdout"):
+            self.assertEqual(ep.main(["--target", self.target, "--max-gb", "0.001"]), 2)
+        self.assertTrue(self.exists("not-a-cargo-lock"))
+
+    def test_cap_must_be_positive(self):
+        with self.assertRaises(ep.Refused):
+            ep.prune_target(self.target, max_gb=0, log=lambda *_: None)
+
+
 if __name__ == "__main__":
     unittest.main()

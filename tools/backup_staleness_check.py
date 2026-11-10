@@ -91,6 +91,48 @@ def installed_copy_drift(installed: Path = INSTALLED_SCRIPT, source: Path = SOUR
     return None
 
 
+# T-5993: the ORG-101 mirror leg imports _git_utils (and through it remote_resolve +
+# repos.yaml) from this root-owned lib copy, never from a claude-writable checkout.
+INSTALLED_LIB = Path("/usr/local/lib/pantheon-vps-backup")
+SOURCE_ROOT = Path(__file__).resolve().parent.parent
+LIB_FILES = ("tools/_git_utils.py", "tools/remote_resolve.py", "repos.yaml")
+LIB_REINSTALL_HINT = (
+    "sudo install -d -o root -g root -m 0755 " + str(INSTALLED_LIB) + "/tools && "
+    + " && ".join(
+        f"sudo install -o root -g root -m 0644 /home/claude/pantheon-config/{rel} {INSTALLED_LIB}/{rel}"
+        for rel in LIB_FILES)
+    + " && re-pin root's repos.yaml (tools/manifest_pin.py)"
+)
+
+
+def installed_lib_drift(lib: Path = INSTALLED_LIB, source_root: Path = SOURCE_ROOT,
+                        owner_uid: int = 0) -> str | None:
+    """Why root's installed mirror-leg lib cannot be trusted, or None. An ABSENT lib is
+    not drift: the leg is simply not installed and prints 'skipped' in the backup log.
+    Once present, both dirs must be owned by `owner_uid` with no group/world write bit
+    and not symlinks, and each LIB_FILES entry must pass installed_copy_drift against
+    its tracked source."""
+    lib = Path(lib)
+    if not os.path.lexists(lib):
+        return None
+    for d in (lib, lib / "tools"):
+        try:
+            st = os.lstat(d)
+        except OSError as exc:
+            return f"cannot stat {d} ({exc.__class__.__name__})"
+        if not stat.S_ISDIR(st.st_mode):
+            return f"{d} is not a directory (a symlink is refused)"
+        if st.st_uid != owner_uid:
+            return f"{d} is owned by uid {st.st_uid}, not {owner_uid}"
+        if st.st_mode & 0o022:
+            return f"{d} is group- or world-writable (mode {st.st_mode & 0o777:o})"
+    for rel in LIB_FILES:
+        why = installed_copy_drift(lib / rel, Path(source_root) / rel, owner_uid=owner_uid)
+        if why:
+            return why
+    return None
+
+
 def age_hours(iso_ts: str, now: dt.datetime) -> float:
     """Hours elapsed from an ISO-8601 UTC timestamp (e.g. 2026-08-12T03:30:03Z) to `now`."""
     then = dt.datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
@@ -123,8 +165,12 @@ def main(argv=None) -> int:
     if drift:
         print(f"DRIFT: {drift} — the root unit runs that copy, not the checkout. "
               f"Reinstall: {REINSTALL_HINT}", file=sys.stderr)
+    lib_drift = installed_lib_drift()
+    if lib_drift:
+        print(f"DRIFT: {lib_drift} — the backup's ORG-101 mirror leg imports that lib "
+              f"(T-5993). Reinstall: {LIB_REINSTALL_HINT}", file=sys.stderr)
     fresh = _freshness(args)
-    return 1 if drift else fresh
+    return 1 if (drift or lib_drift) else fresh
 
 
 def _freshness(args) -> int:

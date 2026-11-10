@@ -324,6 +324,19 @@ class Watcher:
         return 0
 
 
+
+def _collect_rc_note(rc: int) -> str | None:
+    """The watcher's stderr note for a collector run's exit code (T-6041).
+
+    health_collector.run exits 2 for three causes (an un-subscribable emitter
+    declaration, an unwritable out dir, a failed write) and prints the real cause
+    on stderr itself, so this note names the exit code and defers to that line
+    rather than guessing one cause. Any other rc needs no note.
+    """
+    if rc == 2:
+        return "health_watcher: health_collector exited 2 (cause on its stderr line above; tick will report)"
+    return None
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--out", type=Path, default=hc.DEFAULT_OUT)
@@ -335,8 +348,9 @@ def main(argv: list[str] | None = None) -> int:
 
     def collect_fn(mode: str) -> int:
         rc = hc.run(personas, reader=reader, out=args.out, mode=mode, lock_wait_s=0.0)
-        if rc == 2:
-            print("health_watcher: out dir not writable (tick will report)", file=sys.stderr, flush=True)
+        note = _collect_rc_note(rc)
+        if note:
+            print(note, file=sys.stderr, flush=True)
         return rc
 
     w = Watcher(build_specs(personas), collect_fn=collect_fn,

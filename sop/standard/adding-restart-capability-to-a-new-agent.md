@@ -129,7 +129,7 @@ Environment=PANTHEON_API_HEALTH_ENABLED=1
 The fresh session must read its `HANDOFF.md` + org context on boot. Two complementary mechanisms:
 
 - **SessionStart auto-read hook** — injects `Read /home/<user>/HANDOFF.md` as `additionalContext`. NOTE: `additionalContext` does NOT trigger a first turn; it seeds context for when one arrives. (Recovery has no such hook and reads HANDOFF manually per a MEMORY pointer — acceptable for an agent that's reliably kicked.)
-- **Post-restart kick** — `handoff_and_restart.sh` step 8 send-keys a directive ("Read HANDOFF.md, then post a status snapshot") into the fresh pane to actually trigger the first turn + an operator-visible surface.
+- **Post-restart kick** — `handoff_and_restart.sh` step 8 send-keys a directive ("Read HANDOFF.md, then continue the queued work; message the operator only if something needs him") into the fresh pane to actually trigger the first turn + an operator-visible surface.
 
 **Kick MUST be delivered via send-keys to the running bridge session — NOT as a launch-arg.** (See Gotchas.)
 

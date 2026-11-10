@@ -1,0 +1,32 @@
+# mailbox verify invariant list (T-5991; ORG-080 §2 / §6, ORG-081 D-11).
+#
+# DRAFT: signoff pending, D15 co-authorship with recovery, tracked on T-5991.
+# Evaluated by mailbox_handlers.VERIFY through the engine verify leg (T-5135 S1)
+# over the handler's own observation (the wrapped mailbox_onboard verify() report,
+# including its maildir_acl row, plus the simulated organ's substrate, maildir and
+# unit facts); the evaluator itself reads nothing from a host (the live getfacl read
+# is mailbox_onboard verify's, T-6009). A report row whose ok is not a bool counts as
+# failed under its invariant, never as a pass (T-6009). Bound to the contract's
+# legs.verify by invariant_list_id + invariant_list_digest. There is no Health1 emitter (ORG-081 D-11 a/c, T-5102);
+# this is the vocabulary it will report. The digest is list_digest() over
+# {id, invariants}; the status fields are not part of it.
+schema: pantheon-invariant-list/v0
+id: org.pantheon.mailbox/v1
+status: DRAFT
+co_author: recovery
+signoff: pending
+invariants:
+  - id: M1-hub-substrate
+    check: the hub substrate is present (the mailbox group, the hub-owner account and the hub root; host-substrate's families, ORG-082; observed here, never installed), any missing is failed
+  - id: M2-maildir-present
+    check: at least one bound persona is observed, every bound persona has its maildir and every mailbox_onboard hub.<sub> check is ok; an empty persona set, a missing maildir, a malformed verify report row or a missing verify report (could not evaluate) is failed
+  - id: M3-maildir-acl
+    check: every account in the mailbox group (the group database's supplementary members plus every account whose primary group it is, the hub owner included) has an effective rwx ACL entry, both access and default, on each bound persona's maildir and on its new/ and tmp/ (effective = the entry ANDed with the mask; the file owner is satisfied by its owner entry, which no mask touches); a missing or short entry, a mask that cuts the entry, or a path with no ACL observed is degraded, naming the account, the path and access or default (and the mask when it is the cause); a present maildir with no maildir_acl report row is degraded (could not evaluate); the maildir mode is not evaluated (02770 and group::--- grant the group nothing here)
+  - id: M4-group-membership
+    check: every bound persona's account passes the group_membership check (member of the mailbox group); failing, a bound persona with no group_membership row, or no verify report observed, is failed
+  - id: M5-wake-unit-sole
+    check: every sole-wake persona has its wake unit file present, managed by this component and enabled, and its wake_timer.enabled report check ok (both must hold); a foreign unit file, a disabled timer or a missing wake_timer.enabled row is failed
+  - id: M6-wake-unit-non-sole
+    check: no non-wake persona has its wake timer enabled (wake_timer.not_enabled ok); allowed secondary wakers are exempt; failing, a non-wake persona with no wake_timer.not_enabled row, or no verify report observed (could not evaluate), is failed
+  - id: M7-attestation-current
+    check: when an attestation is recorded, the current evidence equals it on every evidence key; any drifted key is degraded and named; no attestation recorded passes

@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from tools import assembly_resolver as ar
 from tools.assembly_resolver import CompatibilityRefusal, LifecyclePlan, LockedComponent, RefusalKind
@@ -45,6 +48,23 @@ from tools.repo_reconciler import (
     GitCheckoutProbe,
     RepoReconciler,
 )
+
+
+class DirectScriptEntrypoint(unittest.TestCase):
+    def test_literal_file_path_reaches_argument_parser_without_pythonpath(self):
+        script = Path(rr.__file__).resolve()
+        with tempfile.TemporaryDirectory() as raw:
+            result = subprocess.run(
+                [sys.executable, "-I", str(script), "--help"],
+                cwd=raw,
+                env={**os.environ, "PYTHONPATH": ""},
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("checkout-lifecycle reconciler", result.stdout)
+        self.assertIn("authorize", result.stdout)
 
 
 class _DictResolver:
@@ -1193,6 +1213,128 @@ class TestScopedPhase2Cutover(_BubbleSafe):
         with patch.object(pg.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
             self.assertIsNone(handler._remote_tips("--evil")); handler._remote_tips("/tmp/repo.git")
         self.assertEqual(run.call_args.args[0][:4], ["git", "ls-remote", "--", "/tmp/repo.git"])
+
+    def _capture_apply_argv(self, entry, remote_map, method):
+        """Run a private apply step with `_run_git` recorded (T-5502)."""
+        rec = self._reconciler([entry], remote_map)
+        calls: list[list[str]] = []
+
+        def fake_run(args, **_kwargs):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 1, "", "")
+
+        with patch.object(rr, "_run_git", side_effect=fake_run):
+            getattr(rec, method)(entry, "a" * 40, MagicMock())
+        return calls
+
+    def test_clone_and_fetch_argv_delimit_url_before_operands(self) -> None:
+        seat = self._path("seat")
+        url = "/tmp/repo.git"
+        clone = self._capture_apply_argv(self._entry("c", target_path=seat), {"demo": url}, "_do_clone")
+        self.assertEqual(clone[0], ["clone", "--branch", "main", "--", url, seat])
+        fetch = self._capture_apply_argv(self._entry("c", target_path=seat), {"demo": url}, "_do_ff_advance")
+        self.assertEqual(fetch[0], ["-C", seat, "fetch", "--", url, "refs/heads/main"])
+        pin = "b" * 40
+        pinned = self._capture_apply_argv(
+            self._entry("c", target_path=seat, tracking=None, pinned=pin), {"demo": url}, "_do_ff_advance"
+        )
+        self.assertEqual(pinned[0][:5], ["-C", seat, "fetch", "--", url])
+
+    def test_dash_operands_refused_and_git_never_invoked(self) -> None:
+        seat = self._path("seat")
+        cases = [
+            (self._entry("c", target_path=seat), {"demo": "-evil"}),
+            (self._entry("c", target_path=seat), {"demo": ""}),
+            (self._entry("c", target_path="-seat"), {"demo": "/tmp/repo.git"}),
+            (self._entry("c", target_path=seat, tracking="-evil"), {"demo": "/tmp/repo.git"}),
+        ]
+        for entry, remote_map in cases:
+            for method in ("_do_clone", "_do_ff_advance"):
+                with self.subTest(entry=entry.target_path, tracking=entry.mode.tracking, remote=remote_map["demo"], m=method):
+                    self.assertEqual(self._capture_apply_argv(entry, remote_map, method), [])
+
+    def test_pinned_wildcard_fallback_fetch_argv_delimits_url(self) -> None:
+        """T-6151: the fallback fetch is reached only when the exact-pin fetch fails."""
+        seat = self._path("seat"); url = "/tmp/repo.git"; pin = "b" * 40
+        calls = self._capture_apply_argv(
+            self._entry("c", target_path=seat, tracking=None, pinned=pin), {"demo": url}, "_do_ff_advance"
+        )
+        self.assertEqual(
+            calls,
+            [
+                ["-C", seat, "fetch", "--", url, "a" * 40],
+                ["-C", seat, "fetch", "--", url, "+refs/heads/*:refs/remotes/origin/*"],
+            ],
+        )
+
+    def _apply_step_receipt(self, entry, remote_map, method):
+        rec = self._reconciler([entry], remote_map)
+        calls: list[list[str]] = []
+
+        def fake_run(args, **_kwargs):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 1, "", "")
+
+        receipt = rr.ApplyReceipt(materialized=True)
+        with patch.object(rr, "_run_git", side_effect=fake_run):
+            getattr(rec, method)(entry, "a" * 40, receipt)
+        return receipt, calls
+
+    def test_unsafe_operand_refusal_lands_in_receipt_naming_entry_and_operand(self) -> None:
+        """T-6151: an apply-time operand refusal is typed, named, and secret-free."""
+        seat = self._path("seat")
+        cases = [
+            (self._entry("c", target_path=seat), {"demo": "-evil-secret"}, "url", RefusalKind.UNRESOLVED_SOURCE),
+            (self._entry("c", target_path=seat), {"demo": ""}, "url", RefusalKind.UNRESOLVED_SOURCE),
+            (self._entry("c", target_path="-seat"), {"demo": "/tmp/repo.git"}, "target_path", RefusalKind.LIFECYCLE_REFUSED),
+            (self._entry("c", target_path=seat, tracking="-evil"), {"demo": "/tmp/repo.git"}, "tracking", RefusalKind.LIFECYCLE_REFUSED),
+        ]
+        for entry, remote_map, operand, kind in cases:
+            for method in ("_do_clone", "_do_ff_advance"):
+                with self.subTest(operand=operand, url=remote_map["demo"], m=method):
+                    receipt, calls = self._apply_step_receipt(entry, remote_map, method)
+                    self.assertEqual(calls, [])
+                    self.assertEqual((receipt.installs, receipt.advances), ([], []))
+                    self.assertEqual(len(receipt.refused), 1)
+                    refusal = receipt.refused[0]
+                    self.assertEqual(refusal.kind, kind)
+                    self.assertEqual(refusal.subject_id, "c")
+                    self.assertIn(operand, refusal.detail)
+                    self.assertNotIn("secret", refusal.detail)
+                    self.assertNotIn("-evil", refusal.detail)
+
+    def test_unsafe_operand_refusal_roundtrips_and_blocks_rollback(self) -> None:
+        entry = self._entry("c", target_path="-seat")
+        receipt, _calls = self._apply_step_receipt(entry, {"demo": "/tmp/repo.git"}, "_do_clone")
+        receipt.checkout_id = "c"; receipt.target_path = "-seat"; receipt.action = rr.ACTION_CLONE
+        sealed = receipt.seal()
+        loaded = rr.ApplyReceipt.from_bytes(sealed.to_bytes())
+        self.assertEqual([r.as_text() for r in loaded.refused], [r.as_text() for r in sealed.refused])
+        self.assertEqual(loaded.receipt_digest, sealed.receipt_digest)
+        rec = self._reconciler([entry], {"demo": "/tmp/repo.git"})
+        with self.assertRaises(rr.ScopedAuthorizationError):
+            rec.rollback(loaded)
+
+    def test_apply_end_to_end_unsafe_target_path_reports_refusal(self) -> None:
+        """T-6151 end to end through apply(): target_path is checked only at apply time."""
+        remote = self._new_remote(); self._seed(remote)
+        entry = self._entry("c", target_path="-seat")
+        rec = self._reconciler([entry], {"demo": remote}, functional=True)
+        plan = rec.reconcile_checkout("c"); auth = rec.issue_authorization(plan, "c")
+        calls: list[list[str]] = []
+        original = rr._run_git
+
+        def spy(args, **kwargs):
+            calls.append(list(args))
+            return original(args, **kwargs)
+
+        with patch.object(rr, "_run_git", side_effect=spy):
+            receipt = rec.apply(plan, auth)
+        self.assertEqual([c for c in calls if c[0] in ("clone", "fetch")], [])
+        self.assertEqual((receipt.installs, receipt.advances), ([], []))
+        self.assertEqual([(r.subject_id, r.kind) for r in receipt.refused], [("c", RefusalKind.LIFECYCLE_REFUSED)])
+        self.assertIn("target_path", receipt.refused[0].detail)
+        self.assertEqual(json.loads(receipt.to_bytes())["refused"][0]["subject_id"], "c")
 
     def test_authorized_rehearsal_cli_real_git_integration_isolated(self) -> None:
         real_root = Path(__file__).resolve().parent.parent

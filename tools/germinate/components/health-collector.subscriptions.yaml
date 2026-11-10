@@ -1,0 +1,20 @@
+# Sidecar subscription rows for the health collector (T-5980; tools/health_subscriptions.py).
+#
+# The collector's subscription set is derived from registry emitter declarations. These
+# rows cover a component that IS a uniform Health1 emitter but declares no `emitter:` block
+# in its contract yet: the Action Broker's two services (ticket T-2920, not installed).
+# The rows RETIRE when action-broker declares an emitter with `endpoints:`; until then
+# deriving refuses a row whose registry_component has gained an emitter declaration.
+subscriptions:
+  - registry_component: action-broker
+    component_id: host-approval
+    interface: org.pantheon.Health1
+    bus_name: org.pantheon.HostApproval1
+    object_path: /org/pantheon/HostApproval1/Health
+    ticket: T-2920
+  - registry_component: action-broker
+    component_id: host-broker
+    interface: org.pantheon.Health1
+    bus_name: org.pantheon.HostBroker1
+    object_path: /org/pantheon/HostBroker1/Health
+    ticket: T-2920

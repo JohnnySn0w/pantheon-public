@@ -41,6 +41,14 @@
 #     `primary`). When set, the push tooling also pushes accepted writes to it, and
 #     falls back to it only when the primary is down (never when the primary merely
 #     refuses a push). Leave it off for a read-only pull-mirror.
+#   - A repo row may carry an optional `revision: <40 lowercase hex commit sha>` (ORG-081 §7,
+#     T-5113): the ratified commit an external component's `pantheon-component.yaml` is
+#     resolved at. Full sha only: a tag or branch moves, so a malformed value is refused when
+#     the manifest loads. `registry validate --resolve-external` fetches exactly that commit
+#     (read-only, into a scratch dir) and requires the registry row's `contract.repo_revision`
+#     to equal it. With no `revision`, an external row stays fail-closed. Readers that predate
+#     the key ignore it. Changing repos.yaml bytes (this field included) invalidates every
+#     seat's manifest hash pin, so re-pin per tools/manifest_pin.py.
 
 schema_version: 1
 

@@ -69,6 +69,25 @@ class VerdictTable(unittest.TestCase):
                 out = v(7200, port)
                 self.assertEqual((type(out), out.fault_id), (es.Unknown, "sample-freshness-journal-unreadable:specialist"))
 
+    def test_legacy_keys_are_unchanged_by_the_detector_parameter(self):  # T-5999
+        self.assertEqual(fr.domain_key("specialist"), "org076-sample-freshness:specialist")
+        self.assertEqual(fr.fault_silent("specialist"), "sample-freshness-silent:specialist")
+        self.assertEqual(fr.fault_unreadable("specialist"), "sample-freshness-journal-unreadable:specialist")
+        spec = fr.spec_for("specialist", "claude-fallback")
+        self.assertEqual((spec.detector, spec.domain_key), (fr.DETECTOR, "org076-sample-freshness:specialist"))
+
+    def test_detector_scoped_variant_uses_its_own_unit_domain_and_fault_ids(self):  # T-5999
+        self.assertEqual(fr.domain_key("specialist", "mail-x"), "org076-sample-freshness:mail-x:specialist")
+        p = FakePort(starts=[NOW - 1800])
+        out = fr.verdict("specialist", seen_epoch=NOW - fr.STALE_SECS - 1, now_epoch=NOW, account="claude", journal=p,
+                         uid_of=lambda a: 1001, detector="mail-x", unit_template="pantheon-mail-x@{persona}.service")
+        self.assertEqual((type(out), out.fault_id), (es.Unknown, "sample-freshness-silent:mail-x:specialist"))
+        self.assertEqual(p.calls[0][1], "pantheon-mail-x@specialist.service")
+        self.assertNotIn("PANTHEON_ORG076_QUOTA_DETECTOR", out.evidence)
+        bad = fr.verdict("specialist", seen_epoch=NOW - 7200, now_epoch=NOW, account="claude",
+                         journal=FakePort(control_ok=False), uid_of=lambda a: 1001, detector="mail-x")
+        self.assertEqual(bad.fault_id, "sample-freshness-journal-unreadable:mail-x:specialist")
+
     def test_unresolvable_account_is_unknown(self):
         out = fr.verdict("specialist", seen_epoch=NOW - 7200, now_epoch=NOW, account="nobody-here",
                          journal=FakePort(), uid_of=lambda a: None)

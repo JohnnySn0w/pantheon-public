@@ -30,7 +30,7 @@ connects to the real system bus; tests use private buses only.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterator, Protocol
+from typing import Callable, Iterator, Protocol
 
 from tools.host_control import wire
 from tools.host_control.approval_source import BrokerApprovalSource
@@ -38,6 +38,7 @@ from tools.host_control.contracts import (
     ApprovalUnavailable,
     HostControlError,
     PolicyDenied,
+    RateLimited,
     RegistryError,
     SubjectContext,
 )
@@ -46,6 +47,14 @@ from tools.host_control.operations import OperationService
 from tools.host_control.planner import HostPlanService
 from tools.host_control.ratelimit import BrokerRateLimits
 from tools.host_control.registry import SeatRegistry
+
+#: T-5644: ApprovalGet replies are deferred, so up to this many status queries
+#: per authenticated uid may be in flight at once. The per-uid read budget
+#: (30 burst, 5/s) bounds the RATE; this bounds the CONCURRENCY the approval
+#: service sees (each holds a 10s client timeout). Over the cap the call is
+#: refused with the existing RateLimited wire error, same message shape.
+MAX_APPROVAL_GET_INFLIGHT_PER_UID = 4
+MAX_APPROVAL_GET_INFLIGHT_TOTAL = 16
 
 try:  # pragma: no cover - exercised implicitly on every import
     import dbus
@@ -416,20 +425,139 @@ if DBUS_AVAILABLE:
             in_signature="s",
             out_signature="ss",
             sender_keyword="sender",
+            async_callbacks=("reply_cb", "error_cb"),
         )
         def ApprovalGet(
             self,
             approval_handle: str,
             sender: str | None = None,
-        ) -> tuple[str, str]:
+            reply_cb: Callable[..., None] | None = None,
+            error_cb: Callable[[BaseException], None] | None = None,
+        ) -> None:
+            # T-5644: a DEFERRED reply. The status query to the approval
+            # service never blocks the GLib main loop, so the approval
+            # service's PlanMetadata call-back into this broker is served
+            # while a status query is in flight.
+            #
+            # Interleaving analysis (phase 1 = identity, budget, pre-check;
+            # phase 2 = post-bind check in the reply handler). Before this
+            # change the two phases were atomic against every other handler
+            # because the loop was blocked; now any handler may run between
+            # them, all on this same loop thread. Every journal write a
+            # concurrent handler can make to ``operations`` (Apply, Rollback,
+            # Verify insert rows; cancel, authorize, dispatch, completion
+            # and manual_recovery UPDATE only ``state``, ``authority_record_id``,
+            # ``operation_json`` and ``updated_at``) leaves the columns the
+            # phase-2 predicate reads (subject_uid, subject_seat_id,
+            # approval_handle, plan_handle) untouched, and no code path
+            # DELETEs or re-keys an operations row. So the predicate is
+            # monotone: true at phase 1 stays true at phase 2, and a row
+            # that a concurrent Apply adds can only matter to a handle that
+            # the caller's own subject binding already scopes. Phase 2
+            # re-runs the FULL binding check on the live journal (never a
+            # phase-1 result), so were a row ever to vanish the reply would
+            # fail closed as UnknownHandle, the same text as an unknown
+            # handle (gate 15). Operation state (cancelled, completed) is
+            # not part of the answer, which is the grant's state from the
+            # approval service.
             uid = self._manager_call(sender, "ApprovalGet")
-            with self._mapped_errors():
-                subject = self._registry.subject_for_uid(uid)
-                state, summary = self._approval_status.approval_status(
-                    subject,
-                    str(approval_handle),
+            state = self._approval_get_state()
+            if (
+                state["total"] >= MAX_APPROVAL_GET_INFLIGHT_TOTAL
+                or state["by_uid"].get(uid, 0) >= MAX_APPROVAL_GET_INFLIGHT_PER_UID
+            ):
+                raise _wire_error(RateLimited("read request budget exhausted; retry later"))
+            state["total"] += 1
+            state["by_uid"][uid] = state["by_uid"].get(uid, 0) + 1
+            settled = False
+
+            def settle() -> bool:
+                """THE single release helper: frees the in-flight slot and
+                arms the reply exactly once. False means a previous path
+                already settled, so the caller must do nothing more."""
+
+                nonlocal settled
+                if settled:
+                    return False
+                settled = True
+                state["total"] -= 1
+                remaining = state["by_uid"].get(uid, 1) - 1
+                if remaining > 0:
+                    state["by_uid"][uid] = remaining
+                else:
+                    state["by_uid"].pop(uid, None)
+                return True
+
+            def fail(error: BaseException) -> None:
+                if not settle():
+                    return
+                error_cb(
+                    error
+                    if isinstance(error, dbus.exceptions.DBusException)
+                    else _wire_error(error)
                 )
-                return (str(state), str(summary))
+
+            def on_reply(reply: tuple[str, str]) -> None:
+                if settled:
+                    return
+                if state["closed"]:
+                    # late reply after close(): drop it. Nothing below may
+                    # touch the (torn-down) journal or connection.
+                    settle()
+                    return
+                try:
+                    # Phase 2 re-resolves authority: the registry can reload
+                    # between phases, so never reuse the phase-1 subject.
+                    try:
+                        current = self._registry.subject_for_uid(uid)
+                    except RegistryError as exc:
+                        raise _wire_error(PolicyDenied("subject_denied")) from exc
+                    if current != subject:
+                        raise _wire_error(PolicyDenied("subject_denied"))
+                    result = self._approval_status.finish_approval_status(
+                        current,
+                        str(approval_handle),
+                        reply,
+                    )
+                except Exception as exc:
+                    fail(exc)
+                    return
+                if settle():
+                    reply_cb(str(result[0]), str(result[1]))
+
+            try:
+                with self._mapped_errors():
+                    subject = self._registry.subject_for_uid(uid)
+                    begin = getattr(self._approval_status, "begin_approval_status", None)
+                    if begin is not None:
+                        begin(subject, str(approval_handle), on_reply, fail)
+                    else:
+                        # a source without the async seam (fakes, the
+                        # fail-closed fallback): blocking call, replied inline
+                        result = self._approval_status.approval_status(
+                            subject,
+                            str(approval_handle),
+                        )
+                        if settle():
+                            reply_cb(str(result[0]), str(result[1]))
+            except BaseException:
+                settle()
+                raise
+
+        def close(self) -> None:
+            """T-5644: broker shutdown. Pending ApprovalGet replies that
+            arrive afterwards are dropped without touching the journal."""
+
+            self._approval_get_state()["closed"] = True
+
+        def _approval_get_state(self) -> dict:
+            # Loop-thread only (no lock); created lazily so a bare test
+            # instance needs no __init__.
+            state = self.__dict__.get("_approval_get")
+            if state is None:
+                state = {"total": 0, "by_uid": {}, "closed": False}
+                self.__dict__["_approval_get"] = state
+            return state
 
         # ------------------------------------------------------------
         # org.pantheon.HostBroker1.ApprovalSource — approval uid ONLY

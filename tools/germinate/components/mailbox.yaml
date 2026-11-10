@@ -1,0 +1,46 @@
+# mailbox component contract (ORG-080 §2; T-5092, germination tranche GG).
+#
+# Wraps tools/mailbox_onboard.py (T-2683), unchanged, as an ORG-080 component:
+# the planner (mailbox.py) plans over mailbox_onboard verify()'s own report,
+# which the SIMULATED handler (mailbox_handlers.py) produces by running the tool
+# over a throwaway materialization of the simulated organ. No live handler
+# exists; nothing here actuates a host (HO ask boundary on T-5092).
+#
+# * install: observe-and-attest (T-5947). A healthy, already-running organ gets
+#   ONE mailbox.adopt-attest op binding the legacy verify evidence; a matching
+#   rerun plans nothing; healthy drift re-attests; unhealthy evidence refuses.
+#   Greenfield: per-persona maildir and sole-path wake-unit provision ops (the
+#   tool's two provision legs, seat privilege, run as the hub-owner / persona).
+# * configure: converge provisionable drift (a new persona, a missing unit).
+# * remove: retire sole-path wake units and the engine attestation only; never
+#   a maildir or the hub (ORG-052 gate 34). Gate mailbox-retire.
+# * the hub substrate (group, hub-owner, linger, hub root) is host-substrate's
+#   (ORG-082 families), hence depends_on; this component only observes it.
+# * update and repair are not declared (the engine refuses leg-not-declared).
+# * verify is bound to the DRAFT invariant list org.pantheon.mailbox/v1 (M1-M7;
+#   mailbox.invariants.yaml), signoff pending (recovery, D15), tracked on T-5991. It is
+#   evaluated by mailbox_handlers.VERIFY over the handler's own observation. No
+#   emitter block: no Health1 emitter exists for mailbox (ORG-081 D-11, T-5102).
+component:
+  id: mailbox
+  steward: orchestrator
+  version: 1
+  planner_kind: python
+  contract_digest: sha256:3db8779ccfa2663c9f5addaa6f714421fb355f9fe408547b1deb99c961b19cf2
+  handlers_digest: sha256:06b72a4b4a5c6a9b0a43c02b8406ffea087b2d730710d2d97b324cb692bfc084
+  depends_on: [host-substrate]
+  scopes: [system]
+  invariant_list_id: org.pantheon.mailbox/v1
+  invariant_list_digest: sha256:1b10f148f52bc39329000383eb178e289d1f0811289e7249e3b007220a931451
+  privilege:
+    seat: [mailbox.maildir-provision, mailbox.wake-unit-install, mailbox.wake-unit-retire, mailbox.adopt-attest, mailbox.attest-retire]
+  legs:
+    install: plan_install
+    configure: plan_configure
+    remove: plan_remove
+    verify:
+      invariant_list_ref: org.pantheon.mailbox/v1@sha256:1b10f148f52bc39329000383eb178e289d1f0811289e7249e3b007220a931451
+  gates:
+    - {id: mailbox-retire, irreversible: false, note: "retires sole-path wake units and the engine attestation; never deletes a maildir or the hub (ORG-052 gate 34)", approval: {class: operator}}
+  receipts:
+    schema: pantheon-receipt/v1

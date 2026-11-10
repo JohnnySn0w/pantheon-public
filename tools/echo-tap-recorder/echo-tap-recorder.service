@@ -6,6 +6,11 @@
 [Unit]
 Description=Echo read-only tap recorder to /var/lib/pantheon/echo-evidence/tap (T-5260)
 Documentation=file:%h/pantheon-config/tools/echo-tap-recorder/README.md
+# T-6352: ~52 min of continuous failure (30 starts/h under the Service-section backoff) ends in
+# ONE latched failed state (OnFailure alert where wired; failed_unit_reconcile sees it
+# regardless) instead of an unbounded loop. Recover: reset-failed + start.
+StartLimitIntervalSec=3600
+StartLimitBurst=30
 
 [Service]
 Type=simple
@@ -17,6 +22,10 @@ ExecStart=/usr/bin/python3 %h/.local/lib/echo-tap-recorder/echo_tap_recorder.py
 # again every 10 s. Fix the cause, then systemctl --user restart.
 Restart=always
 RestartSec=10
+# T-6352: exponential restart backoff (10,16,27,44,73,120s). NRestarts is cumulative
+# (resets only on a manual start/restart), so 120s is also the steady per-crash delay.
+RestartSteps=5
+RestartMaxDelaySec=120
 RestartPreventExitStatus=1 2
 # On SIGTERM the script sends DISCONNECT, then fsyncs and closes the file. A
 # handshake read notices the stop within 0.25 s; the worst case is a connect

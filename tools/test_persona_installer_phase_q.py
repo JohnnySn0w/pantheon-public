@@ -77,6 +77,9 @@ KEPT_FILES = (
 )
 
 
+SESSION = "recovery-session"  # T-5612: the seat tmux session the quarantine op names
+
+
 def current_user() -> str:
     return pwd.getpwuid(os.geteuid()).pw_name
 
@@ -85,7 +88,7 @@ def make_q_op(root: str) -> InstallOperation:
     return InstallOperation(
         operation_id=QID, layer=1, kind=QKIND, target=f"{root}/{PERSONA}",
         precondition={"state": "must-pass"},
-        desired={"persona_state_root": root, "persona": PERSONA, "timer": TIMER},
+        desired={"persona_state_root": root, "persona": PERSONA, "timer": TIMER, "tmux_session": SESSION},
         inverse=None, privilege="operator-required", owner=current_user(),
         provenance={"install_root": "/"},
     )
@@ -121,6 +124,14 @@ class SimQDriver:
             self.backend.unreadable_units.add(unit)
         else:
             self.backend.unit_active_states[unit] = state
+
+    def set_pane(self, state) -> None:
+        self.backend.live_panes.discard(SESSION)
+        self.backend.unreadable_panes.discard(SESSION)
+        if state == "live":
+            self.backend.live_panes.add(SESSION)
+        elif state is None:
+            self.backend.unreadable_panes.add(SESSION)
 
     def put_file(self, rel: str, text: str = "{}") -> None:
         self.backend.seed_file(f"{self.root}/{rel}", text, "0600")
@@ -169,6 +180,15 @@ class LocalQDriver:
         patcher = mock.patch.object(_pim, "_quarantine_stamp", return_value=STAMP)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # T-5612: the pane read is stubbed at the shared reader (its argv/uid/socket shape has its
+        # own tests); default absent == today's behaviour
+        self.pane = "absent"
+        pane_patch = mock.patch.object(_act, "read_seat_pane_state", side_effect=lambda *a, **k: self.pane)
+        pane_patch.start()
+        self.addCleanup(pane_patch.stop)
+
+    def set_pane(self, state) -> None:
+        self.pane = state
 
     def _read_unit(self, unit, purpose):
         state = self.unit_states.get(unit, "inactive")
@@ -361,6 +381,46 @@ class QuarantineContract:
             self.execute()
         self.assertEqual(self.snapshot(), before)
 
+    def test_failed_controller_with_a_live_pane_is_refused_naming_the_pane(self) -> None:
+        # T-5612: the FAILED unit does not prove the pane is gone
+        self.seed_full()
+        before = self.snapshot()
+        self.set_unit_state(self.CONTROLLER, "failed")
+        self.set_unit_state(self.CONSUME, "inactive")
+        self.set_pane("live")
+        result = self.backend.preflight(self.op)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.classification, "conflicting")
+        self.assertIn(SESSION, result.detail)
+        self.assertIn("live pane", result.detail)
+        with self.assertRaises(OperationFailed):
+            self.execute()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_unreadable_pane_is_refused_and_nothing_moves(self) -> None:
+        self.seed_full()
+        before = self.snapshot()
+        self.set_pane(None)
+        result = self.backend.preflight(self.op)
+        self.assertFalse(result.ok)
+        self.assertIn("unreadable", result.detail)
+        with self.assertRaises(OperationFailed):
+            self.execute()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_absent_pane_with_inactive_units_is_admitted_as_before(self) -> None:
+        self.seed_full()
+        self.set_pane("absent")
+        self.assertEqual(self.backend.preflight(self.op).classification, "ready")
+        mutation, _ = self.execute()
+        self.assertTrue(mutation.changed)
+
+    def test_enabled_timer_with_a_live_pane_is_still_the_converged_noop(self) -> None:
+        self.seed_full()
+        self.set_pending(False)
+        self.set_pane("live")
+        self.assertEqual(self.backend.preflight(self.op).classification, "converged")
+
     def test_inactive_or_failed_controller_does_not_block(self) -> None:
         self.seed_full()
         for state in ("inactive", "failed"):
@@ -429,7 +489,12 @@ class QuarantineContract:
 
 
 class SimulatedQuarantineTests(QuarantineContract, SimQDriver, unittest.TestCase):
-    pass
+    def test_plan_without_a_tmux_session_is_refused(self) -> None:
+        self.seed_full()
+        desired = {k: v for k, v in self.op.desired.items() if k != "tmux_session"}
+        result = self.backend.preflight(dataclasses.replace(self.op, desired=desired))
+        self.assertFalse(result.ok)
+        self.assertIn("unreadable", result.detail)
 
 
 class LocalQuarantineTests(QuarantineContract, LocalQDriver, unittest.TestCase):
@@ -767,7 +832,11 @@ class PlanShapeTests(PeriodicCase):
         self.assertNotIn(TID, {o.operation_id for o in broker.operations})
         self.assertIn(QID, {o.operation_id for o in broker.operations})
         self.assertNotIn(QID, {o.operation_id for o in residue})
-        self.assertLessEqual(len(residue), SEAT_LOCAL_RESIDUE_LIMIT)
+        # T-5961 (orchestrator ruling on B8): the fleet-usage periodic-timer ops are a separate bucket
+        from tools.host_control.planner import residue_bucket_counts
+
+        self.assertLessEqual(residue_bucket_counts((o.kind, o.target) for o in residue)[0],
+                             SEAT_LOCAL_RESIDUE_LIMIT)
 
     def test_trust_then_quarantine_precede_every_launch_and_the_fire(self) -> None:
         self.set_manifest(legacy_ho_resumer_manifest())  # T-5633: the decommission is declared-only
@@ -786,7 +855,11 @@ class PlanShapeTests(PeriodicCase):
         self.assertEqual(q.desired, {
             "persona_state_root": str(home / ".local" / "state" / "pantheon" / "personas"),
             "persona": "recovery", "timer": "pantheon-persona-consume@recovery.timer",
+            "tmux_session": "pantheon-recovery",
         })
+        # T-5612: the pane the quarantine guards is the pane the fire launches (one resolver)
+        fire = self.op(plan, "connective.unit-fire")
+        self.assertEqual(fire.desired["tmux_target"].partition(":")[0], q.desired["tmux_session"])
         self.assertEqual(t.target, str(home / ".claude.json"))
         self.assertEqual(t.desired, {"project_path": str(home / "pantheon-config"), "key": KEY})
         self.assertEqual(self.plan("recovery").digest, plan.digest)  # no time-varying input

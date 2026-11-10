@@ -109,7 +109,7 @@ _EVENT_MAP: dict[str, str] = {
 CONSUME_STATES = frozenset({"active", "inactive", "failed", "unknown"})
 PANE_STATES = frozenset({"idle", "busy", "modal", "unknown"})
 # ORG-106 L4a (T-5527): the seat-state record's state. An unread record is "active" (fail-open).
-SEAT_STATES = frozenset({"active", "paused-intake", "deep-sleep"})
+SEAT_STATES = frozenset({"active", "paused-intake", "deep-sleep", "halted"})  # T-5868
 
 _IDENT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _RUNTIME_RE = re.compile(r"^[a-z0-9-]+/[a-z0-9-]+$")

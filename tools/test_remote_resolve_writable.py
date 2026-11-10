@@ -69,6 +69,9 @@ class WritableParseTest(unittest.TestCase):
     # reviewed step that switches on its write path; anything else must stay off.
     WRITABLE_ALLOWLIST = {
         ("pantheon-config", "https://pantheon-fleet@git.your-self-hosted-git.example/github-mirror/pantheon-config.git"),
+        # T-5993 (the operator TG 9190): root's VPS backup, written to the EXISTING reconciler copy
+        # github-mirror/pantheon-vps-backup (main protected; vps-backup = write collaborator).
+        ("pantheon-vps-backup", "https://vps-backup@git.your-self-hosted-git.example/github-mirror/pantheon-vps-backup.git"),
     }
 
     def test_live_repos_yaml_writable_only_on_allowlist(self):

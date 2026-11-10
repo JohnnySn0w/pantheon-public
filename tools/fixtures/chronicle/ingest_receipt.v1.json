@@ -1,0 +1,16 @@
+{
+ "file": "seatx/2026-01-02/2026-01-02T030405.123456Z-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.md",
+ "ingested_utc": "2026-01-03T04:05:06Z",
+ "memex_commit": "0123456789abcdef0123456789abcdef01234567",
+ "memex_record_ids": [
+  "sessions:seatx-handoff-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-2026-01-02t030405.123456z",
+  "sessions:seatx-session-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+ ],
+ "raw_dest": "/srv/chronicle-raw/seatx/2026-01-02/2026-01-02T030405.123456Z-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.md",
+ "raw_sha256_verified": true,
+ "schema": "chronicle-ingest-receipt/v1",
+ "seat": "seatx",
+ "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+ "size": 4746,
+ "supersedes": []
+}

@@ -7,6 +7,10 @@ as the ``receipt_payload`` of a T-3336 WAL receipt, so the WAL's intent-digest
 binding and immutability apply to it unchanged. Broker-only fields (plan
 handle, subject, approval) are absent: on the broker path the broker journal
 stays the receipt owner (T-2917 5a).
+
+``authority`` (T-5233) is always present: ``{gate_id, scope,
+authority_record_id}`` for an op an independent-agent grant authorized, else
+``null``. The grant (approval) handle is never recorded.
 """
 
 from __future__ import annotations
@@ -30,8 +34,10 @@ BODY_KEYS = frozenset(
         "evidence_scope",
         "mutation",
         "evidence",
+        "authority",
     }
 )
+AUTHORITY_KEYS = frozenset({"gate_id", "scope", "authority_record_id"})
 
 
 class ReceiptError(ValueError):
@@ -89,9 +95,11 @@ def build_body(
     evidence_scope: str,
     mutation: MutationRecord,
     evidence: OperationEvidence,
+    authority: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     if mutation.operation_id != op_id or evidence.operation_id != op_id:
         raise ReceiptError("mutation/evidence op id disagrees with the receipt op id")
+    _check_authority(authority)
     return {
         "schema": SCHEMA,
         "run_id": run_id,
@@ -105,10 +113,21 @@ def build_body(
         "evidence_scope": evidence_scope,
         "mutation": mutation_to_json_obj(mutation),
         "evidence": evidence_to_json_obj(evidence),
+        "authority": None if authority is None else dict(authority),
     }
+
+
+def _check_authority(authority: Any) -> None:
+    if authority is None:
+        return
+    if not (isinstance(authority, Mapping) and set(authority) == AUTHORITY_KEYS):
+        raise ReceiptError("receipt authority must be null or exactly {gate_id, scope, authority_record_id}")
+    if not all(isinstance(v, str) and v for v in authority.values()):
+        raise ReceiptError("receipt authority fields must be non-empty strings")
 
 
 def validate_body(body: Mapping[str, Any]) -> None:
     if set(body) != BODY_KEYS or body.get("schema") != SCHEMA:
         raise ReceiptError(f"receipt body is not {SCHEMA}")
     mutation_from_json_obj(body["mutation"])
+    _check_authority(body["authority"])

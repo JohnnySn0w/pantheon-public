@@ -989,6 +989,29 @@ class BrokerJournal:
         ).fetchone()
         return row is not None
 
+    def subject_operation_binds_plan(
+        self,
+        *,
+        subject: SubjectContext,
+        approval_handle: str,
+        plan_handle: str,
+    ) -> bool:
+        """True iff one of ``subject``'s own operations carries
+        ``approval_handle`` AND is an operation on ``plan_handle`` (T-4875:
+        the plan-bound half of ApprovalGet subject binding; the grant's
+        plan comes from the approval service's status reply).
+
+        Read-only, single SELECT, no DDL; exact equality on every column.
+        """
+
+        connection = self._require_open()
+        row = connection.execute(
+            "SELECT 1 FROM operations WHERE subject_uid=? AND "
+            "subject_seat_id=? AND approval_handle=? AND plan_handle=? LIMIT 1",
+            (subject.uid, subject.seat_id, approval_handle, plan_handle),
+        ).fetchone()
+        return row is not None
+
     def load_operation_unbound(self, operation_handle: str) -> OperationRecord:
         """Broker-internal recovery read; never expose on a public surface."""
 

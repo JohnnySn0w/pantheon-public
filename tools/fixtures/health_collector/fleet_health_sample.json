@@ -1,0 +1,137 @@
+{
+  "collected_at": 1800000000,
+  "collector": {
+    "component_id": "health-collector",
+    "duration_ms": 2,
+    "entry_count": 5,
+    "mode": "signal",
+    "read_ok_count": 2
+  },
+  "entries": [
+    {
+      "account": null,
+      "bus_class": "system",
+      "component_id": "host-approval",
+      "contract_revision": null,
+      "current_status": null,
+      "health_leg": "unreachable",
+      "invariant_list_digest": null,
+      "invariant_list_id": null,
+      "kind": "host_service",
+      "persona": null,
+      "reachability": "no_service",
+      "reasons": [],
+      "registry_component": "action-broker",
+      "seat_state": null,
+      "security_drift": null,
+      "subcomponents": {},
+      "viability": null
+    },
+    {
+      "account": null,
+      "bus_class": "system",
+      "component_id": "host-broker",
+      "contract_revision": null,
+      "current_status": null,
+      "health_leg": "unreachable",
+      "invariant_list_digest": null,
+      "invariant_list_id": null,
+      "kind": "host_service",
+      "persona": null,
+      "reachability": "denied",
+      "reasons": [],
+      "registry_component": "action-broker",
+      "seat_state": null,
+      "security_drift": null,
+      "subcomponents": {},
+      "viability": null
+    },
+    {
+      "account": "suborch2",
+      "bus_class": "session",
+      "component_id": "persona-controller.artisan",
+      "contract_revision": null,
+      "current_status": null,
+      "health_leg": "unreachable",
+      "invariant_list_digest": null,
+      "invariant_list_id": null,
+      "kind": "persona_controller",
+      "persona": "artisan",
+      "reachability": "unreachable",
+      "reasons": [],
+      "registry_component": "harness-manager",
+      "seat_state": null,
+      "security_drift": null,
+      "subcomponents": {},
+      "viability": null
+    },
+    {
+      "account": "claude",
+      "bus_class": "session",
+      "component_id": "persona-controller.orchestrator",
+      "contract_revision": null,
+      "current_status": "not_configured",
+      "health_leg": "absent",
+      "invariant_list_digest": null,
+      "invariant_list_id": null,
+      "kind": "persona_controller",
+      "persona": "orchestrator",
+      "reachability": "ok",
+      "reasons": [],
+      "registry_component": "harness-manager",
+      "seat_state": {
+        "expires": "2026-10-24T00:00:00Z",
+        "fault": false,
+        "owner": "operator",
+        "reason": "e2e pinned stub",
+        "sources": [
+          "seat-state"
+        ],
+        "state": "paused-intake"
+      },
+      "security_drift": null,
+      "subcomponents": {},
+      "viability": {
+        "active_runtime_present": true,
+        "modal_kind": "session-limit",
+        "modal_present": true,
+        "viability_status": "viable"
+      }
+    },
+    {
+      "account": "claude-fallback",
+      "bus_class": "session",
+      "component_id": "persona-controller.recovery",
+      "contract_revision": null,
+      "current_status": "not_configured",
+      "health_leg": "absent",
+      "invariant_list_digest": null,
+      "invariant_list_id": null,
+      "kind": "persona_controller",
+      "persona": "recovery",
+      "reachability": "ok",
+      "reasons": [],
+      "registry_component": "harness-manager",
+      "seat_state": {
+        "expires": "2026-10-24T00:00:00Z",
+        "fault": false,
+        "owner": "operator",
+        "reason": "e2e pinned stub",
+        "sources": [
+          "seat-state"
+        ],
+        "state": "paused-intake"
+      },
+      "security_drift": null,
+      "subcomponents": {},
+      "viability": {
+        "active_runtime_present": true,
+        "modal_kind": "session-limit",
+        "modal_present": true,
+        "viability_status": "viable"
+      }
+    }
+  ],
+  "schema": "pantheon-fleet-health/1",
+  "schema_version": 1
+}

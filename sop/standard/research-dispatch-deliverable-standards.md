@@ -55,6 +55,8 @@ Any deliverable that **relays a claim sourced from a prior artifact** — a watc
 
 **Worked examples (2026-06-16):** T-1162 (AHE eval) caught the watch report's "UC Berkeley" attribution (actually Fudan/Peking/Shanghai) and its "top aggregate success" overstatement — surfaced in a CONFLICT section, not buried. The 2026-06-15 claim batch (Fable suspension; opus/sonnet-4-*snapshot* retirement) was over-doubted twice though both were true — the over-skepticism failure mode this standard guards against.
 
+A claim with a recorded Standard 5 spot-check verdict can be cited by that verdict; an OVER-BROAD or UNSUPPORTED verdict is relayed only with the correction stated.
+
 **When Standard 3 does NOT apply:** fresh-discovery deliverables where no prior artifact framed the claim (the agent found it itself, primary-source-first) — there's no relaying artifact to conflict-check against, though per-claim `[UNVERIFIED]` tagging still applies.
 
 ## Standard 4 — Cyber/exploit-sensitive research isolates raw detail to Sonnet subagents (never the Opus orchestrator)
@@ -84,6 +86,8 @@ Any research or claim-verification on a **security/cyber-sensitive topic** — `
 Every **ad-hoc Agent-tool dispatch whose deliverable is a file** gets a **files-on-disk check** (exists, non-empty, expected shape/frontmatter) before its result is used or relayed; every **decision-changing claim** in a dispatch report gets **one primary-source spot-check**. This generalizes what `tools/watch_runner.py` already enforces structurally for cron'd dispatches (file-exists + frontmatter) to the dispatches nothing enforces. Role-defining for any orchestrator-tier agent (HO, Specialist, PO tier).
 
 **Why:** LLM self-reports are optimized to sound complete — fluency is an anti-signal, not evidence (arXiv 2606.09863 false-success finding; same family as the standing `feedback_dispatch_brief_claims_are_unverified` + `feedback_no_fabricated_tool_results` pins). The report saying "written to X" is a claim, not an artifact.
+
+**Watch-fire refinement: independent-recomputation spot-check** *(T-4877, from the T-4572 pilot).* For a watch or reporting fire that is above-bar, files follow-up tickets, or makes a legal, financial or commercial recommendation, the dispatching tier runs an independent recomputation before the fire files tickets or lets a conclusion stand: sample 3-5 load-bearing interpretive or synthesis claims (not verbatim quotes), give a fresh verifier only the claim text and its cited source, record SUPPORTED / REFINEMENT / OVER-BROAD / UNSUPPORTED, and carry the running hit rate in the report frontmatter and ticket trail. Routine fires with no follow-ups are exempt; topics risk-tagged `"spot_check": "always"` in `tools/watch_runner.py` TOPIC_POLICY are checked every fire. Record it as the frontmatter key `spot_check: sampled=N supported=a refinement=b over_broad=c unsupported=d verifier=<agent>`; the runner counts it only when the counts are non-negative ints summing to `sampled`. Why: the pilot measured 3/18 corrections, all interpretive, none in about 8 quotes.
 
 ## Common failure modes
 

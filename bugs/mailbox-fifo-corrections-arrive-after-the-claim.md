@@ -1,6 +1,6 @@
 ---
 symptom: "You consume the mailbox in-order and act on message N. Message N+1 was a correction of N — the sender caught the error and followed up. You have already acted on the wrong claim. The mailbox drain is strictly FIFO by write-time: `mailbox_consume` returns items sorted by their `<ns-epoch>.<pid>.<seq>.<sender>` id prefix, and a same-turn correction is always written LATER than the claim it corrects. So the correct handling is guaranteed to arrive AFTER the incorrect one, and any act-per-message loop that does not read to the tail before acting will act on stale claims."
-fix: "Drain the whole queue into memory FIRST, then decide. The consume tool description already reminds you of this at drain time (`QUEUED, oldest first — READ THIS BEFORE ACTING ON ANY ONE OF THEM. Delivery is FIFO, so a correction is always consumed AFTER the claim it corrects`) — the trap fires when you re-enter the drain later in the turn without re-reading the notification, or when you act inline in a per-message handler. If a later subject in the same drain retracts an earlier one, honour the later one. This is a property of shared mailbox infrastructure, not of any one seat's discipline — it fires for every recipient of every multi-message sender, and it fires hardest for whoever is least expecting it."
+fix: "Drain the whole queue into memory FIRST, then decide. The consume tool description already reminds you of this at drain time (`QUEUED, oldest first — READ THIS BEFORE ACTING ON ANY ONE OF THEM. Delivery is FIFO, so a correction is always consumed AFTER the claim it corrects`) — the trap fires when you re-enter the drain later in the turn without re-reading the notification, or when you act inline in a per-message handler. If a later subject in the same drain retracts an earlier one, honour the later one. A drain cannot see a correction not sent yet: when the act explicitly depends on a second verifier, keep the hold until that response arrives and re-drain before release. This is a property of shared mailbox infrastructure, not of any one seat's discipline — it fires for every recipient of every multi-message sender, and it fires hardest for whoever is least expecting it."
 domain: pantheon, mailbox, mcp, fifo, ordering, correction, drain, act-per-message
 ---
 
@@ -58,6 +58,11 @@ for m in final:
 corrections in `new/` where the next re-consume will fire them against a state the
 previous turn already mutated on the wrong claim.
 
+**Boundary: a drain cannot see a correction that has not been sent yet.** When the requested
+act explicitly depends on a second reviewer, clone, or evidence source, keep a hold until that
+response arrives and re-drain before releasing it. An empty queue tail proves only that no later
+message is pending *now*; it is not positive approval from an expected verifier.
+
 ## Why this doesn't belong in one seat's handoff
 
 The rule is a property of shared infrastructure that every mailbox consumer inherits
@@ -79,6 +84,20 @@ But `supersedes=` cannot fire once the prior message has been drained to `cur/`,
 the sender doesn't know which state the recipient is in. So a follow-up in-flight in
 `new/` is the *common* case; the FIFO-drain-then-decide discipline is the belt to the
 `supersedes=` suspenders.
+
+## Verification
+
+T-6238 reproduced the acted-then-corrected shape on 2026-11-06. Specialist consumed Watchman's
+v3 review request as mailbox record
+`01793940593522219160.1995914.000000.watchman`, verified the evidence available in its
+clone, and recorded an APPROVE. Recovery's authoritative correction arrived later as
+`01793941058758885788.2021463.000001.recovery` — a strictly higher FIFO id, 465 seconds after
+the original request — and proved the same exact commit still had six NEW findings in a
+different clone shape. T-6238's transition log therefore shows the observable consequence:
+the earlier APPROVE followed by a CORRECTION / REBOUND and merge-gate closure. The later
+message had not been sent at the original drain, so drain-then-decide alone could not prevent
+the earlier action. The required protection was the explicit do-not-merge hold until the
+cross-clone peer replied, followed by another drain before releasing that hold.
 
 ## Discovered
 

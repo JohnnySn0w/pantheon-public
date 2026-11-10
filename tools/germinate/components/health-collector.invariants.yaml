@@ -1,0 +1,48 @@
+# health-collector verify invariant list (T-5102; ORG-080 §6, ORG-076 §5.5 / RFC-004 §5.5).
+#
+# status: DRAFT, signoff pending (D15; recovery co-author), tracked on T-5102.
+# Recovery signed DRAFT 2026-11-02, mail 01793645670714493278 (HC-1..HC-8; the HC-6
+# threshold of 180 s = 3 x 60 s collector ticks, measured max gap 61.1 s,
+# AccuracySec 5 s; the HC-8 expected-unreachable set below).
+#
+# Evaluated by health-collector_handlers.VERIFY through the engine verify leg
+# (T-5135 S1), over the handler's observation. HC-5..HC-7 read fleet-health.json
+# through tools/health_collector_check.py, the ONE staleness rule the
+# out-of-domain witness (T-5978) also runs. No emitter block: the collector has no
+# Health1 emitter of its own (D5 option (i), Recovery-confirmed; a waiver on ORG-081
+# D-11 (a)); its self-health is the aggregate heartbeat plus the witness.
+# The digest is list_digest() over {id, invariants}; the status fields above and
+# below are not part of it.
+schema: pantheon-invariant-list/v0
+id: org.pantheon.health-collector/v1
+status: DRAFT
+co_author: recovery
+signoff: pending
+invariants:
+  - id: HC1-unit-templates
+    check: pantheon-health-collector.service, pantheon-health-collector.timer and pantheon-health-watcher.service are installed byte-equal (sha256) to their tools/systemd/ templates
+  - id: HC2-timer-enabled
+    check: pantheon-health-collector.timer is enabled (the stateless 60 s poll backstop)
+  - id: HC3-watcher-active
+    check: pantheon-health-watcher.service is enabled and active (the PropertiesChanged subscribing leg)
+  - id: HC4-out-dir
+    check: /run/pantheon-health is present, mode 2750, group pantheon-health (root tmpfiles; observed, never installed by this component, T-5982)
+  - id: HC5-aggregate-shape
+    check: fleet-health.json is present, readable and well formed per tools/health_collector_check.py (missing, unreadable or malformed fails)
+  - id: HC6-aggregate-fresh
+    check: fleet-health.json collected_at is at most 180 s old per tools/health_collector_check.py (3 x 60 s ticks)
+    max_age_secs: 180
+  - id: HC7-collector-mode
+    check: fleet-health.json collector.mode is poll, signal or startup per tools/health_collector_check.py
+  - id: HC8-reachability
+    check: every fleet-health.json entry has reachability ok except exactly the expected_unreachable set; an unlisted unreachable entry is degraded, a listed component_id missing from the subscription set is degraded, and a listed component_id observed reachable is degraded (remove it from the list)
+    expected_unreachable:
+      - component_id: host-approval
+        reason: the Action Broker approval service is not installed; its Health1 monitor_uids (the collector's uid) are unwired until the supervised root install
+        ticket: T-2920
+      - component_id: host-broker
+        reason: the Action Broker host broker is not installed; its Health1 monitor_uids (the collector's uid) are unwired until the supervised root install
+        ticket: T-2920
+      - component_id: persona-controller.codex
+        reason: codex's PersonaController1 health leg is not reachable by the collector on the codex account's session bus (live aggregate 2026-11-02, Recovery)
+        ticket: T-5992

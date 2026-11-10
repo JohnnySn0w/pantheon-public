@@ -54,6 +54,7 @@ from tools.harness_adapter.hermes_render import (
 # re-exported here for H1 importers.
 from tools.harness_adapter.integration import HermesIntegration
 from tools.harness_adapter.provider_quota import (
+    DEEPSEEK_BALANCE_BASE_URL,
     DeepSeekBalanceObserver,
     read_deepseek_balance,
 )
@@ -750,8 +751,19 @@ class HermesHarnessAdapter(PantheonHarnessAdapter):
             except ValueError:
                 thresholds = None  # the observer then reports balance_band=unknown
         env_file = self.hermes_home / _ENV_FILENAME
+        base_url = self.launch.native.get("base_url") if self.launch is not None else None
+        key_holding_proxy = (
+            isinstance(base_url, str)
+            and base_url.startswith("https://deepseek-proxy.invalid:")
+            and base_url.endswith("/v1")
+        )
+        balance_base_url = base_url if key_holding_proxy else DEEPSEEK_BALANCE_BASE_URL
         return DeepSeekBalanceObserver(
-            lambda: read_deepseek_balance(env_file),
+            lambda: read_deepseek_balance(
+                env_file,
+                base_url=balance_base_url,
+                key_holding_proxy=key_holding_proxy,
+            ),
             profile=f"hermes/{profile}",
             thresholds=thresholds,
         )

@@ -135,6 +135,7 @@ CLOSURE_ENTRY_MODULES: Final = (
     "tools.host_control.telegram_ingress.main",
     "tools.host_plan_producer",  # T-5533 registration step
     "tools.persona_bringup",  # executor direct-fire runs it with python3 -I from the copy
+    "tools.germinate.seat_child",  # T-6167 PR-4: the root launcher's seat child, python3 -I -B -c from the copy
 )
 
 #: Non-Python files the copy must carry, each with the reader that needs it.
@@ -144,6 +145,8 @@ CLOSURE_DATA_FILES: Final = (
     ("registry/systems.yaml", "load_repo_op_registry (runtime_table.load_checkout_op_registry)"),
     ("instance.yaml", "agent_role_map import-time read; executor direct-fire --manifest"),
     ("tools/mcp_allowlist.yaml", "persona_installer and host-broker MCP admission gate"),
+    # T-5961: the fleet-usage periodic timer instance of a codex seat is its appserver seat name
+    ("harness/codex/appserver_seats.json", "persona_installer _fleet_usage_seat (codex fleet-usage timer instance)"),
 )
 CLOSURE_DATA_DIRS: Final = (
     # (dir, file suffix filter or "", reader). Top-level files only.
@@ -320,13 +323,20 @@ class InstallManifest:
     def file(self, key: str) -> str:
         return self.doc["files"][key]["path"]
 
+    @property
+    def protocol_test_seat_ids(self) -> tuple[str, ...]:
+        """The only seats whose installer plans are registered with the broker
+        (ORG-052 section 8 clarification, #1665): disposable protocol-test seats."""
+
+        return tuple(self.doc["plan_registration"]["protocol_test_seat_ids"])
+
 
 def parse_manifest(raw: bytes) -> InstallManifest:
     """Validate the closed ``pantheon-host-broker-install/v1`` manifest."""
 
     doc = load_json_strict(raw, "manifest")
     top = ("schema", "revision", "status", "accounts", "account_defaults", "groups", "paths", "files", "executables",
-           "framework", "mailbox_hub", "approvers", "refs", "packages_verify", "runtimes", "producer")
+           "framework", "mailbox_hub", "approvers", "refs", "packages_verify", "runtimes", "producer", "plan_registration")
     _closed("manifest", doc, top)
     if doc["schema"] != MANIFEST_SCHEMA:
         raise InstallPlanError(f"manifest schema must be {MANIFEST_SCHEMA}")
@@ -443,6 +453,18 @@ def parse_manifest(raw: bytes) -> InstallManifest:
         if (spec["prefix"], spec["launcher"]) != (fixed["prefix"], fixed["launcher"]):
             raise InstallPlanError(f"runtimes.{key}.launcher and .prefix are fixed literals (Recovery D15): "
                                    f"{fixed['prefix']}, {fixed['launcher']}")
+
+    # ORG-052 section 8 clarification (#1665): the broker is sudo-on-behalf for running
+    # seats; seat installation is the germination engine's. Production seat plans are
+    # NOT registered; only a disposable protocol-test seat named here is (ORG-052 E37).
+    plan_reg = _closed("plan_registration", doc["plan_registration"], ("protocol_test_seat_ids",))
+    test_ids = plan_reg["protocol_test_seat_ids"]
+    if not isinstance(test_ids, list) or not all(isinstance(s, str) and _SEAT_ID_RE.match(s) for s in test_ids):
+        raise InstallPlanError("plan_registration.protocol_test_seat_ids: must be a list of seat ids")
+    if len(set(test_ids)) != len(test_ids):
+        raise InstallPlanError("plan_registration.protocol_test_seat_ids: duplicates are refused")
+    if set(test_ids) & set(approvers["seat_ids"]):
+        raise InstallPlanError("plan_registration.protocol_test_seat_ids: an approver seat cannot be a protocol-test seat")
 
     producer = _closed("producer", doc["producer"], ("user", "group", "via"))
     if (producer["user"], producer["group"], producer["via"]) != ("nobody", "nogroup", "setpriv"):
@@ -1122,6 +1144,37 @@ def _state_dir(unit_text: str) -> str:
     return "/var/lib/" + _unit_value(unit_text, "StateDirectory")[0]
 
 
+def _instance_role_identities(repo_root: Path) -> tuple[set[str], set[int]]:
+    """Every instance.yaml role identity (account name, uid): data, not persona names."""
+
+    doc = yaml.safe_load((repo_root / "instance.yaml").read_text(encoding="utf-8"))
+    roles = (doc or {}).get("roles") if isinstance(doc, dict) else None
+    accounts: set[str] = set()
+    uids: set[int] = set()
+    for spec in (roles or {}).values():
+        if not isinstance(spec, dict):
+            continue
+        if isinstance(spec.get("account"), str):
+            accounts.add(spec["account"])
+        uid = (spec.get("identity") or {}).get("uid") if isinstance(spec.get("identity"), dict) else None
+        if isinstance(uid, int) and not isinstance(uid, bool):
+            uids.add(uid)
+    return accounts, uids
+
+
+def _check_protocol_test_seats(m: InstallManifest, registry: SeatRegistryInput, repo_root: Path) -> None:
+    ids = m.protocol_test_seat_ids
+    if not ids:
+        return
+    accounts, uids = _instance_role_identities(repo_root)
+    for seat_id in ids:
+        seat = registry.seat(seat_id)  # a marker id absent from the registry is refused
+        if seat.account in accounts or seat.uid in uids:
+            raise InstallPlanError(
+                f"plan_registration.protocol_test_seat_ids: seat {seat_id!r} account or uid is an instance.yaml role "
+                "identity: a production seat is never a protocol-test seat (ORG-052 section 8, #1665)")
+
+
 def build_plan(manifest: InstallManifest, registry: SeatRegistryInput, repo_root: Path = REPO_ROOT,
                *, tracked: frozenset[str] | None = None,
                closure: Closure | None = None,
@@ -1141,6 +1194,7 @@ def build_plan(manifest: InstallManifest, registry: SeatRegistryInput, repo_root
             raise InstallPlanError(f"seat {seat.seat_id}: account or uid collides with a service account")
     for seat_id in m.doc["approvers"]["seat_ids"]:
         registry.seat(seat_id)
+    _check_protocol_test_seats(m, registry, repo_root)
     template_ids = sorted({t for rec in registry.manifests for t in rec["template_ids"]})
     if closure is None:
         if tracked is None:
@@ -1354,7 +1408,7 @@ def build_plan(manifest: InstallManifest, registry: SeatRegistryInput, repo_root
     registry_bytes = (canonical(registry.doc) + "\n").encode("ascii")
     b.add(id=f"registry:{m.file('seat_registry')}", phase="P5", kind="registry", path=m.file("seat_registry"),
           owner="root", group="root", mode="0644", content=registry_bytes, source=tool("install-file"),
-          after=[f"dir:{m.path('broker_etc')}"], inputs={"stage": "pre-registration (plans absent)"})
+          after=[f"dir:{m.path('broker_etc')}"], inputs={"stage": "pre-registration (plans absent; production seats register none, #1665)"})
     b.add(id=f"registry:{m.file('approver_policy')}", phase="P5", kind="registry", path=m.file("approver_policy"),
           owner="root", group="root", mode="0644", deferred=f"approver identities and policy are operator-only ({m.doc['files']['approver_policy']['ref']})",
           source=tool("install-file", restart_after="pantheon-host-approval.service"),
@@ -1380,11 +1434,17 @@ def build_plan(manifest: InstallManifest, registry: SeatRegistryInput, repo_root
                   "owner_uid": m.account("ingress")["uid"], "ticket": "T-2919"})
 
     # P6 plan registration (T-5533 a-d) --------------------------------------
+    # Only seats in plan_registration.protocol_test_seat_ids are registered with the
+    # broker (ORG-052 section 8 clarification, #1665; seat installation is the
+    # germination engine's). Zero such seats: no P6 entries at all.
     staging = m.path("producer_staging")
     producer = m.doc["producer"]
     reg_ids = []
+    test_ids = set(m.protocol_test_seat_ids)
     for rec in registry.manifests:
         for seat in registry.seats:
+            if seat.seat_id not in test_ids:
+                continue
             out = posixpath.join(staging, f"{seat.seat_id}-{rec['revision']}.json")
             dest = posixpath.join(m.path("broker_plans"), f"{seat.seat_id}-{rec['revision']}.json")
             argv = [SETPRIV, f"--reuid={producer['user']}", f"--regid={producer['group']}", "--clear-groups",
@@ -1400,16 +1460,19 @@ def build_plan(manifest: InstallManifest, registry: SeatRegistryInput, repo_root
                   after=[f"framework:{closure.rev}", f"registered-manifest:{rec['revision']}", f"dir:{staging}",
                          f"registry:{m.file('seat_registry')}"],
                   inputs={"producer_writes": out, "expected_writer": f"{producer['user']}:{producer['group']}",
-                          "root_side_checks": list(PRODUCER_ROOT_CHECKS)})
-    dir_entry("producer_run_root", "P6")
-    dir_entry("producer_staging", "P6", [f"dir:{m.path('producer_run_root')}"],
-              source=tool("install-d-fresh", must_not_exist=True, remove_after_registration=True,
-                          why="host_plan_producer opens --out O_EXCL as the producer user; it has no stdout or fd "
-                              "output mode, and its source stays unchanged"))
-    b.add(id=f"registry-post:{m.file('seat_registry')}", phase="P6", kind="registry_post_registration",
-          path=m.file("seat_registry"), owner="root", group="root", mode="0644",
-          deferred="pre-registration bytes plus the printed {seat_id, manifest_revision, path, sha256} records",
-          source=tool("append-plan-records"), after=reg_ids)
+                          "protocol_test_seat": True, "root_side_checks": list(PRODUCER_ROOT_CHECKS)})
+    # the units wait on the final registry state: registry-post, or the pre-registration entry when none
+    registry_final = f"registry-post:{m.file('seat_registry')}" if reg_ids else f"registry:{m.file('seat_registry')}"
+    if reg_ids:  # no protocol-test seat: no producer dirs, no registry-post, the registry keeps no plans key
+        dir_entry("producer_run_root", "P6")
+        dir_entry("producer_staging", "P6", [f"dir:{m.path('producer_run_root')}"],
+                  source=tool("install-d-fresh", must_not_exist=True, remove_after_registration=True,
+                              why="host_plan_producer opens --out O_EXCL as the producer user; it has no stdout or fd "
+                                  "output mode, and its source stays unchanged"))
+        b.add(id=f"registry-post:{m.file('seat_registry')}", phase="P6", kind="registry_post_registration",
+              path=m.file("seat_registry"), owner="root", group="root", mode="0644",
+              deferred="pre-registration bytes plus the printed {seat_id, manifest_revision, path, sha256} records",
+              source=tool("append-plan-records"), after=reg_ids)
 
     # P7 bus policies, units, activation --------------------------------------
     def family_file(kind: str, family: str, dest_dir: str, basename: str, content: bytes, stage_dir: str,
@@ -1492,7 +1555,7 @@ def build_plan(manifest: InstallManifest, registry: SeatRegistryInput, repo_root
                                 "pantheon-host-approval-telegram-ingress.service")):
         b.add(id=f"unit_enable:{name}", phase="P9", kind="unit_enable", path=UNIT_DIR + name,
               source={"route": "family", "family": "unit.system.enable", "params": {"unit": name, "state": "enabled"}},
-              after=[f"unit:{name}", f"registry-post:{m.file('seat_registry')}", *order[name]],
+              after=[f"unit:{name}", registry_final, *order[name]],
               hold="D3 P9: ingress start is outward-facing" if "ingress" in name else None, sub=sub)
         text = dist_bytes(repo_root, name).decode("utf-8")
         state = _state_dir(text)
@@ -1706,9 +1769,11 @@ def name_rows(manifest: InstallManifest, repo_root: Path = REPO_ROOT) -> list[di
         row("path", label, path, path, minted, "code + reinstall: root-owned file rewritten by a new plan; no data")
     token = posixpath.join(m.path("ingress_credentials"), "bot-token")
     row("path", "Telegram bot-token file (0600, parent 0700)", token, token, "T-2919", "re-place the credential + CredentialRef")
-    for key, label in (("broker_plans", "registered plans dir"), ("broker_manifests", "registered manifests dir"),
-                       ("producer_run_root", "producer run root (root:root 0755)"),
-                       ("producer_staging", "producer staging dir (fresh per run, nobody:nogroup 0700)")):
+    path_rows = [("broker_plans", "registered plans dir"), ("broker_manifests", "registered manifests dir")]
+    if m.protocol_test_seat_ids:  # producer dirs exist in the plan only with a protocol-test seat
+        path_rows += [("producer_run_root", "producer run root (root:root 0755)"),
+                      ("producer_staging", "producer staging dir (fresh per run, nobody:nogroup 0700)")]
+    for key, label in path_rows:
         row("path", label, m.path(key), m.path(key), "T-2920 U1", "no: regenerated per framework update")
     for name, minted in zip(STATIC_UNITS, ("T-2912", "T-2913", "T-2919")):
         state = _state_dir(dist_bytes(repo_root, name).decode("utf-8"))
@@ -1741,7 +1806,7 @@ def name_rows(manifest: InstallManifest, repo_root: Path = REPO_ROOT) -> list[di
 def names_document(manifest: InstallManifest, repo_root: Path = REPO_ROOT) -> dict[str, Any]:
     return {"schema": NAMES_SCHEMA, "manifest_revision": manifest.revision, "generator": "tools/host_broker_install.py names",
             "rows": name_rows(manifest, repo_root),
-            "out_of_scope": "the ORG-052 wire vocabulary (error names, journal events, evidence labels; ADR :1129-1159) "
+            "out_of_scope": "the ORG-052 wire vocabulary (error names, journal events, evidence labels; ADR §Provisional wire names) "
                             "is not install surface; its canonical table is tools/host_control/README.md "
                             "'Provisional names pending ratification'"}
 
@@ -1753,8 +1818,8 @@ def names_markdown(doc: Mapping[str, Any]) -> str:
         f"GENERATED by `{doc['generator']}` from `tools/host_broker_install.manifest.example.json` "
         f"(revision `{doc['manifest_revision']}`). Do not hand-edit; regenerate and commit.",
         "",
-        "Every account, group, bus name and path the T-2920 install leg creates or names. ORG-052 :1121 and "
-        ":1129-1134 keep these provisional: ratification authorizes implementation, not enablement or "
+        "Every account, group, bus name and path the T-2920 install leg creates or names. ORG-052 §Ratification surface (item 12) and "
+        "§Provisional wire names keep these provisional: ratification authorizes implementation, not enablement or "
         "specific grants. The proposed final value equals the provisional one unless the row says otherwise. "
         "\"Rename later is a migration\" says what renaming after the first install costs.",
         "",

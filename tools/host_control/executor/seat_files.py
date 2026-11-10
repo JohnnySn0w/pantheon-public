@@ -32,6 +32,8 @@ reads, ``lexists`` and ``list_dir``.
 from __future__ import annotations
 
 import base64
+import ctypes
+import ctypes.util
 import errno
 import hashlib
 import os
@@ -80,6 +82,53 @@ def parse_mode(raw: object, default: str) -> int:
     if mode & ~0o777:
         raise SeatPathRefused("file mode carries setuid, setgid or sticky bits")
     return mode
+
+
+# T-5635: renameat2(RENAME_NOREPLACE) closes the window between the
+# existing-destination check and the rename (a seat process re-creating the
+# destination there would otherwise be silently replaced).
+_RENAME_NOREPLACE: Final[int] = 1
+_RENAMEAT2_UNSUPPORTED: Final[frozenset[int]] = frozenset((errno.EINVAL, errno.ENOSYS))
+_renameat2_cache: list = []
+
+
+def _renameat2_function():
+    """The libc ``renameat2`` callable, or None when this libc lacks it."""
+
+    if not _renameat2_cache:
+        function = None
+        try:
+            libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+            function = libc.renameat2
+            function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+            function.restype = ctypes.c_int
+        except (OSError, AttributeError):
+            function = None
+        _renameat2_cache.append(function)
+    return _renameat2_cache[0]
+
+
+def _rename_noreplace(source: str, destination: str, source_fd: int, destination_fd: int) -> bool:
+    """Rename relative to the two directory descriptors, atomically refusing
+    an existing destination. True when renameat2 did the move; False when it
+    is unsupported here (no libc symbol, EINVAL or ENOSYS: the caller falls
+    back to check-then-rename, which keeps the race). Any other errno raises;
+    EEXIST is a ``SeatPathRefused``."""
+
+    function = _renameat2_function()
+    if function is None:
+        return False
+    result = function(
+        source_fd, os.fsencode(source), destination_fd, os.fsencode(destination), _RENAME_NOREPLACE
+    )
+    if result != -1:
+        return True
+    code = ctypes.get_errno()
+    if code in _RENAMEAT2_UNSUPPORTED:
+        return False
+    if code == errno.EEXIST:
+        raise SeatPathRefused("move destination already exists; never replaced")
+    raise OSError(code, os.strerror(code))
 
 
 class SeatFiles:
@@ -571,7 +620,11 @@ class SeatFiles:
         an EXISTING destination (never replaced). Once the rename has
         committed, a failing directory sync raises ``SeatChangeIncomplete``.
         The destination check and the rename share the destination parent's
-        descriptor; only the seat's own uid can write under its seat root."""
+        descriptor, and the rename is renameat2 RENAME_NOREPLACE, so a
+        destination created after the check is still refused. Only where
+        renameat2 is unsupported does it fall back to check-then-rename, which
+        keeps that window (only the seat's own uid can write under its seat
+        root)."""
 
         source_parts = self._relative(source)
         destination_parts = self._relative(destination)
@@ -591,12 +644,15 @@ class SeatFiles:
                 self._check_owner(existing, "move source")
                 if self._final_stat(destination_parent, destination_parts[-1]) is not None:
                     raise SeatPathRefused("move destination already exists; never replaced")
-                os.rename(
-                    source_parts[-1],
-                    destination_parts[-1],
-                    src_dir_fd=source_parent,
-                    dst_dir_fd=destination_parent,
-                )
+                if not _rename_noreplace(
+                    source_parts[-1], destination_parts[-1], source_parent, destination_parent
+                ):
+                    os.rename(  # unsupported renameat2: the check above is all there is
+                        source_parts[-1],
+                        destination_parts[-1],
+                        src_dir_fd=source_parent,
+                        dst_dir_fd=destination_parent,
+                    )
                 # committed: the entry moved
                 self._sync_committed(destination_parent, "entry moved")
                 self._sync_committed(source_parent, "entry moved")

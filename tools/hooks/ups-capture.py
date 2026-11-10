@@ -35,7 +35,7 @@ RECORD (one JSON object):
   capture_schema, ticket, hook_basename, label,
   clock{utc, wall_ns, monotonic_ns, boot_id},
   process{pid, ppid, uid, cwd, argv, python},
-  stdin{bytes, utf8, raw, raw_b64, json, json_error, read_hit_deadline},
+  stdin{bytes, utf8, raw, raw_b64, json, json_error, read_hit_deadline, read_error},
   env{...}, env_redacted_names[...],
   emit{enabled, reason, until, shape, stdout},
   elapsed_ms, errors[...]
@@ -102,7 +102,7 @@ import base64
 import json
 import os
 import re
-import select
+import selectors
 import sys
 import time
 from datetime import datetime, timezone
@@ -151,32 +151,52 @@ def _clean(s: str) -> str:
     return s.encode("utf-8", "replace").decode("utf-8", "replace")
 
 
+# T-5872: set by read_stdin_bounded when the read ended on a genuine error (as
+# opposed to EOF / deadline), so main() can record it without changing the
+# function's 2-tuple return shape. None = no error.
+LAST_READ_ERROR: str | None = None
+
+
 def read_stdin_bounded(fd: int | None, deadline_s: float = STDIN_DEADLINE_SECONDS) -> tuple[bytes, bool]:
     """Read fd to EOF or until deadline_s elapses. Returns (data, hit_deadline).
 
-    fd None (stdin closed at startup) -> (b"", False). Never raises.
+    fd None (stdin closed at startup) -> (b"", False). Never raises (fail-open),
+    but a genuine read error is NOT silent (T-5872): partial data is returned,
+    a line goes to stderr, and LAST_READ_ERROR is set so the capture record
+    carries `stdin.read_error` and a failed read is distinguishable from empty.
+
+    Uses selectors (poll), not select.select(): the latter raises ValueError
+    for any fd >= FD_SETSIZE (1024), which used to be swallowed into b"".
     """
+    global LAST_READ_ERROR
+    LAST_READ_ERROR = None
     if fd is None:
         return b"", False
     data = bytearray()
     hit_deadline = False
     deadline = time.monotonic() + deadline_s
     try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                hit_deadline = True
-                break
-            readable, _, _ = select.select([fd], [], [], remaining)
-            if not readable:
-                hit_deadline = True
-                break
-            chunk = os.read(fd, STDIN_CHUNK_BYTES)
-            if not chunk:
-                break  # EOF
-            data.extend(chunk)
-    except (OSError, ValueError):
-        pass  # partial data is still data; the record notes what we got
+        with selectors.PollSelector() as sel:
+            sel.register(fd, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    hit_deadline = True
+                    break
+                if not sel.select(remaining):
+                    hit_deadline = True
+                    break
+                chunk = os.read(fd, STDIN_CHUNK_BYTES)
+                if not chunk:
+                    break  # EOF
+                data.extend(chunk)
+    except (OSError, ValueError) as exc:
+        # partial data is still data; the record notes what we got + the error
+        LAST_READ_ERROR = f"{type(exc).__name__}: {exc}"
+        try:
+            sys.stderr.write(f"ups-capture: stdin read error after {len(data)} bytes: {LAST_READ_ERROR}\n")
+        except Exception:
+            pass
     return bytes(data), hit_deadline
 
 
@@ -375,11 +395,16 @@ def main(
             except Exception:  # stdin closed/absent at startup
                 return b"", False
             return read_stdin_bounded(fd)
+    global LAST_READ_ERROR
+    LAST_READ_ERROR = None
     try:
         data, hit_deadline = stdin_reader()
     except Exception as exc:
         data, hit_deadline = b"", False
         errors.append(f"stdin read failed: {exc!r}")
+    read_error = LAST_READ_ERROR
+    if read_error is not None:
+        errors.append(f"stdin read error: {read_error}")
 
     raw: str | None
     raw_b64: str | None
@@ -462,6 +487,7 @@ def main(
             "json": parsed,
             "json_error": json_error,
             "read_hit_deadline": hit_deadline,
+            "read_error": read_error,
         },
         "env": env_snap,
         "env_redacted_names": redacted_names,

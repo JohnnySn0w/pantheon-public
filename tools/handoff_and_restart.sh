@@ -188,7 +188,7 @@ Optional:
                               prong (not recommended outside tests).
   --lockfile <path>           default: /tmp/handoff_and_restart.lock
   --kick-prompt <text>        post-step-7 directive injected into the fresh pane to trigger first-turn
-                              action (Read HANDOFF.md + post status). default: canned text referencing chat_id 424242424.
+                              action (Read HANDOFF.md + continue the queued work; message the operator only if needed). default: canned text.
   --no-kick                   skip the post-step-7 kick (T-0172). useful for tests / one-off invocations.
   --skip-ack                  force-restart mode (T-0510): skip steps 2-4 (handoff prompt + ack-wait) and
                               go straight to restart. For agents that cannot write a handoff (e.g. a
@@ -322,13 +322,15 @@ fi
 # pause-specific default prompt unless the caller overrode --prompt.
 DEFAULT_PROMPT="Recovery here — please write a fresh ${HANDOFF_FILE} capturing current state, in-flight work, and immediate next actions for the next session. When done, say \"handoff written\" and stop. I will then restart the service. Rewrite the file even if nothing changed since your last handoff: the restart waits for the file's modification time, not for your reply."
 DEFAULT_PAUSE_PROMPT="Recovery here — a coordinated machine reboot is imminent. Please finish your current step, then write a fresh ${HANDOFF_FILE} capturing current state, in-flight work, and immediate next actions. When done, say \"handoff written\" and stop — do NOT start new work; the reboot will cycle the session and the next session resumes from your handoff. Rewrite the file even if nothing changed since your last handoff: the restart waits for the file's modification time, not for your reply."
-# T-1500 (A): the kick must CONTINUE the handoff's queued work, not stop at the
-# snapshot — a fresh session that completes the literal ask and parks caused the
-# 2026-07-02 6.5h idle gap. Keep the phrase "post a one-paragraph status
-# snapshot" intact (the smoke suite's kick_busy_token keys on it). This copy is
+# T-1500 (A): the kick must CONTINUE the handoff's queued work, not stop at a
+# report — a fresh session that completes the literal ask and parks caused the
+# 2026-07-02 6.5h idle gap. 2026-11-03: no routine restart snapshot to the operator
+# (D1); only a seat with a Telegram channel messages him, and only when he is
+# needed. Keep the phrase "No routine restart snapshots" intact (the smoke
+# suite's kick_busy_token keys on it). This copy is
 # canonical: its former inbox_consumer twin (RECOVERY_AUTO_RESOLVE_KICKOFF_PROMPT) was
 # retired in T-4203.
-DEFAULT_KICK_PROMPT="Read ${HANDOFF_FILE}, then post a one-paragraph status snapshot to the operator via your Telegram tool (chat_id 424242424). Then continue working immediately: pick up the handoff's queued next work (or your next ticket per standing priority) and execute — do not park after the snapshot. Begin."
+DEFAULT_KICK_PROMPT="Read ${HANDOFF_FILE}, then continue working immediately: pick up the handoff's queued next work (or your next ticket per standing priority) and execute. Message the operator only if something genuinely needs his attention, and only if your seat has a Telegram channel to him (the reply tool, chat_id 424242424); seats without one mail their orchestrator instead. No routine restart snapshots. Begin."
 
 if [[ -z "$PROMPT_TEXT" ]]; then
   if [[ "$NO_RESTART" == "1" ]]; then
@@ -715,6 +717,7 @@ CHRONICLE_UUID="$(python3 "$(dirname "$0")/chronicle.py" detect-uuid \
 # already carry through stdout/stderr regardless.
 python3 "$(dirname "$0")/handoff_conservation.py" check \
       --handoff-file "$HANDOFF_FILE" \
+      --size-state "${PANTHEON_HANDOFF_SIZE_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/pantheon/handoff-size-alert.json}" \
       2>&1 | sed 's/^/  [handoff-conservation] /'
 
 # T-5349: ACE phase-1 advisory carry-forward (T-2819 C1/C3). Runs here for the same
@@ -1069,8 +1072,9 @@ if [[ "$KICK_ENABLED" == "1" ]]; then
   KICK_MAX_ATTEMPTS="${HANDOFF_RESTART_KICK_MAX_ATTEMPTS:-3}"
   # T-4456: render-gate each inject. The kick lands on a freshly booted TUI (T-4362):
   # ungated, the Enter can beat the paste render and read as submitted while the
-  # text sits unsent (T-4455). 8s = runtime_controller's fresh-runtime bound.
-  KICK_RENDER_WAIT="${HANDOFF_RESTART_KICK_RENDER_WAIT:-8}"
+  # text sits unsent (T-4455). T-6293: the bound comes from the submit_verify harness
+  # profile (one source; 8 only if python is unavailable).
+  KICK_RENDER_WAIT="${HANDOFF_RESTART_KICK_RENDER_WAIT:-$(/usr/bin/python3 "$SCRIPT_DIR/submit_verify.py" --harness claude-code --print-first-paste-render-wait 2>/dev/null || echo 8)}"
   if /usr/bin/python3 "$SCRIPT_DIR/kick_verify.py" \
         --pane "$TARGET_PANE" --prompt "$KICK_PROMPT" \
         --settle "$KICK_READINESS_SETTLE_SECS" \

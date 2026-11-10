@@ -397,7 +397,7 @@ EOF
   # deliver-but-not-dispatch path is unit-tested in test_kick_verify.py.
   export HANDOFF_RESTART_KICK_POLL_SECS=3
   export HANDOFF_RESTART_KICK_POLL_INTERVAL=0.1
-  echo "post a one-paragraph status snapshot" > "$SBX/kick_busy_token"
+  echo "No routine restart snapshots" > "$SBX/kick_busy_token"
   cat > "$SBX/pane_text_busy" <<'EOF'
 ╭─────────────────────────────────────╮
 │                                     │

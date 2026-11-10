@@ -1,0 +1,19 @@
+[Unit]
+# T-6141 (parent T-6121): owner-side prune of this account's dead Claude Code session dirs in
+# /tmp/claude-<uid> and old /tmp/pytest-of-<user>/pytest-N dirs. Runs AS the seat's own account
+# and takes no cross-account argument: the root is /tmp/claude-$(id -u). Exit 2 (refused / proc
+# scan failed closed) and 3 (per-dir errors) alert. No git writes.
+# Install as each Claude-harness seat's own account (installer-owned; recovery self-prunes).
+Description=Pantheon tmp session prune: dead Claude Code session dirs for seat %i
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/tmp_session_prune.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=15min
+Nice=10
+IOSchedulingClass=idle

@@ -6,7 +6,7 @@ downstream is wrong-looking -- the quota-probe readability domain just stops rec
 check closes that: "no drop record of ANY kind from seat X for more than 2 buckets (60 min) while X's
 quota unit ran" => ``Unknown("sample-freshness-silent:<persona>")`` on the domain
 ``org076-sample-freshness:<persona>`` (one detector instance per seat; requester ``recovery``, routed to
-Consultant@codex like every ORG-076 ticket).
+Watchman@codex, ``repair_evidence.RECOVERY_CANDIDATE``, like every BT2/BT3b ORG-076 ticket).
 
 Evidence that the quota unit ran (cross-account, no new grants). Recovery (claude-fallback) is in group
 ``systemd-journal``; ``/var/log/journal/<machine>/user-<uid>.journal`` is mode 0640 root:systemd-journal
@@ -43,6 +43,16 @@ not flagged here. (c) A previously enrolled seat that later turns the switch OFF
 running reads as silent until ``--forget-persona``. (d) The "last record" clock is the RUNNER's ingest
 time, so seat clock skew cannot fake freshness.
 
+PER-DETECTOR, OPT-IN (T-5999, BT5.0). The functions above take an optional ``detector``: ``None`` is the
+quota-probe check exactly as before (domain ``org076-sample-freshness:<persona>``, fault ids
+``sample-freshness-*:<persona>``, unit ``pantheon-persona-quota@<persona>.service``). A generic drop detector
+registered in ``org076_store_runner.REGISTRY`` with a ``freshness_unit`` opts in; it gets its own domain
+``org076-sample-freshness:<detector>:<persona>`` and fault ids ``sample-freshness-*:<detector>:<persona>``,
+judged against ITS unit and ITS enrollment/seen maps (runner state ``detectors`` / ``detector_seen``,
+``feed_detector``). A registry detector without ``freshness_unit`` gets no freshness check at all. These specs
+keep ``(RECOVERY_CANDIDATE,)`` and harness ``claude`` like the legacy ones (the writer is a claude-account
+seat: codex accounts cannot write drops, see the runner docstring).
+
 Uninstall leg (ORG-068 Remove): ``--forget-persona`` for each enrolled seat (closes its freshness
 episodes, removes enrollment); delete this module and ``tools/test_org076_sample_freshness.py``; drop
 the freshness calls from ``org076_store_runner.run_cycle``; remove store files
@@ -73,25 +83,31 @@ JOB_START_MESSAGE_ID = "7d4958e842da4a758f6c1cdc7b36dcc5"  # systemd JOB_START (
 JOURNAL_TIMEOUT_SECS = 15
 
 
-def domain_key(persona: str) -> str:
-    return f"{DOMAIN_PREFIX}:{persona}"
+def _scope(persona: str, detector: "str | None") -> str:
+    return persona if detector is None else f"{detector}:{persona}"
 
 
-def fault_silent(persona: str) -> str:
-    return f"sample-freshness-silent:{persona}"
+def domain_key(persona: str, detector: "str | None" = None) -> str:
+    return f"{DOMAIN_PREFIX}:{_scope(persona, detector)}"
 
 
-def fault_unreadable(persona: str) -> str:
-    return f"sample-freshness-journal-unreadable:{persona}"
+def fault_silent(persona: str, detector: "str | None" = None) -> str:
+    return f"sample-freshness-silent:{_scope(persona, detector)}"
 
 
-def spec_for(persona: str, account: str, requester: str = "recovery"):
-    """``account`` is the account the DETECTOR runs under (recovery's), for the evidence redactor."""
+def fault_unreadable(persona: str, detector: "str | None" = None) -> str:
+    return f"sample-freshness-journal-unreadable:{_scope(persona, detector)}"
+
+
+def spec_for(persona: str, account: str, requester: str = "recovery", detector: "str | None" = None):
+    """``account`` is the account the DETECTOR runs under (recovery's), for the evidence redactor.
+    ``detector`` None => the quota-probe freshness domain (unchanged); else that drop detector's."""
     from tools import repair_evidence
     return es.DetectorSpec(
-        detector=DETECTOR, domain_key=domain_key(persona), subsystem=DETECTOR, requester=requester,
+        detector=DETECTOR, domain_key=domain_key(persona, detector), subsystem=DETECTOR, requester=requester,
         harness="claude", account=account,
         candidates=(repair_evidence.RECOVERY_CANDIDATE,),
+        any_live_fallback=(repair_evidence.RECOVERY_CANDIDATE,),  # T-5998 B(i)
         redactor=repair_evidence.make_default_redactor(account))
 
 
@@ -161,32 +177,40 @@ def resolve_uid(account: str) -> "int | None":
 
 
 def verdict(persona: str, *, seen_epoch: float, now_epoch: float, account: str,
-            journal: JournalPort, uid_of: Callable[[str], "int | None"] = resolve_uid):
+            journal: JournalPort, uid_of: Callable[[str], "int | None"] = resolve_uid,
+            detector: "str | None" = None, unit_template: str = UNIT_TEMPLATE):
     age = now_epoch - seen_epoch
     if age <= STALE_SECS:
         return es.Healthy()
-    unit = UNIT_TEMPLATE.format(persona=persona)
+    unit = unit_template.format(persona=persona)
     uid = uid_of(account)
     if uid is None:
-        return es.Unknown(fault_unreadable(persona), f"cannot resolve a uid for account {account!r}\n")
+        return es.Unknown(fault_unreadable(persona, detector), f"cannot resolve a uid for account {account!r}\n")
     try:
         res = journal.starts(uid, unit, seen_epoch)
     except Exception as exc:  # noqa: BLE001
-        return es.Unknown(fault_unreadable(persona), f"journal port raised {type(exc).__name__}: {exc}\n")
+        return es.Unknown(fault_unreadable(persona, detector), f"journal port raised {type(exc).__name__}: {exc}\n")
     if res.error or not res.control_ok:
-        return es.Unknown(fault_unreadable(persona),
+        return es.Unknown(fault_unreadable(persona, detector),
                           f"cannot read {account}'s user journal ({res.error or 'positive control returned no records'}); "
                           f"the reader must be in group systemd-journal. Last drop record from {persona} was "
                           f"{int(age)}s ago.\n")
     ran = sorted(s for s in res.starts if seen_epoch < s <= now_epoch - GRACE_SECS)
     if not ran:
         return es.Healthy()
-    return es.Unknown(fault_silent(persona),
-                      f"no drop record of any kind from {persona} for {int(age)}s (> {STALE_SECS}s) but {unit} "
+    if detector is None:
+        return es.Unknown(fault_silent(persona),
+                          f"no drop record of any kind from {persona} for {int(age)}s (> {STALE_SECS}s) but {unit} "
+                          f"started {len(ran)} time(s) since (last start {int(now_epoch - ran[-1])}s ago).\n"
+                          f"Seat-side drop writes are failing silently: check the drop dir "
+                          f"(/var/lib/pantheon/org076/samples: mode 2775 group pantheon-shared) and the seat's "
+                          f"PANTHEON_ORG076_QUOTA_DETECTOR / stderr in `journalctl --user -u {unit}`.\n")
+    return es.Unknown(fault_silent(persona, detector),
+                      f"no {detector} drop record from {persona} for {int(age)}s (> {STALE_SECS}s) but {unit} "
                       f"started {len(ran)} time(s) since (last start {int(now_epoch - ran[-1])}s ago).\n"
-                      f"Seat-side drop writes are failing silently: check the drop dir "
-                      f"(/var/lib/pantheon/org076/samples: mode 2775 group pantheon-shared) and the seat's "
-                      f"PANTHEON_ORG076_QUOTA_DETECTOR / stderr in `journalctl --user -u {unit}`.\n")
+                      f"Seat-side {detector} drop writes are failing silently: check the drop dir "
+                      f"(/var/lib/pantheon/org076/samples: mode 2775 group pantheon-shared) and the writer's "
+                      f"stderr in `journalctl --user -u {unit}`.\n")
 
 
 def feed_all(state: dict, *, ports: "es.Ports", state_dir, now_epoch: float, runner_account: str,
@@ -205,4 +229,25 @@ def feed_all(state: dict, *, ports: "es.Ports", state_dir, now_epoch: float, run
         except Exception as exc:  # noqa: BLE001
             if errors is not None:
                 errors.append(f"freshness {persona}: {type(exc).__name__}: {exc}")
+    return out
+
+
+def feed_detector(detector: str, unit_template: str, enrolled: dict, seen: dict, *, ports: "es.Ports", state_dir,
+                  now_epoch: float, runner_account: str, journal: JournalPort,
+                  uid_of: Callable[[str], "int | None"] = resolve_uid, errors: "list | None" = None) -> list:
+    """Per-detector, opt-in freshness (T-5999): one verdict per persona ENROLLED for ``detector``
+    (``enrolled``: persona -> account; ``seen``: persona -> runner-clock epoch of its last record, stamped
+    ``now`` on first sight). The caller saves the maps. Same contract as ``feed_all``."""
+    out = []
+    for persona, account in sorted(enrolled.items()):
+        last = seen.setdefault(persona, now_epoch)
+        try:
+            v = verdict(persona, seen_epoch=last, now_epoch=now_epoch, account=account, journal=journal,
+                        uid_of=uid_of, detector=detector, unit_template=unit_template)
+            res = es.observe(spec_for(persona, runner_account, detector=detector), v, ports=ports,
+                             state_dir=state_dir)
+            out.append((persona, res.status))
+        except Exception as exc:  # noqa: BLE001
+            if errors is not None:
+                errors.append(f"freshness {detector}/{persona}: {type(exc).__name__}: {exc}")
     return out

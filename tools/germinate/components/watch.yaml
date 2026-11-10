@@ -1,0 +1,52 @@
+# watch component contract (ORG-080 §2; T-5964, child of T-5104).
+#
+# WRAPS the legacy watch/research pipeline without rewriting it (ORG-080 A-5):
+# three user-unit pairs on claude-research (pantheon-watch, pantheon-knowledge-sweep,
+# pantheon-watch-digest; the stems tools/watch_pipeline_decommission.py tears down),
+# hand-installed from tools/systemd/. pantheon-policy-outflow is not part of it (it
+# runs on claude). No other seat can read claude-research's units, state or journal,
+# so every leg is OBSERVE-AND-ATTEST over repo-side evidence (watch_evidence.py):
+# the unit templates' digests, the newest committed day index and its landing
+# author, topics.md as watch_runner.parse_topics reads it, and the HERMES-guard
+# byte-sequence scan of knowledge/watch/reports/** (W6). The only mutations
+# are attestation entries in the handler's own state. The planner (watch.py)
+# refuses unless the evidence is healthy:
+# * install / configure / update plan one watch.adopt-attest op each (update only
+#   for a code-only update; a unit-template change refuses: the hand re-install on
+#   claude-research is not typed, T-5972);
+# * remove plans one watch.attest-retire op, only after an EXECUTED decommission
+#   report is observed; the engine never runs the decommission tool (its own
+#   account check; no sudo).
+# Only the SIMULATED handler is registered; there is no live reader (T-5972).
+# verify is bound to the DRAFT invariant list org.pantheon.watch/v1 (W1-W6;
+# watch.invariants.yaml), CURRENT pending specialist+Recovery sign-off per D15, tracked on
+# T-5964. No emitter block: no Health1 emitter exists for watch (ORG-081 D-11, T-5102).
+component:
+  id: watch
+  steward: specialist
+  version: 1
+  planner_kind: python
+  contract_digest: sha256:0090771a4a6f70032ce557bb2467de316240fe917e21c8981189aa19fed687d0
+  handlers_digest: sha256:13a808fd570407fedf258a04c122ff011cd4cf6b656e297191dd87390c95f0a6
+  # Empty on purpose (T-5964 D4). Watch runs from the account's pantheon-config
+  # clone and alerts through the mailbox, but neither has an engine install record
+  # yet; declaring them would make watch unplannable (same reasoning as action-broker,
+  # T-5948 D3).
+  depends_on: []
+  scopes: [system]
+  invariant_list_id: org.pantheon.watch/v1
+  invariant_list_digest: sha256:e9bcfba8e05a50f7866799f9e6323d4d2d40bfe3ff451593195ee3dbb7fd3693
+  privilege:
+    seat: [watch.adopt-attest, watch.attest-retire]
+  legs:
+    install: plan_install
+    configure: plan_configure
+    update: plan_update(source_rev_from, source_rev_to)
+    remove: plan_remove
+    verify:
+      invariant_list_ref: org.pantheon.watch/v1@sha256:e9bcfba8e05a50f7866799f9e6323d4d2d40bfe3ff451593195ee3dbb7fd3693
+  gates:
+    - {id: adopt-legacy-install, irreversible: false, note: "attest the hand-installed claude-research watch pipeline from repo-side evidence; the engine installs and reads nothing on that account", approval: {class: operator}}
+    - {id: watch-retire, irreversible: false, note: "retire the engine's watch attestations after an executed tools/watch_pipeline_decommission.py run; the host is untouched", approval: {class: operator}}
+  receipts:
+    schema: pantheon-receipt/v1

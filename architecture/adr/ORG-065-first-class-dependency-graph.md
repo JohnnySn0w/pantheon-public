@@ -5,7 +5,10 @@ status: Ratified 2026-08-11 by the operator (via kino PWA — T-2672 resolve + T
 date: 2026-08-08
 author: Orchestrator (Orchestrator)
 relates: ORG-003, ORG-013, ORG-015, ORG-019, ORG-022, ORG-034, ORG-038
-build_disposition: needs-build
+# build_disposition: built since 2026-08-12 (BT1 T-2841, BT2 T-2842, BT3 T-2843; BT4 delivered as T-2676, T-2844
+# closed as its duplicate; BT5 prerequisites T-2845, walk + gate flip completed by T-2934; the closure-validation
+# gate is live and gating by default, ticket.py PANTHEON_CLOSURE_GATE_MODE=gate). T-6066.
+build_disposition: built
 scoping_ticket: T-2840
 # elements: — ORG-065 machine index of its own §3.1-3.6 ("Decision"),
 # "Migration", and "Verification / acceptance" (4 named bullets) sections

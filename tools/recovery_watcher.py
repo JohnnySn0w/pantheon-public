@@ -1087,8 +1087,11 @@ def run(*, health_dir: Path, state_file: Path, watcher_health_dir: Path, now: in
     asleep_names = sorted(p for p, r in records.items() if _expected_down(r) and p in personas)
     paused_names = sorted(p for p, r in records.items()
                           if r.get("seat_state") == "paused-intake" and p in personas)
-    if asleep_names or paused_names:
-        log(f"seat_state asleep={','.join(asleep_names) or '-'} paused={','.join(paused_names) or '-'}")
+    halted_names = sorted(p for p, r in records.items()
+                          if r.get("seat_state") == "halted" and p in personas)  # T-5868
+    if asleep_names or paused_names or halted_names:
+        log(f"seat_state asleep={','.join(asleep_names) or '-'} paused={','.join(paused_names) or '-'}"
+            + (f" HALTED={','.join(halted_names)}" if halted_names else ""))
     if not incidents:
         log("no incidents")
 

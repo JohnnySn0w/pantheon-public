@@ -32,6 +32,7 @@ from tools import persona_bringup
 from tools import runtime_controller as rc
 from tools import t2611_recovery_persona_apply as persona_apply
 from tools.harness_adapter import CodexHarnessAdapter
+from tools.test_codex_shell_box import fake_read_hooks
 from tools.persona_apply_path import controlled_apply_environment
 from tools.persona_installer import (
     ActorContext,
@@ -66,6 +67,8 @@ def _is_seat_core_periodic_timer(unit: str) -> bool:
 class LocalHostCommandSheetStageBackend(LocalHostBackend):
     def __init__(self, expected_env: dict[str, str]) -> None:
         super().__init__(command_timeout=1, timed_fire_timeout=1)
+        # T-5480: hermetic codex hooks/list (the default reader spawns the real codex app-server)
+        self.codex_hooks_reader = fake_read_hooks
         self.commands: list[tuple[str, ...]] = []
         self.expected_env = expected_env
 
@@ -106,7 +109,29 @@ class LocalHostCommandSheetStageBackend(LocalHostBackend):
             return subprocess.CompletedProcess(command, 0, "", "")
         return subprocess.CompletedProcess(command, 0, "", "")
 
+    @staticmethod
+    def _plain_mkdir(operation):
+        """T-6118: fixture accounts/groups do not exist and the run is not root, so the
+        ownership-enforcing chronicle-export mkdir ops run as plain mkdirs here; their real
+        behaviour is covered in test_persona_installer_chronicle_export.py."""
+        from tools import persona_installer as _pim
+
+        if _pim._mkdir_owned(operation):
+            desired = {k: v for k, v in operation.desired.items() if k not in {"owner", "group"}}
+            return dataclasses.replace(operation, desired=desired)
+        return operation
+
+    def _simple_mutation(self, operation):  # type: ignore[override]
+        from tools import persona_installer as _pim
+
+        owned = _pim._mkdir_owned(operation)
+        operation = self._plain_mkdir(operation)
+        if owned:  # only the ops stripped of owner/group; plain mkdirs keep real missing-parent behaviour
+            Path(operation.target).parent.mkdir(parents=True, exist_ok=True)
+        return super()._simple_mutation(operation)
+
     def preflight(self, operation) -> PreflightResult:  # type: ignore[override]
+        operation = self._plain_mkdir(operation)
         if operation.provenance.get("install_root") != "/":
             operation = dataclasses.replace(
                 operation,
@@ -647,15 +672,18 @@ class BridgeCase(unittest.TestCase):
         self._write_bridge_shim(repo)
         # T-5454: the seat clone's shell-box wrapper (operator prerequisite), committed with
         # the clone so the checkout stays clean and the local backend can exec it
-        shell_box = repo / "tools" / "oom" / "pantheon-shell-box.sh"
-        shell_box.parent.mkdir(parents=True, exist_ok=True)
-        shell_box.write_text("#!/bin/sh\n", encoding="utf-8")
-        shell_box.chmod(0o755)
+        # T-5480: plus the codex PreToolUse hook script (orchestrator's codex runtime plans
+        # harness.codex-shell-box, whose local preflight fails closed without it)
+        for rel in ("pantheon-shell-box.sh", "pantheon-codex-shell-box-hook.py"):
+            shell_box = repo / "tools" / "oom" / rel
+            shell_box.parent.mkdir(parents=True, exist_ok=True)
+            shell_box.write_text("#!/bin/sh\n", encoding="utf-8")
+            shell_box.chmod(0o755)
         subprocess.run(("git", "init", "--initial-branch=main", str(repo)), check=True, capture_output=True, text=True)
         self._git(repo, "config", "user.email", "test@example.invalid")
         self._git(repo, "config", "user.name", "Test")
         self._git(repo, "add", "pinned-rules/orchestrator-codex.md", "tools/codex_telegram_bridge.py",
-                  "tools/oom/pantheon-shell-box.sh")
+                  "tools/oom/pantheon-shell-box.sh", "tools/oom/pantheon-codex-shell-box-hook.py")
         self._git(repo, "commit", "-m", "source")
         source_commit = self._git_text(repo, "rev-parse", "HEAD")
         source_sha = hashlib.sha256(source_text.encode("utf-8")).hexdigest()

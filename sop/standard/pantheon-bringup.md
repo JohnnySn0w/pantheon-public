@@ -720,16 +720,41 @@ These three conventions were invented independently by the first outside fork (w
 
 **Root-level files reconcile by explicit name, not by the dir-scoped recipe.** The canonical reconcile command (`git checkout upstream/main -- rulebook/ sop/ architecture/ tools/ skills/ .githooks/`) pulls the KEEP *directories*. Root-level upstream-owned files — `README.md`, `BACKLOG.md`, `FORK.md.template`, `instance.yaml.example` — are NOT in that pathspec, so the standard reconcile does not touch them; name them explicitly in the checkout if you want their upstream updates (e.g. `git checkout upstream/main -- FORK.md.template` to refresh the template shape). Your own `FORK.md` is deliberately never named — that omission is exactly what makes it durable across reconciles. (This is the KEEP-set/recipe sync ORG-029 Implementation step 3 flags: the conceptual KEEP set includes root scaffolding, but the dir-scoped recipe reaches directories only.)
 
-**Harness-config + the 3-repo bundle (governed by [ORG-039](../../architecture/adr/ORG-039-harness-config-distribution-model.md), ratified 2026-06-30).** `pantheon-config` is only ONE of the four layers a runnable instance needs (§"What you're building"). The §11 keep/clear posture above is the *framework/content* layer; the **agent-runtime** layer is a separate, per-harness config repo — `claude-code-config` (the claude-code harness; `codex-config` is a fast-follow). It carries its own FRAMEWORK/INSTANCE distribution model (the layer-2 analog of ORG-029): role-keyed `agents/` skeletons + the `pantheon-org-discipline` skill + `settings.json`/MCP templates + the `pinned-rules/` STRUCTURE **port**; persona-brief *content*, tokens, account names, and absolute paths **stay**. A fourth layer — **host/runtime provisioning** (`claude-code-config/provisioning/`) — makes the bundle bootable (users/dirs/perms, service/launch wiring, env/secret placeholders, a per-role boot smoke).
+**Harness configuration after ORG-091 (governed by
+[ORG-039](../../architecture/adr/ORG-039-harness-config-distribution-model.md)
+and [ORG-091](../../architecture/adr/ORG-091-harness-config-consolidation-into-pantheon-config.md)).**
+`pantheon-config` now carries both the org framework/content and each harness's
+canonical FRAMEWORK slice under `harness/<name>/`. INSTANCE values remain in
+the root `instance.yaml` and persona-authored rules remain under
+`pinned-rules/`; tokens and other secrets remain external. A fleet seat needs
+one pantheon-config clone, not separate writable `claude-config` and
+`codex-config` source repositories. `persona_installer` and harness tooling
+read the applicable in-repo subtree.
 
-The portable bringup is a **3-repo drop-in** into one agent home, bound by a single `instance.yaml`:
-1. clone `pantheon-config` (framework, this repo), `claude-code-config` (agent-runtime), and optionally `kino` (control surface);
-2. author one `instance.yaml` in `claude-code-config` (role→persona/account/path binding — the only hand-authored file);
-3. fill the role brief(s) from the `pinned-rules/*.md.example` skeletons;
-4. `claude-code-config/provisioning/provision.sh` then `install.sh --role <role>`;
-5. **release gates before relying on it:** `provisioning/leak-scan.sh` (no secrets/names/host-paths in the shippable set) and `provisioning/boot-smoke.sh <role>` (the role's agent boots from the template alone).
+The public `claude-code-config` and `codex-config-template` repositories are
+**generated release artifacts**, built from a pinned pantheon-config commit by
+`tools/build_harness_mirror.py`. Their provisioning overlays contain the
+generic users/dirs/perms, service/launch wiring, env/secret placeholders, role
+brief examples, leak scan, and boot smoke needed by self-hosters. They have an
+independent release cadence and are never edited as source.
 
-The `pantheon-config` ↔ harness-config coupling (the `pantheon-org-discipline` skill + the `directive_skill_drift_check.py` guard) is **decoupled for a fork** (ORG-039 §4): a clone without a harness-config repo configured gets a clean, actionable SKIP from the drift check — never a broken hook — and strict validation runs only when the harness skill is actually present.
+Choose the bringup path explicitly:
+
+1. **Pantheon fleet/internal:** clone `pantheon-config` (plus optional `kino`),
+   author the root `instance.yaml`, fill the applicable `pinned-rules/` file,
+   then run the typed installer against `harness/<name>/`.
+2. **External/self-hoster:** clone a reviewed generated release (normally
+   `claude-code-config`), author its `instance.yaml` from the shipped example,
+   fill the role brief example, run `provisioning/provision.sh` and
+   `install.sh --role <role>`, then require both
+   `provisioning/leak-scan.sh` and `provisioning/boot-smoke.sh <role>` before
+   relying on it.
+
+The `pantheon-org-discipline` skill and `directive_skill_drift_check.py` guard
+remain **decoupled for a fork** (ORG-039 §4): if a fork omits or disables a
+harness subtree, the drift check returns a clean, actionable SKIP rather than
+breaking unrelated hooks; strict validation runs only when the harness skill
+is present.
 
 ### 12. Codex-daemon variant (ORG-018 pilot)
 

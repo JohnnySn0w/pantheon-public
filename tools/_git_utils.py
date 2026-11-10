@@ -670,10 +670,38 @@ def _origin_reachable(cwd: Path) -> bool:
     return res.returncode == 0
 
 
+_PUBLICKEY_RETRY_DISQUALIFIERS = (
+    "authentication failed", "could not read username", "access denied", "forbidden",
+    "permission to", "protected branch", "declined", "pre-receive hook", "gh006",
+    "gh013", "repository rule", "not allowed", "rejected", "non-fast-forward",
+    "fetch first",
+)
+_GITHUB_SSH_PUBLICKEY_DENIAL_RE = re.compile(
+    r"(?m)^git@github\.com: Permission denied \(publickey\)\.$"
+)
+
+
+def _recovered_publickey_retry_warranted(cwd: Path, stderr: str) -> bool:
+    """One retry of GitHub is safe only for the narrow transient SSH-auth shape.
+
+    A successful authenticated probe says the primary recovered; it does not license
+    a mirror-only write. Compound permission/policy answers always win and never probe.
+    """
+    low = (stderr or "").lower()
+    if (
+        not _GITHUB_SSH_PUBLICKEY_DENIAL_RE.search(stderr or "")
+        or any(marker in low for marker in _PUBLICKEY_RETRY_DISQUALIFIERS)
+    ):
+        return False
+    return _origin_reachable(cwd)
+
+
 def _origin_failover_warranted(cwd: Path, stderr: str) -> bool:
     """True iff the write authority is down (not merely saying no): a server-side
     fault (no probe needed — the server itself said it failed) or a network-class
-    failure CONFIRMED by a failing ls-remote. Real answers and ambiguous errors: False."""
+    failure CONFIRMED by a failing ls-remote. Real answers and ambiguous errors remain
+    fail-closed; transient public-key recovery is handled as an origin retry above this
+    failover decision."""
     kind = _classify_push_failure(stderr)
     if kind == "server_error":
         return True
@@ -775,7 +803,9 @@ def push_with_retry(
         push goes to the mirror instead, returning success with a "replay pending"
         note; non-ff retries then fetch+rebase against the mirror.
       - a non-ff / auth / permission / protected-branch / hook-declined answer, or an
-        ambiguous error, NEVER falls over to the mirror (split-brain guard).
+        ambiguous error, NEVER falls over to the mirror (split-brain guard). A narrow
+        public-key rejection contradicted by a successful authenticated origin probe
+        gets ONE retry to origin; it never licenses a mirror-only write.
 
     Retry semantics:
       1. Attempt `git push origin <refspec>`.
@@ -845,6 +875,7 @@ def push_with_retry(
     hook_rebase_ours_to_handle = is_root and rebase_at_entry is None
     mirror = _resolve_write_mirror(cwd) if mirror_url is _UNSET else mirror_url
     dest = "origin"  # becomes the mirror url once origin is confirmed down
+    recovered_publickey_retry_used = False
     attempt_num = 0
     while attempt_num < attempts:
         attempt_num += 1
@@ -878,6 +909,14 @@ def push_with_retry(
         is_non_ff = any(marker in stderr_lower for marker in _NON_FF_MARKERS)
 
         if not is_non_ff:
+            if (
+                dest == "origin"
+                and not recovered_publickey_retry_used
+                and attempt_num < attempts
+                and _recovered_publickey_retry_warranted(cwd, res.stderr)
+            ):
+                recovered_publickey_retry_used = True
+                continue
             if dest == "origin" and mirror and _origin_failover_warranted(cwd, res.stderr):
                 dest = mirror  # the write authority is down, not refusing: ORG-101 §2
                 attempt_num -= 1  # the redirected push is not a retry of the same target

@@ -27,6 +27,7 @@ PINS = ("pyyaml==6.0.3", "pytest==9.1.1", "pytest-xdist==3.8.0")
 _CASE_PASS = '<testcase classname="tools.test_a.A" name="test_ok" time="0.1"/>'
 _CASE_SKIP = ('<testcase classname="tools.test_a.A" name="test_skip" time="0">'
               '<skipped message="no"/></testcase>')
+_CASE_NESTED = '<testcase classname="tools.test_n.N" name="test_nested_ok" time="0.1"/>'
 _CASE_FAIL = ('<testcase classname="tools.test_b.B" name="test_bad" time="0.1">'
               '<failure message="boom">x</failure></testcase>')
 _CASE_ERROR = ('<testcase classname="tools.test_c.C" name="test_err" time="0.1">'
@@ -316,6 +317,15 @@ class PytestArgvTests(unittest.TestCase):
         self.assertEqual(argv[6:8], ["tools/a.py", "tools/oom/"])
         self.assertNotIn("tools/", argv)
 
+    def test_marker_selection_argv(self):
+        a = soak_leg.build_pytest_argv(Path("/p"), Path("/o"), 2, nested=False)
+        b = soak_leg.build_pytest_argv(Path("/p"), Path("/o"), 2, nested=True)
+        self.assertEqual(a[-2:], ["-m", "not nested_namespace"])
+        self.assertEqual(b[-2:], ["-m", "nested_namespace"])
+        self.assertIn("--junitxml=/o/pytest-tools.xml", a)
+        self.assertIn("--junitxml=/o/pytest-tools-nested.xml", b)
+        self.assertNotIn("-m", soak_leg.build_pytest_argv(Path("/p"), Path("/o"), 2)[7:])
+
     def test_ci_options_still_match_the_workflow_pytest_step(self):
         run_line = next(line for line in CI_TEXT.splitlines()
                         if "python -m pytest tools/" in line and "run:" in line)
@@ -487,6 +497,24 @@ class EvaluateTests(unittest.TestCase):
         _, lines = self._eval(_junit(_CASE_PASS), sha="s", py="3.11")
         self.assertIn(" py=3.11 ", lines[0])
 
+    def test_two_legs_sum_counts_and_show_nested_rc(self):
+        self.xml.write_text(_junit(_CASE_PASS, _CASE_SKIP), encoding="utf-8")
+        nested = self.xml.with_name("n.xml")
+        nested.write_text(_junit(_CASE_NESTED), encoding="utf-8")
+        green, lines = soak_leg.evaluate(self.xml, 0, 0, sha="s", py="3.11",
+                                         nested_xml=nested, nested_rc=0)
+        self.assertTrue(green)
+        self.assertEqual(lines, ["SOAK LEG: sha=s py=3.11 executed=2 skipped=1 failed=0 "
+                                 "pytest_rc=0 nested_rc=0 shell_outcomes_rc=0 -> GREEN"])
+
+    def test_two_legs_red_when_the_nested_leg_has_a_failure_even_with_rc_zero(self):
+        self.xml.write_text(_junit(_CASE_PASS), encoding="utf-8")
+        nested = self.xml.with_name("n.xml")
+        nested.write_text(_junit(_CASE_FAIL), encoding="utf-8")
+        green, lines = soak_leg.evaluate(self.xml, 0, 0, nested_xml=nested, nested_rc=0)
+        self.assertFalse(green)
+        self.assertIn("  FAILED tools.test_b.B::test_bad", lines)
+
     def test_subset_skips_the_shell_check_and_says_so(self):
         green, lines = self._eval(_junit(_CASE_PASS), shell_rc=None, subset=True)
         self.assertTrue(green)
@@ -494,6 +522,19 @@ class EvaluateTests(unittest.TestCase):
 
 
 SHA = "0123456789ab"
+BWRAP = "/usr/bin/bwrap"
+
+
+def _which(name):
+    return BWRAP if name == "bwrap" else None
+
+
+def _write_junits(out: Path, argv, a_body: str | None, b_body: str | None = None) -> None:
+    """The fake pytest's reports: leg B's argv names the nested report."""
+    nested = any("pytest-tools-nested.xml" in t for t in argv)
+    body = (b_body or _junit(_CASE_NESTED)) if nested else a_body
+    if body is not None:
+        soak_leg.junit_path(out, nested).write_text(body, encoding="utf-8")
 
 
 def _write_ci(root: Path) -> None:
@@ -531,8 +572,7 @@ class MainTests(unittest.TestCase):
             if "pytest" in argv:
                 if explode_on_pytest:
                     raise RuntimeError("pytest blew up")
-                if junit_body is not None:
-                    soak_leg.junit_path(self.out).write_text(junit_body, encoding="utf-8")
+                _write_junits(self.out, argv, junit_body)
         return FakeRunner(rcs=rcs, on_call=on_call, stdouts={"local-env-vars": "GIT_DIR\nGIT_CONFIG_COUNT\n", "rev-parse": SHA + "\n",
                                     "init.defaultBranch": "main\n"})
 
@@ -541,7 +581,7 @@ class MainTests(unittest.TestCase):
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
             rc = soak_leg.main(["--venv", str(self.venv), "--out-dir", str(self.out), *extra],
-                               runner=runner, repo_root=self.repo)
+                               runner=runner, repo_root=self.repo, which=_which)
         return rc, stdout.getvalue(), runner
 
     def _git(self, runner) -> list[list[str]]:
@@ -560,14 +600,14 @@ class MainTests(unittest.TestCase):
         self.assertEqual(g[4], ["git", "-C", str(self.wt), "rev-parse", "--short=12", "HEAD"])
         self.assertEqual(g[-1], ["git", "-C", str(self.repo), "worktree", "remove", "--force",
                                  str(self.wt)])
-        pytest_argv, pytest_kw = next((a, k) for a, k in runner.calls if "pytest" in a and a[0] == "nice")
+        pytest_argv, pytest_kw = next((a, k) for a, k in runner.calls if "pytest" in a and "nice" in a)
         self.assertEqual(pytest_kw["cwd"], str(self.wt))
         self.assertIn(f"--junitxml={soak_leg.junit_path(self.out)}", pytest_argv)
         self.assertIn(f"--basetemp={self.out / 'pytest-basetemp'}", pytest_argv)
         shell_argv, shell_kw = next((a, k) for a, k in runner.calls if a[1].endswith("check_shell_suite_outcomes.py"))
         self.assertEqual(shell_argv[1], str(self.wt / "tools" / "check_shell_suite_outcomes.py"))
         self.assertEqual(shell_kw["cwd"], str(self.wt))
-        self.assertIn(f"SOAK LEG: sha={SHA} py={PY} executed=1", out)
+        self.assertIn(f"SOAK LEG: sha={SHA} py={PY} executed=2", out)
         self.assertIn("-> GREEN", out)
         self.assertIn(f"removed worktree {self.wt}", out)
 
@@ -576,7 +616,7 @@ class MainTests(unittest.TestCase):
                                             "PYTHONPATH": "/x"}):
             rc, out, runner = self._main(_junit(_CASE_PASS))
         self.assertEqual(rc, 0, out)
-        _, kw = next((a, k) for a, k in runner.calls if a[0] == "nice")
+        _, kw = next((a, k) for a, k in runner.calls if "nice" in a)
         for name in ("GIT_DIR", "GIT_CONFIG_COUNT", "PYTHONPATH"):
             self.assertNotIn(name, kw["env"])
         self.assertEqual(kw["env"]["PANTHEON_DISABLE_LIVE_TELEGRAM"], "1")
@@ -598,7 +638,7 @@ class MainTests(unittest.TestCase):
         runner = self._runner(None, explode_on_pytest=True)
         with self.assertRaises(RuntimeError), redirect_stdout(io.StringIO()):
             soak_leg.main(["--venv", str(self.venv), "--out-dir", str(self.out)],
-                          runner=runner, repo_root=self.repo)
+                          runner=runner, repo_root=self.repo, which=_which)
         self.assertEqual(self._git(runner)[-1][3:5], ["worktree", "remove"])
 
     def test_main_installs_the_sigterm_handler(self):
@@ -613,13 +653,13 @@ class MainTests(unittest.TestCase):
         def on_call(argv, kw):
             if argv[:5] == ["git", "-C", str(self.repo), "worktree", "add"]:
                 _write_ci(self.wt)
-            if argv[0] == "nice":
+            if "nice" in argv:
                 soak_leg._on_sigterm(signal.SIGTERM, None)  # what the handler does on SIGTERM
         runner = FakeRunner(on_call=on_call, stdouts={"local-env-vars": "GIT_DIR\nGIT_CONFIG_COUNT\n", "rev-parse": SHA + "\n",
                                     "init.defaultBranch": "main\n"})
         with self.assertRaises(SystemExit) as cm, redirect_stdout(io.StringIO()):
             soak_leg.main(["--venv", str(self.venv), "--out-dir", str(self.out)],
-                          runner=runner, repo_root=self.repo)
+                          runner=runner, repo_root=self.repo, which=_which)
         self.assertEqual(cm.exception.code, 143)
         self.assertEqual(self._git(runner)[-1][3:5], ["worktree", "remove"])
 
@@ -629,7 +669,7 @@ class MainTests(unittest.TestCase):
         rc, _, runner = self._main(_junit(_CASE_PASS), extra=("--ci-workflow", str(bad)))
         self.assertEqual(rc, 2)
         self.assertEqual(self._git(runner)[-1][3:5], ["worktree", "remove"])
-        self.assertFalse(any(a[0] == "nice" for a in runner.argvs()))
+        self.assertFalse(any("nice" in a for a in runner.argvs()))
 
     def test_fetch_failure_exits_two_and_adds_no_worktree(self):
         rc, _, runner = self._main(_junit(_CASE_PASS), rcs={"fetch": 1})
@@ -655,8 +695,8 @@ class MainTests(unittest.TestCase):
         self.assertEqual(g, [["git", "rev-parse", "--local-env-vars"], list(soak_leg.DEFAULT_BRANCH_ARGV),
                              ["git", "-C", str(self.repo), "rev-parse", "--short=12", "HEAD"]])
         argvs = runner.argvs()
-        self.assertEqual(len(argvs), 5)  # local-env-vars + defaultBranch + rev-parse + pytest + shell; venv reused
-        _, kw = next((a, k) for a, k in runner.calls if a[0] == "nice")
+        self.assertEqual(len(argvs), 7)  # bwrap preflight + local-env-vars + defaultBranch + rev-parse + 2 pytest legs + shell; venv reused
+        _, kw = next((a, k) for a, k in runner.calls if "nice" in a)
         self.assertEqual(kw["cwd"], str(self.repo))
         self.assertIn("venv " + str(self.venv) + " reused", out)
 
@@ -665,16 +705,16 @@ class MainTests(unittest.TestCase):
 
         def make(body):
             def on_call(argv, kw):
-                if argv[0] == "nice":
+                if "nice" in argv:
                     (basetemp / "t0").mkdir(parents=True, exist_ok=True)
-                    soak_leg.junit_path(self.out).write_text(body, encoding="utf-8")
+                    _write_junits(self.out, argv, body)
             return FakeRunner(on_call=on_call, stdouts={"local-env-vars": "GIT_DIR\n"})
 
         argv = ["--venv", str(self.venv), "--out-dir", str(self.out), "--in-place"]
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            self.assertEqual(soak_leg.main(argv, runner=make(_junit(_CASE_PASS)), repo_root=self.repo), 0)
+            self.assertEqual(soak_leg.main(argv, runner=make(_junit(_CASE_PASS)), repo_root=self.repo, which=_which), 0)
             self.assertFalse(basetemp.exists())
-            self.assertEqual(soak_leg.main(argv, runner=make(_junit(_CASE_FAIL)), repo_root=self.repo), 1)
+            self.assertEqual(soak_leg.main(argv, runner=make(_junit(_CASE_FAIL)), repo_root=self.repo, which=_which), 1)
             self.assertTrue(basetemp.is_dir())
         self.assertTrue(soak_leg.junit_path(self.out).is_file())
 
@@ -699,19 +739,19 @@ class MainTests(unittest.TestCase):
             runner = self._runner(_junit(_CASE_PASS))
             with redirect_stdout(io.StringIO()):
                 rc = soak_leg.main(["--out-dir", str(self.out), "--in-place"], runner=runner,
-                                   repo_root=self.repo)
+                                   repo_root=self.repo, which=_which)
         self.assertEqual(rc, 0)
-        nice = next(a for a in runner.argvs() if a[0] == "nice")
-        self.assertEqual(nice[3], str(soak_leg.venv_python(self.venv)))
+        nice = next(a for a in runner.argvs() if "nice" in a)
+        self.assertEqual(nice[nice.index("nice") + 3], str(soak_leg.venv_python(self.venv)))
 
     def test_non_main_default_branch_warns_but_stays_green(self):
         runner = FakeRunner(stdouts={"rev-parse": SHA + "\n", "init.defaultBranch": "master\n"},
-                            on_call=lambda a, k: soak_leg.junit_path(self.out).write_text(
-                                _junit(_CASE_PASS), encoding="utf-8") if a[0] == "nice" else None)
+                            on_call=lambda a, k: _write_junits(
+                                self.out, a, _junit(_CASE_PASS)) if "nice" in a else None)
         stdout, stderr = io.StringIO(), io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
             rc = soak_leg.main(["--venv", str(self.venv), "--out-dir", str(self.out), "--in-place"],
-                               runner=runner, repo_root=self.repo)
+                               runner=runner, repo_root=self.repo, which=_which)
         self.assertEqual(rc, 0)
         self.assertIn("WARNING: init.defaultBranch is master", stderr.getvalue())
         self.assertIn(" defbranch=master ", stdout.getvalue())
@@ -721,7 +761,7 @@ class MainTests(unittest.TestCase):
         stderr = io.StringIO()
         with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
             rc = soak_leg.main(["--venv", "/", "--out-dir", str(self.out), "--in-place"],
-                               runner=FakeRunner(), repo_root=self.repo)
+                               runner=FakeRunner(), repo_root=self.repo, which=_which)
         self.assertEqual(rc, 2)
         self.assertIn("setting up the venv", stderr.getvalue())
 
@@ -730,12 +770,169 @@ class MainTests(unittest.TestCase):
             raise FileNotFoundError("git")
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             rc = soak_leg.main(["--venv", str(self.venv), "--out-dir", str(self.out)],
-                               runner=boom, repo_root=self.repo)
+                               runner=boom, repo_root=self.repo, which=_which)
         self.assertEqual(rc, 2)
+
+    # -- T-5915: PID namespace + the two legs ------------------------------------------
+    def _pytest_calls(self, runner):
+        return [a for a in runner.argvs() if "nice" in a and "pytest" in a]
+
+    def test_leg_a_is_namespaced_and_leg_b_is_bare_with_the_right_markers(self):
+        rc, out, runner = self._main(_junit(_CASE_PASS))
+        self.assertEqual(rc, 0, out)
+        a, b = self._pytest_calls(runner)
+        self.assertEqual(a[:1], [BWRAP])
+        self.assertEqual(a[1:a.index("--")], list(soak_leg.BWRAP_NAMESPACE_ARGS))
+        self.assertEqual(a[a.index("--") + 1], "nice")
+        self.assertEqual(a[a.index("-m", a.index("tools/")) + 1], "not nested_namespace")
+        self.assertEqual(b[0], "nice")
+        self.assertNotIn("--unshare-pid", b)
+        self.assertNotIn(BWRAP, b)
+        self.assertEqual(b[b.index("-m", b.index("tools/")) + 1], "nested_namespace")
+        self.assertEqual(a[a.index("tools/"):a.index("-q")], b[b.index("tools/"):b.index("-q")])
+        self.assertIn(f"--junitxml={self.out / 'pytest-tools-nested.xml'}", b)
+        self.assertIn(f"--basetemp={self.out / 'pytest-basetemp-nested'}", b)
+        self.assertIn("nested_rc=0", out)
+
+    def test_subset_paths_reach_both_legs(self):
+        _, _, runner = self._main(_junit(_CASE_PASS), extra=("--paths", "tools/test_x.py"))
+        for argv in self._pytest_calls(runner):
+            self.assertIn("tools/test_x.py", argv)
+
+    def test_namespace_args_include_proc_and_unshare_pid(self):
+        self.assertIn("--unshare-pid", soak_leg.BWRAP_NAMESPACE_ARGS)
+        self.assertIn("--die-with-parent", soak_leg.BWRAP_NAMESPACE_ARGS)
+        i = soak_leg.BWRAP_NAMESPACE_ARGS.index("--proc")
+        self.assertEqual(soak_leg.BWRAP_NAMESPACE_ARGS[i + 1], "/proc")
+        self.assertEqual(soak_leg.namespaced(["x", "y"], "/b"),
+                         ["/b", *soak_leg.BWRAP_NAMESPACE_ARGS, "--", "x", "y"])
+
+    def test_missing_bwrap_is_a_setup_error_naming_bwrap_and_runs_nothing(self):
+        with self.assertRaises(soak_leg.SetupError) as cm:
+            soak_leg.require_bwrap(which=lambda n: None)
+        self.assertIn("bwrap", str(cm.exception))
+        runner = self._runner(_junit(_CASE_PASS))
+        stderr = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+            rc = soak_leg.main(["--venv", str(self.venv), "--out-dir", str(self.out)],
+                               runner=runner, repo_root=self.repo, which=lambda n: None)
+        self.assertEqual(rc, 2)
+        self.assertIn("bwrap", stderr.getvalue())
+        self.assertEqual(self._pytest_calls(runner), [])
+        self.assertEqual(self._git(runner)[-1][3:5], ["worktree", "remove"])
+
+    def test_failing_preflight_is_a_setup_error(self):
+        runner = self._runner(_junit(_CASE_PASS), rcs={"-- true": 1})
+        stderr = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+            rc = soak_leg.main(["--venv", str(self.venv), "--out-dir", str(self.out)],
+                               runner=runner, repo_root=self.repo, which=_which)
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot create the PID namespace", stderr.getvalue())
+        self.assertEqual(self._pytest_calls(runner), [])
+
+    def test_red_if_leg_b_fails(self):
+        rc, out, _ = self._main(_junit(_CASE_PASS), rcs={"pytest-tools-nested.xml": 1})
+        self.assertEqual(rc, 1)
+        self.assertIn("pytest_rc=0 nested_rc=1", out)
+        self.assertIn("-> RED", out)
+
+    def test_red_if_leg_a_fails(self):
+        rc, out, _ = self._main(_junit(_CASE_FAIL), rcs={"not nested_namespace": 1})
+        self.assertEqual(rc, 1)
+        self.assertIn("pytest_rc=1 nested_rc=0", out)
+        self.assertIn("-> RED", out)
+
+    def test_red_if_leg_b_report_is_missing(self):
+        def on_call(argv, kw):
+            if argv[:5] == ["git", "-C", str(self.repo), "worktree", "add"]:
+                _write_ci(self.wt)
+            if "nice" in argv and not any("nested.xml" in t for t in argv):
+                soak_leg.junit_path(self.out).write_text(_junit(_CASE_PASS), encoding="utf-8")
+        runner = FakeRunner(on_call=on_call, stdouts={"local-env-vars": "GIT_DIR\n",
+                                                      "rev-parse": SHA + "\n"})
+        rc, out, _ = self._main(None, runner=runner)
+        self.assertEqual(rc, 1)
+        self.assertIn("junit report unusable", out)
+
+    def test_leg_b_logs_to_its_own_file(self):
+        self._main(_junit(_CASE_PASS), extra=("--in-place",))
+        self.assertTrue((self.out / "pytest.log").is_file())
+        self.assertTrue((self.out / "pytest-nested.log").is_file())
+
+    def test_subset_tolerates_a_leg_that_collected_nothing_but_not_a_full_run(self):
+        def runner_without_nested_report():
+            def on_call(argv, kw):
+                if argv[:5] == ["git", "-C", str(self.repo), "worktree", "add"]:
+                    _write_ci(self.wt)
+                if "nice" in argv and not any("nested.xml" in t for t in argv):
+                    soak_leg.junit_path(self.out).write_text(_junit(_CASE_PASS), encoding="utf-8")
+            return FakeRunner(on_call=on_call, rcs={"pytest-tools-nested.xml": 5},
+                              stdouts={"local-env-vars": "GIT_DIR\n", "rev-parse": SHA + "\n"})
+        rc, out, _ = self._main(None, extra=("--paths", "tools/test_x.py"),
+                                runner=runner_without_nested_report())
+        self.assertEqual(rc, 0, out)
+        self.assertIn("nested_rc=5", out)
+        rc, out, _ = self._main(None, runner=runner_without_nested_report())
+        self.assertEqual(rc, 1)
 
     def test_workers_must_be_positive(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             soak_leg.parse_args(["--workers", "0"])
+
+
+NESTED_NAMESPACE_IDS = (
+    *(f"tools/germinate/host_substrate/tests/test_gate_acceptance_sandbox.py::{n}" for n in (
+        "test_the_sandbox_is_a_private_userns_with_a_private_etc",
+        "test_e17_forbidden_values_never_reach_the_sandbox",
+        "test_bootstrap_converges_every_family_and_the_invariants_hold",
+        "test_restorable_families_roll_back_exactly",
+        "test_mailbox_and_group_removal_have_no_argv",
+        "test_e19_the_broker_loads_unprivileged_and_refuses_namespace_root",
+        "test_e19_the_root_helper_leaves_both_journals_untouched",
+        "test_e20_sudoers_apply_runs_the_exact_sequence_with_parser_derived_evidence",
+        "test_e20_real_visudo_errors_and_warnings_fail_closed",
+        "test_e20_untracked_fragments_and_mode_drift_fail_closed",
+        "test_e20_rollback_is_exact_for_an_absent_and_a_tracked_prior_fragment",
+        "test_e33_one_human_approved_fragment_applies_verifies_revokes_and_rolls_back",
+        "test_e34_retirement_disables_the_seat_and_jobs_and_keeps_home_and_mailbox",
+        "test_e36_the_broker_daemon_context_is_refused_for_every_family_in_the_sandbox",
+        "test_f3_rolling_back_a_retire_restores_the_account_in_the_sandbox")),
+    *(f"tools/germinate/host_substrate/tests/test_host_port_observe.py::{n}" for n in (
+        "test_the_sandbox_root_is_ns_root_owned_so_the_walk_sees_a_trusted_root",
+        "test_sandbox_real_binaries_observe_parses_like_the_sandbox_port")),
+    *(f"tools/test_codex_acceptance_config_guard.py::ReplayPreservesBeforeOwnershipTests::{n}" for n in (
+        "test_scratch_prefix_snapshots_match_before_ownership_when_gid_differs",
+        "test_replay_refuses_when_before_ownership_cannot_be_mirrored")),
+)
+
+
+class NestedNamespaceMarkerTests(unittest.TestCase):
+    """The tests that fail only inside an outer namespace carry the marker, and the marker
+    changes nothing for plain CI (no -m): they are still collected there. Deliberately does
+    not pin the TOTAL marked count: a new legitimately nested test must not break this."""
+
+    def _collect(self, *extra: str) -> set[str]:
+        modules = sorted({i.split("::")[0] for i in NESTED_NAMESPACE_IDS})
+        r = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q",
+                            "-p", "no:cacheprovider", *extra, *modules],
+                           cwd=str(REPO), capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:] + r.stderr[-2000:])
+        return {line.strip() for line in r.stdout.splitlines() if "::" in line}
+
+    def test_the_known_nested_tests_are_marked(self):
+        marked = self._collect("-m", "nested_namespace")
+        self.assertLessEqual(set(NESTED_NAMESPACE_IDS), marked)
+
+    def test_plain_ci_collection_still_includes_them_and_leg_a_excludes_them(self):
+        everything = self._collect()
+        self.assertLessEqual(set(NESTED_NAMESPACE_IDS), everything)
+        self.assertFalse(set(NESTED_NAMESPACE_IDS) & self._collect("-m", "not nested_namespace"))
+
+    def test_the_marker_is_registered(self):
+        r = subprocess.run([sys.executable, "-m", "pytest", "--markers", "-p", "no:cacheprovider"],
+                           cwd=str(REPO / "tools"), capture_output=True, text=True)
+        self.assertIn("@pytest.mark.nested_namespace", r.stdout)
 
 
 if __name__ == "__main__":

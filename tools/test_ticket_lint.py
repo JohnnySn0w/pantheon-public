@@ -28,6 +28,7 @@ from unittest.mock import MagicMock, patch
 from tools._test_fixtures import (
     IntegrationEnv,
     assert_real_repo_untouched,
+    copy_tools_import_closure,
     git_head,
     setup_integration_env,
     snapshot_real_repo,
@@ -1336,14 +1337,7 @@ class TestRetargetDetachedHeadPush(unittest.TestCase):
         repo_tools = Path(__file__).resolve().parent
         wt_tools = self._env.repo_path / "tools"
         wt_tools.mkdir(parents=True, exist_ok=True)
-        for fname in ("ticket.py", "_git_utils.py", "agent_role_map.py", "hermes_action.py",
-                      "_md_table.py",  # T-1936: ticket.py's README-row emitter imports it
-                      "_security_gate.py",  # T-5678: ticket.py imports it
-                      "_frontmatter_block.py",  # T-5689: ticket.py imports it
-                      "priority_list_parse.py"):  # T-3020 BT3: ticket.py imports it at module scope
-            src = repo_tools / fname
-            if src.exists():
-                shutil.copy2(src, wt_tools / fname)
+        copy_tools_import_closure(wt_tools, source_tools=repo_tools)
         # ticket.py imports things from rulebook/ etc. — for the retarget code
         # path it just needs to read frontmatter + write transition log + git
         # commit, so we only need the helper modules above.
@@ -2146,6 +2140,68 @@ class TestOperatorUnattachedAsk(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("T-0311", proc.stdout)
+
+
+class TestWarnExcludedRatifiableClassT6071(unittest.TestCase):
+    """T-6071 / ORG-015: grandfathered excluded-class targets WARN, never fail."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        for st in ("inbox", "active", "done"):
+            (self.root / st).mkdir()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _t(self, tid: str, files: list[str], state: str = "active") -> Path:
+        p = self.root / state / f"{tid}.md"
+        _make_ticket(p, tid=tid, state=state, target="operator", intent="ratify",
+                     ratifiable_files=files)
+        return p
+
+    def test_warns_naming_each_grandfathered_ticket(self) -> None:
+        a = self._t("T-0001", ["pantheon-config:notes/x.md"])
+        b = self._t("T-0002", ["pantheon-config:adr/ORG-001-x.md"])
+        c = self._t("T-0003", ["pantheon-config:README.md"], state="done")
+        res = ticket_lint.warn_excluded_ratifiable_class([a, b, c])
+        self.assertEqual([r.tid for r in res], ["T-0001", "T-0003"])
+        for r in res:
+            self.assertEqual(r.action, ticket_lint.LintAction.WARN)
+            self.assertIn("ORG-015", r.description)
+
+    def test_digest_names_ticket(self) -> None:
+        a = self._t("T-0004", ["pantheon-config:notes/x.md"])
+        res = ticket_lint.warn_excluded_ratifiable_class([a])
+        msg = ticket_lint.build_lint_digest(
+            now_iso="2026-11-03 10:00 UTC", auto_fixed=[], flagged=[],
+            total_scanned=1, excluded_class_warned=res,
+        )
+        self.assertIn("T-0004", msg)
+        self.assertNotIn("all clean", msg)
+
+    def test_grandfathered_line_never_fails_dry_run_exit(self) -> None:
+        repo = self.root / "repo"
+        for st in ("inbox", "active", "done"):
+            (repo / "tickets" / st).mkdir(parents=True)
+        _make_ticket(repo / "tickets" / "active" / "T-0400.md", tid="T-0400",
+                     state="active", target="operator", intent="ratify",
+                     ratifiable_files=["pantheon-config:notes/x.md"])
+        proc = subprocess.run(
+            [sys.executable, str(Path(ticket_lint.__file__)), "--dry-run",
+             "--repo-root", str(repo)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("T-0400", proc.stdout)
+        self.assertIn("excluded class", proc.stdout)
+
+    def test_real_tree_has_warns_and_no_errors(self) -> None:
+        tickets = Path(__file__).resolve().parent.parent / "tickets"
+        paths = sorted(tickets.glob("*/T-*.md"))
+        res = ticket_lint.warn_excluded_ratifiable_class(paths)
+        self.assertGreater(len(res), 0)
+        self.assertTrue(all(r.action == ticket_lint.LintAction.WARN for r in res))
 
 
 if __name__ == "__main__":

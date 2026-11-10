@@ -48,7 +48,7 @@ REQUIRED: Final = frozenset(
         "side_effect_free",
     }
 )
-OPTIONAL: Final = frozenset({"gate", "execution_scope"})
+OPTIONAL: Final = frozenset({"gate", "execution_scope", "rollback_on_halt"})
 
 
 class OperationError(ValueError):
@@ -71,6 +71,10 @@ class Operation:
     side_effect_free: bool
     gate: str | None = None
     execution_scope: str = "all"
+    #: T-5866: opt-in. When this op HALTS, the engine runs rollback(run_id) at once (see
+    #: executor ``_rollback_on_halt``). Written to JSON only when True, so the plan bytes
+    #: and plan digest of every op that does not opt in are unchanged.
+    rollback_on_halt: bool = False
 
     def to_json_obj(self) -> dict[str, object]:
         out: dict[str, object] = {
@@ -89,6 +93,8 @@ class Operation:
             "side_effect_free": self.side_effect_free,
             "target": self.target,
         }
+        if self.rollback_on_halt:
+            out["rollback_on_halt"] = True
         return out
 
     def to_install_operation(self) -> InstallOperation:
@@ -133,6 +139,7 @@ def operation_from_json_obj(raw: Mapping[str, Any]) -> Operation:
         side_effect_free=raw["side_effect_free"],
         gate=raw.get("gate"),
         execution_scope=raw.get("execution_scope", "all"),
+        rollback_on_halt=raw.get("rollback_on_halt", False) is True,
     )
 
 
@@ -195,6 +202,9 @@ def parse_operation(raw: Any, *, contract: "LoadedContract", op_registry: OpRegi
     scope = raw.get("execution_scope", "all")
     if scope not in EXECUTION_SCOPES:
         raise OperationError(f"{where}: execution_scope {scope!r} not in {sorted(EXECUTION_SCOPES)}")
+    rollback_on_halt = raw.get("rollback_on_halt", False)
+    if not isinstance(rollback_on_halt, bool):
+        raise OperationError(f"{where}: rollback_on_halt must be a boolean")
     return Operation(
         operation_id=op_id,
         layer=layer,
@@ -210,4 +220,5 @@ def parse_operation(raw: Any, *, contract: "LoadedContract", op_registry: OpRegi
         side_effect_free=side_effect_free,
         gate=gate,
         execution_scope=scope,
+        rollback_on_halt=rollback_on_halt,
     )

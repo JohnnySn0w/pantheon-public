@@ -90,3 +90,23 @@ def test_gate_must_be_declared(contract):
 def test_op_id_alphabet_is_the_wals(contract):
     with pytest.raises(O.OperationError, match="operation_id"):
         _parse(contract, operation_id="op.1/../x")
+
+
+# --- T-5866: opt-in rollback_on_halt --------------------------------------------------------
+
+
+def test_rollback_on_halt_defaults_off_and_is_written_only_when_true(contract):
+    plain = _parse(contract)
+    assert plain.rollback_on_halt is False and "rollback_on_halt" not in plain.to_json_obj()
+    explicit_off = _parse(contract, rollback_on_halt=False)
+    assert explicit_off == plain and explicit_off.to_json_obj() == plain.to_json_obj()  # byte-identical plan data
+    on = _parse(contract, rollback_on_halt=True)
+    assert on.rollback_on_halt is True and on.to_json_obj() == dict(plain.to_json_obj(), rollback_on_halt=True)
+    assert O.operation_from_json_obj(on.to_json_obj()) == on  # survives plan.json (rollback reads it there)
+    assert O.operation_from_json_obj(plain.to_json_obj()) == plain
+
+
+@pytest.mark.parametrize("value", ["true", 1, 0, None, "yes"])
+def test_rollback_on_halt_must_be_a_boolean(contract, value):
+    with pytest.raises(O.OperationError, match="rollback_on_halt must be a boolean"):
+        _parse(contract, rollback_on_halt=value)

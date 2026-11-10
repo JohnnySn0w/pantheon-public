@@ -189,15 +189,14 @@ class MainTest(unittest.TestCase):
 
 
 class InRepoHarnessTest(unittest.TestCase):
-    """T-4763 (ORG-091): the in-repo harness/claude skill is the FIRST fallback, ahead of
-    the frozen ~/claude-config clone, and it is present and in sync in this repo."""
+    """T-4763 (ORG-091): the in-repo harness/claude skill is the FIRST fallback. T-4842: the
+    frozen ~/claude-config clone and the never-existing REPO/claude-config path are gone."""
 
     def test_in_repo_harness_is_first_fallback(self):
         self.assertEqual(
             Path(dsd.SKILL_FALLBACKS[0]),
             REPO_ROOT / "harness" / "claude" / "skills" / "pantheon-org-discipline" / "SKILL.md")
-        frozen = os.path.expanduser("~/claude-config/skills/pantheon-org-discipline/SKILL.md")
-        self.assertGreater(dsd.SKILL_FALLBACKS.index(frozen), 0)
+        self.assertFalse(any("claude-config" in c for c in dsd.SKILL_FALLBACKS))
 
     def test_unconfigured_run_resolves_the_in_repo_skill(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -211,6 +210,108 @@ class InRepoHarnessTest(unittest.TestCase):
             rc = dsd.main()
         self.assertEqual(rc, 0, buf.getvalue())
         self.assertIn("OK", buf.getvalue())
+
+
+class ConfiguredPathNeverFallsThroughTest(unittest.TestCase):
+    """T-4842: a configured (--skill / $ORG_SKILL_PATH) but missing path must SKIP, never
+    fall through to a fallback and report OK against a file the seat does not load."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+        self.directives = os.path.join(self.tmp, "directives.md")
+        Path(self.directives).write_text("## D1 - a\n## D2 - b\n", encoding="utf-8")
+        # A PRESENT, in-sync fallback: falling through to it would print OK.
+        self.fallback = os.path.join(self.tmp, "fallback.md")
+        Path(self.fallback).write_text("D1 D2\n", encoding="utf-8")
+        self.good = os.path.join(self.tmp, "good.md")
+        Path(self.good).write_text("D1 D2\n", encoding="utf-8")
+        self.bad = os.path.join(self.tmp, "bad.md")
+        Path(self.bad).write_text("D1 only\n", encoding="utf-8")
+        self.missing = os.path.join(self.tmp, "missing.md")
+        for name, val in (("DIRECTIVES", self.directives), ("SKILL_FALLBACKS", [self.fallback])):
+            orig = getattr(dsd, name)
+            setattr(dsd, name, val)
+            self.addCleanup(setattr, dsd, name, orig)
+
+    def _run(self, argv, env=None):
+        buf = io.StringIO()
+        with patch.object(sys, "argv", ["prog", *argv]), \
+             patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ORG_SKILL_PATH", None)
+            if env:
+                os.environ["ORG_SKILL_PATH"] = env
+            with redirect_stdout(buf):
+                rc = dsd.main()
+        return rc, buf.getvalue()
+
+    def _assert_configured_skip(self, rc, out, path):
+        self.assertEqual(rc, 0)
+        self.assertIn("SKIP", out)
+        self.assertNotIn("OK", out)
+        self.assertIn(path, out)
+        self.assertNotIn(self.fallback, out)
+        self.assertIn("configured harness skill path not found", out)
+        self.assertNotIn("no harness-config repo configured", out)
+
+    def test_missing_skill_arg_skips_not_fallback(self):
+        rc, out = self._run([f"--skill={self.missing}"])
+        self._assert_configured_skip(rc, out, self.missing)
+
+    def test_missing_env_skips_not_fallback(self):
+        rc, out = self._run([], env=self.missing)
+        self._assert_configured_skip(rc, out, self.missing)
+
+    def test_missing_skill_arg_beats_existing_env(self):
+        # --skill wins over $ORG_SKILL_PATH; it is missing, so SKIP (not the env file).
+        rc, out = self._run([f"--skill={self.missing}"], env=self.good)
+        self._assert_configured_skip(rc, out, self.missing)
+
+    def test_existing_skill_arg_beats_missing_env(self):
+        rc, out = self._run([f"--skill={self.good}"], env=self.missing)
+        self.assertEqual(rc, 0)
+        self.assertIn("OK", out)
+        self.assertIn(self.good, out)
+
+    def test_existing_configured_path_drift_is_checked_on_that_file(self):
+        rc, out = self._run([f"--skill={self.bad}"])
+        self.assertEqual(rc, 1)
+        self.assertIn("DRIFT", out)
+        self.assertIn(self.bad, out)
+
+    def test_existing_env_path_is_checked(self):
+        rc, out = self._run([], env=self.good)
+        self.assertEqual(rc, 0)
+        self.assertIn(self.good, out)
+
+    def test_nothing_configured_uses_fallback(self):
+        rc, out = self._run([])
+        self.assertEqual(rc, 0)
+        self.assertIn("OK", out)
+        self.assertIn(self.fallback, out)
+
+    def test_nothing_configured_no_fallback_is_not_configured_skip(self):
+        dsd.SKILL_FALLBACKS = [self.missing]
+        rc, out = self._run([])
+        self.assertEqual(rc, 0)
+        self.assertIn("no harness-config repo configured", out)
+        self.assertNotIn("configured harness skill path not found", out)
+
+    def test_home_claude_config_is_not_consulted(self):
+        # Real fallbacks recomputed with HOME pointing at a tmp dir holding the old clone's skill.
+        import importlib
+        home = os.path.join(self.tmp, "home")
+        old = os.path.join(home, "claude-config", "skills", "pantheon-org-discipline")
+        os.makedirs(old)
+        stale = os.path.join(old, "SKILL.md")
+        Path(stale).write_text("D1 D2\n", encoding="utf-8")
+        try:
+            with patch.dict(os.environ, {"HOME": home}):
+                importlib.reload(dsd)
+                self.assertNotIn(stale, dsd.SKILL_FALLBACKS)
+                self.assertFalse(any("claude-config" in c for c in dsd.SKILL_FALLBACKS))
+        finally:
+            importlib.reload(dsd)
 
 
 if __name__ == "__main__":

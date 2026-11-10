@@ -1,0 +1,20 @@
+[Unit]
+# T-4536 rollout (d), T-5933: per-turn usage rows for a Codex seat (persona %i).
+# Install as that seat's OWN account (consultant -> codex, watchman -> codex-fallback): its
+# rollouts and app-server OAuth state under ~/.codex are private, and the export refuses any --seat but the
+# caller's own (PANTHEON_FLEET_USAGE_SEAT below). It rewrites only
+# /var/lib/pantheon/fleet-usage/turns/%i/<day>.jsonl for the last 2 UTC days plus
+# /var/lib/pantheon/fleet-usage/turns/%i/quota.json from account/rateLimits/read, atomically,
+# and never touches git. Prerequisite (root, once): turns/%i pre-created as
+# <account>:pantheon-shared 2755, because the codex accounts are not in pantheon-shared and
+# so cannot create it under the root-owned 3775 turns/.
+Description=Pantheon fleet usage: export Codex rollout usage rows for seat %i
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PANTHEON_FLEET_USAGE_SEAT=%i
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/fleet_usage_codex.py export --seat %i --sessions %h/.codex/sessions --days 2 --commit
+TimeoutStartSec=5min
+Nice=10

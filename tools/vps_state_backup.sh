@@ -145,7 +145,38 @@ if git diff --cached --quiet; then
 fi
 git -c user.name='vps-backup' -c user.email='vps-backup@pantheon.local' \
   commit -q -m "vps-state backup $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# --- T-5993 mirror leg: begin ---
+# ORG-101 dual-write leg (T-4705 / T-5993). Root must never import code from a
+# claude-writable checkout, so _git_utils is imported only from a lib dir that the
+# running uid owns and nobody else can write (the installed_copy_drift rule):
+# every entry under it, the dir included, must be owned by this uid, have no group
+# or world write bit, and not be a symlink. python3 -I ignores PYTHONPATH and the
+# user site. Every outcome prints one line and returns 0: the mirror is
+# best-effort, origin already landed, and the backup never fails on this leg.
+mirror_leg() {
+  local repo="$1" lib="${VPS_BACKUP_MIRROR_TOOLS_DIR:-/usr/local/lib/pantheon-vps-backup}" bad note
+  if [ ! -d "$lib/tools" ] || [ ! -f "$lib/tools/_git_utils.py" ]; then
+    echo "vps_state_backup: mirror leg: skipped (no lib at $lib)"
+    return 0
+  fi
+  bad="$(find "$lib" \( -type l -o ! -uid "$(id -u)" -o -perm /022 \) -print -quit 2>/dev/null)" || bad="find failed"
+  if [ -n "$bad" ]; then
+    echo "vps_state_backup: mirror leg: skipped (unsafe: $bad)"
+    return 0
+  fi
+  note="$(cd / && python3 -I -c '
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import _git_utils
+print(_git_utils.mirror_push_after_origin(Path(sys.argv[2]), "main:main") or "inert")
+' "$lib/tools" "$repo" 2>/dev/null | tail -n 1)" || note=""
+  echo "vps_state_backup: mirror leg: ${note:-error (the mirror helper failed)}"
+  return 0
+}
 if [ "${VPS_BACKUP_NO_PUSH:-0}" != "1" ]; then
   git push -q origin main
+  mirror_leg "$REPO_DIR" || true
 fi
+# --- T-5993 mirror leg: end ---
 echo "vps_state_backup: committed + ${VPS_BACKUP_NO_PUSH:+(push skipped) }pushed"

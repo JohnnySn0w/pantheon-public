@@ -370,14 +370,21 @@ def test_real_every_installer_kind_has_exactly_one_mapping_and_one_handler():
 
 
 def test_real_op_kinds_literal_is_unchanged():
-    """ORG-080 D-AC / mason ruling: identity mapping, so OP_KINDS gains nothing."""
+    """ORG-080 D-AC / mason ruling: identity mapping, so the install leg adds nothing to
+    OP_KINDS. (T-5830 later added sub-op (a)'s isolated harness.supervisor block; it is
+    pinned in test_harness_manager_supervisor; T-5858 added configure run_state's isolated
+    harness.run-state block, pinned in test_harness_manager_run_state; T-5859 added the remove
+    leg's isolated harness.decommission block, pinned in test_harness_manager_remove.)"""
 
-    assert read_op_kinds(CID, HANDLERS) == {
+    kinds = read_op_kinds(CID, HANDLERS)
+    others = ("harness.supervisor", "harness.run-state", "harness.decommission")
+    assert {k: v for k, v in kinds.items() if v[0] not in others} == {
         "harness.transition-stage": ("harness.runtime", "seat"),
         "harness.receiver-handoff": ("harness.runtime", "seat"),
         "harness.runtime-replace": ("harness.runtime", "seat"),
         "harness.transition-commit": ("harness.runtime", "seat"),
     }
+    assert not set(kinds) & set(HM._INSTALL_KIND_MAP)
 
 
 # --- structural pins ------------------------------------------------------------

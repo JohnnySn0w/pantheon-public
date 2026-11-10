@@ -1383,9 +1383,16 @@ _NEUTERING_HOOKS = frozenset({
     "pytest_pycollect_makeitem", "pytest_collect_directory", "pytest_runtest_protocol",
     "pytest_runtest_setup", "pytest_runtest_call", "pytest_runtest_makereport", "pytest_sessionfinish",
 })
-# (repo-relative path, hook) pairs a reviewer has read and accepted. Empty today: no conftest
-# in the repo defines any of the hooks above.
-_SANCTIONED_HOOKS: frozenset[tuple[str, str]] = frozenset()
+# (repo-relative path, hook) pairs a reviewer has read and accepted. One today; any other
+# conftest hook above still fails closed.
+#   tools/conftest.py pytest_sessionfinish (T-6118): the real-state tripwire. It can only flip
+#   exitstatus 0 to TESTS_FAILED, and only when the running account's real Chronicle/personas
+#   state changed. It never turns a failure into a pass and never drops or re-grades a test. It
+#   is a no-op in CI (missing roots read as empty). Under PANTHEON_REAL_STATE_TRIPWIRE=warn it
+#   only prints; under =off it does nothing. Pinned by tools/test_t6118_sessionfinish_contract.py.
+_SANCTIONED_HOOKS: frozenset[tuple[str, str]] = frozenset({
+    ("tools/conftest.py", "pytest_sessionfinish"),
+})
 _PRUNE = frozenset({"node_modules", "venv", "build", "dist", "__pycache__"})
 
 
@@ -2811,20 +2818,34 @@ class TheTreeGuard(unittest.TestCase):
                 self.assertTrue(any("pytest_collection_modifyitems" in v for v in found), found)
 
     def test_every_spelling_of_a_neutering_hook_is_caught(self):
-        for src in (
-            "def pytest_collection_modifyitems(config, items):\n    for i in items: i.add_marker('skip')\n",
-            "import pytest\n@pytest.hookimpl(tryfirst=True)\ndef pytest_collection_modifyitems(items):\n    config.hook.pytest_deselected(items=items)\n",
-            "class P:\n    def pytest_collection_modifyitems(self, items):\n        pass\n",
-            "def _h(items): pass\npytest_collection_modifyitems = _h\n",
-            "def pytest_ignore_collect(collection_path):\n    return True\n",
-            "def pytest_sessionfinish(session, exitstatus):\n    session.exitstatus = 0\n",
-            "import pytest\n@pytest.hookimpl(wrapper=True)\ndef pytest_runtest_makereport(item, call):\n    r = yield\n    r.outcome = 'passed'\n    return r\n",
-            "def pytest_runtest_setup(item):\n    import pytest; pytest.skip('x')\n",
-            "async def pytest_collection(session):\n    return True\n",
+        for rel, src in (
+            ("tools/conftest.py", "def pytest_collection_modifyitems(config, items):\n    for i in items: i.add_marker('skip')\n"),
+            ("tools/conftest.py", "import pytest\n@pytest.hookimpl(tryfirst=True)\ndef pytest_collection_modifyitems(items):\n    config.hook.pytest_deselected(items=items)\n"),
+            ("tools/conftest.py", "class P:\n    def pytest_collection_modifyitems(self, items):\n        pass\n"),
+            ("tools/conftest.py", "def _h(items): pass\npytest_collection_modifyitems = _h\n"),
+            ("tools/conftest.py", "def pytest_ignore_collect(collection_path):\n    return True\n"),
+            ("tools/sub/conftest.py", "def pytest_sessionfinish(session, exitstatus):\n    session.exitstatus = 0\n"),
+            ("tools/conftest.py", "import pytest\n@pytest.hookimpl(wrapper=True)\ndef pytest_runtest_makereport(item, call):\n    r = yield\n    r.outcome = 'passed'\n    return r\n"),
+            ("tools/conftest.py", "def pytest_runtest_setup(item):\n    import pytest; pytest.skip('x')\n"),
+            ("tools/conftest.py", "async def pytest_collection(session):\n    return True\n"),
         ):
-            with self.subTest(src=src):
-                self.write("tools/conftest.py", src)
+            with self.subTest(rel=rel, src=src):
+                for path in self.repo.rglob("conftest.py"):
+                    path.unlink()
+                self.write(rel, src)
                 self.assertTrue(tree_violations(self.repo))
+
+    def test_a_sanctioned_hook_does_not_sanction_other_hooks_in_the_same_file(self):
+        self.write(
+            "tools/conftest.py",
+            "def pytest_sessionfinish(session, exitstatus):\n"
+            "    session.exitstatus = 0\n"
+            "def pytest_ignore_collect(collection_path):\n"
+            "    return True\n",
+        )
+        found = tree_violations(self.repo)
+        self.assertTrue(any("pytest_ignore_collect" in violation for violation in found), found)
+        self.assertFalse(any("pytest_sessionfinish" in violation for violation in found), found)
 
     def test_a_hook_only_in_a_string_or_a_non_conftest_module_is_not_a_hook(self):
         self.write("tools/neutralize_x.py", "T = '''\\ndef pytest_collection_modifyitems(config, items):\\n    pass\\n'''\n"

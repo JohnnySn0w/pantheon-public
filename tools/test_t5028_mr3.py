@@ -18,11 +18,23 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+try:
+    from tools import _seat_state_isolation
+except ImportError:  # pragma: no cover
+    import _seat_state_isolation  # type: ignore[no-redef]
 from tools import fleet_health
 from tools import harness
 from tools import harness_state as hs
 from tools import runtime_controller as rc
 from tools import test_t5021_runtime_hold_both_planes as t5021
+
+
+def setUpModule() -> None:
+    _seat_state_isolation.start()
+
+
+def tearDownModule() -> None:
+    _seat_state_isolation.stop()
 
 
 def _entries(ledger_dir: Path) -> list[dict]:

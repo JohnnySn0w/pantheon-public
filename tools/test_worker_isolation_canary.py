@@ -37,6 +37,12 @@ PREFLIGHT_SECTION = "Pre-flight: cwd discipline"
 
 
 AGENTS_DIR = Path(__file__).resolve().parent.parent / "harness" / "claude" / "agents"
+DISPATCH_SOP = (
+    Path(__file__).resolve().parent.parent
+    / "sop"
+    / "standard"
+    / "staging-a-worker-dispatch.md"
+)
 
 
 class TestPersonaCwdGuard(unittest.TestCase):
@@ -46,6 +52,7 @@ class TestPersonaCwdGuard(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.implementer = (AGENTS_DIR / "implementer.md").read_text()
         cls.reviewer = (AGENTS_DIR / "reviewer.md").read_text()
+        cls.dispatch_sop = DISPATCH_SOP.read_text()
 
     # --- implementer.md checks ---
 
@@ -121,6 +128,22 @@ class TestPersonaCwdGuard(unittest.TestCase):
             missing,
             [],
             f"reviewer.md missing canonical paths: {missing}",
+        )
+
+    def test_reviewer_uses_operator_directed_fable_model(self) -> None:
+        frontmatter = self.reviewer.split("---", 2)[1]
+        self.assertIn("\nmodel: claude-fable-5-1\n", frontmatter)
+        self.assertNotIn("\nmodel: sonnet\n", frontmatter)
+
+    def test_dispatch_fallback_preserves_reviewer_fable_exception(self) -> None:
+        self.assertIn("Reviewers run on Fable 5.1", self.dispatch_sop)
+        self.assertIn(
+            'pass `model: "claude-fable-5-1"` for reviewer Agent calls',
+            self.dispatch_sop,
+        )
+        self.assertIn(
+            '`model: "sonnet"` for all other worker Agent calls',
+            self.dispatch_sop,
         )
 
 

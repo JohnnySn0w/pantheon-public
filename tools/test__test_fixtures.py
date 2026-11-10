@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -31,9 +32,93 @@ from tools._test_fixtures import (
     assert_real_repo_untouched,
     TicketTreeWatch,
     contained_path,
+    copy_tools_import_closure,
     local_only_commits,
     snapshot_real_repo,
 )
+
+
+# ---------------------------------------------------------------------------
+# Tests for synthetic-repo tools import closure
+# ---------------------------------------------------------------------------
+
+
+class TestCopyToolsImportClosure(unittest.TestCase):
+    def test_new_import_and_its_transitive_import_are_copied_automatically(self) -> None:
+        """A newly imported local module needs no hand-maintained copy list."""
+        with tempfile.TemporaryDirectory(prefix="tfix_imports_") as tmp_str:
+            base = Path(tmp_str)
+            source_tools = base / "source" / "tools"
+            destination_tools = base / "destination" / "tools"
+            source_tools.mkdir(parents=True)
+            (source_tools / "__init__.py").write_text("", encoding="utf-8")
+            (source_tools / "ticket.py").write_text(
+                "from tools import newly_added\n"
+                "if True:\n"
+                "    from tools import conditional_import\n"
+                "try:\n"
+                "    from tools import guarded_import\n"
+                "except ImportError:\n"
+                "    pass\n"
+                "def lazy_import():\n"
+                "    from tools import function_local_import\n"
+                "class LazyImports:\n"
+                "    from tools import class_local_import\n"
+                "    def lazy_method(self):\n"
+                "        from tools import method_local_import\n",
+                encoding="utf-8",
+            )
+            (source_tools / "newly_added.py").write_text(
+                "from tools.transitive_leaf import VALUE\n", encoding="utf-8"
+            )
+            (source_tools / "transitive_leaf.py").write_text(
+                "VALUE = 1\n", encoding="utf-8"
+            )
+            for module_name in (
+                "conditional_import",
+                "guarded_import",
+                "function_local_import",
+                "class_local_import",
+                "method_local_import",
+            ):
+                (source_tools / f"{module_name}.py").write_text(
+                    "VALUE = 1\n", encoding="utf-8"
+                )
+
+            copied = copy_tools_import_closure(
+                destination_tools,
+                source_tools=source_tools,
+            )
+
+            self.assertEqual(
+                set(copied),
+                {
+                    Path("__init__.py"),
+                    Path("ticket.py"),
+                    Path("newly_added.py"),
+                    Path("transitive_leaf.py"),
+                    Path("conditional_import.py"),
+                    Path("guarded_import.py"),
+                    Path("class_local_import.py"),
+                },
+            )
+            self.assertNotIn(Path("function_local_import.py"), copied)
+            self.assertNotIn(Path("method_local_import.py"), copied)
+            for relative_path in copied:
+                self.assertEqual(
+                    (destination_tools / relative_path).read_bytes(),
+                    (source_tools / relative_path).read_bytes(),
+                )
+
+            imported = subprocess.run(
+                [sys.executable, "-c", "import tools.ticket"],
+                cwd=base / "destination",
+                env={**os.environ, "PYTHONPATH": str(base / "destination")},
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(imported.returncode, 0, imported.stderr)
 
 
 # ---------------------------------------------------------------------------

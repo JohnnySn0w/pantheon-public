@@ -301,6 +301,26 @@ class TestComposerPredicate(unittest.TestCase):
         self.assertTrue(sv.submit_pending(self.profile, pane, text))
 
 
+class TestHermesBusyComposerPredicate(unittest.TestCase):
+    TEXT = "Resume the queued recovery check and report its result."
+
+    def test_busy_status_prefixed_composer_keeps_pending_text(self):
+        profile = sv.get_profile("hermes")
+        pane = f"turn output\n☤ ❯ {self.TEXT}\n⏱ 12s\n"
+        self.assertTrue(
+            sv.submit_pending(profile, pane, self.TEXT),
+            "pending text in the measured busy composer must not read submitted",
+        )
+
+    def test_prefix_allowance_is_hermes_only(self):
+        claude = sv.get_profile("claude-code")
+        codex = sv.get_profile("codex")
+        self.assertFalse(sv.submit_pending(claude, f"☤ ❯ {self.TEXT}\n", self.TEXT))
+        self.assertFalse(sv.submit_pending(codex, f"☤ › {self.TEXT}\n", self.TEXT))
+        self.assertTrue(sv.submit_pending(claude, f"❯ {self.TEXT}\n", self.TEXT))
+        self.assertTrue(sv.submit_pending(codex, f"› {self.TEXT}\n", self.TEXT))
+
+
 # --------------------------------------------------------------------------- #
 # Unknown strategy.                                                            #
 # --------------------------------------------------------------------------- #
@@ -527,6 +547,7 @@ class TestAutoModeNudge(unittest.TestCase):
 class TestSubmitVerifyClaudeCode(unittest.TestCase):
     def setUp(self):
         self.profile = dict(sv.get_profile("claude-code"))
+        self.profile.pop("render_wait_s")  # exercise the post-Enter algorithm in isolation
         self.profile["settle_delay_s"] = 0  # no real sleeping
 
     def _run(self, fake):
@@ -584,7 +605,9 @@ class TestSubmitVerifyCodex(unittest.TestCase):
 
     def test_codex_success_when_composer_clears(self):
         text = "[inbound Telegram DM from the operator | chat_id=9 | message_id=1] yo"
-        fake = FakePane([f"› {text}", f"› {text}", "› Type a message"])  # post-Enter, pre-retry (T-5380 r2), cleared
+        # T-6130 gate: pre-paste capture (blank), render gate (pending); then
+        # post-Enter, pre-retry (T-5380 r2), cleared.
+        fake = FakePane(["› Type a message", f"› {text}", f"› {text}", f"› {text}", "› Type a message"])
         r = sv.submit_verify(
             self.profile, "codex-session", text,
             send_text=fake.send_text, send_enter=fake.send_enter,
@@ -717,7 +740,8 @@ class TestCLI(unittest.TestCase):
     def test_cli_success_returns_0(self):
         with mock.patch.object(sv, "tmux_send_text", return_value=True), \
              mock.patch.object(sv, "tmux_send_enter", return_value=True), \
-             mock.patch.object(sv, "tmux_capture", return_value="clean pane"), \
+             mock.patch.object(sv, "tmux_capture",
+                               side_effect=["❯ hello", "clean pane", "clean pane"]), \
              mock.patch.object(sv.time, "sleep", _no_sleep), \
              mock.patch.dict(os.environ, {"INJECT_ENTER_DELAY": "0"}):
             rc = sv.main(["--harness", "claude-code", "--", "p:0.0", "hello"])
@@ -869,6 +893,7 @@ def _submitted_pane(prompt_lines):
 class TestHeadScrolledComposer(unittest.TestCase):
     def setUp(self):
         self.profile = dict(sv.get_profile("claude-code"))
+        self.profile.pop("render_wait_s")  # exercise the post-Enter algorithm in isolation
         self.profile["settle_delay_s"] = 0
 
     def _run(self, fake, prompt):
@@ -942,6 +967,7 @@ class TestHeadScrolledComposer(unittest.TestCase):
 class TestPreRetryRecheck(unittest.TestCase):
     def setUp(self):
         self.profile = dict(sv.get_profile("claude-code"))
+        self.profile.pop("render_wait_s")  # exercise retry semantics in isolation
         self.profile["settle_delay_s"] = 0
 
     def _run(self, fake, prompt=None):
@@ -1057,6 +1083,7 @@ class TestEmptyPostEnterCapture(unittest.TestCase):
 
     def setUp(self):
         self.profile = dict(sv.get_profile("claude-code"))
+        self.profile.pop("render_wait_s")  # exercise post-Enter empty-capture handling
         self.profile["settle_delay_s"] = 0
 
     def _run(self, fake):
@@ -1277,6 +1304,252 @@ class TestCodexRealCaptures(unittest.TestCase):
             self.profile, pane, "T-4987 an unrelated injected text for the busy baseline"))
         self.assertEqual(sv.busy_reason(pane), "generating")
 
+
+class ClockedPane(FakePane):
+    """FakePane whose capture() is a function of fake time (advanced by sleep()),
+    so a test can say "the paste renders 3s after it was typed"."""
+
+    def __init__(self, render_after_s=None, *, text, submit_on_enter=True):
+        super().__init__([])
+        self.t = 0.0
+        self.text = text
+        self.render_after_s = render_after_s
+        self.typed_at = None
+        self.submit_on_enter = submit_on_enter
+        self.submitted = False
+        self.events = []
+
+    def sleep(self, secs):
+        self.t += secs
+
+    def send_text(self, pane, text):
+        self.typed_at = self.t
+        self.events.append(("text", self.t))
+        return super().send_text(pane, text)
+
+    def send_enter(self, pane):
+        self.events.append(("enter", self.t))
+        rendered = (self.typed_at is not None and self.render_after_s is not None
+                    and self.t - self.typed_at >= self.render_after_s)
+        # A fresh TUI swallows an Enter that lands before the paste has rendered.
+        if rendered and self.submit_on_enter:
+            self.submitted = True
+        return super().send_enter(pane)
+
+    def capture(self, pane):
+        if self.submitted or self.typed_at is None:
+            return "› Type a message"
+        if self.render_after_s is not None and self.t - self.typed_at >= self.render_after_s:
+            return f"› {self.text}"
+        return "› Type a message"
+
+
+class GlyphClockedPane(ClockedPane):
+    """ClockedPane with a configurable composer glyph (claude-code / hermes use U+276F)."""
+
+    def __init__(self, render_after_s=None, *, text, glyph):
+        super().__init__(render_after_s, text=text)
+        self.glyph = glyph
+
+    def capture(self, pane):
+        return super().capture(pane).replace("›", self.glyph, 1)
+
+
+class TestRenderGateOptIn(unittest.TestCase):
+    """T-6132: Claude gates by default; Hermes remains measurement-gated opt-in."""
+
+    TEXT = "You just (re)started. Resume the standing instructions and report back."
+
+    def run_sv(self, harness, env):
+        pane = GlyphClockedPane(render_after_s=3.0, text=self.TEXT, glyph="❯")
+        with mock.patch.dict(os.environ, env, clear=False):
+            for k in ("RENDER_WAIT_S", "INJECT_ENTER_DELAY", "SUBMIT_RETRIES"):
+                if k not in env:
+                    os.environ.pop(k, None)
+            prof = sv._profile_with_env_overrides(harness)
+        prof["settle_delay_s"] = 0
+        r = sv.submit_verify(prof, "pane", self.TEXT, send_text=pane.send_text,
+                             send_enter=pane.send_enter, capture=pane.capture, sleep=pane.sleep)
+        return r, pane
+
+    def test_late_render_false_passes_today_without_the_gate(self):
+        # The hole the ticket names: Enter lands before the paste renders (swallowed),
+        # the blank composer reads "submitted", and nothing was submitted.
+        r, pane = self.run_sv("hermes", {})
+        self.assertTrue(r.ok)
+        self.assertFalse(pane.submitted, "hermes: expected the false-pass")
+
+    def test_claude_default_gate_closes_late_render_false_pass(self):
+        r, pane = self.run_sv("claude-code", {})
+        self.assertTrue(r.ok, r)
+        self.assertTrue(pane.submitted)
+        first_enter = next(t for kind, t in pane.events if kind == "enter")
+        self.assertGreaterEqual(first_enter, 3.0)
+
+    def test_render_wait_env_closes_it(self):
+        for harness in ("claude-code", "hermes"):
+            r, pane = self.run_sv(harness, {"RENDER_WAIT_S": "8"})
+            self.assertTrue(r.ok, (harness, r))
+            self.assertTrue(pane.submitted, harness)
+            first_enter = next(t for kind, t in pane.events if kind == "enter")
+            self.assertGreaterEqual(first_enter, 3.0, harness)
+
+    def test_bad_or_zero_render_wait_env_preserves_the_claude_default(self):
+        for val in ("", "abc", "-1", "0", "nan"):
+            with mock.patch.dict(os.environ, {"RENDER_WAIT_S": val}):
+                prof = sv._profile_with_env_overrides("claude-code")
+            self.assertEqual(prof.get("render_wait_s"), 8.0, val)
+
+    def test_render_wait_env_is_finite_and_capped(self):
+        # reviewer (T-6132): inf would make the gate poll forever on a never-rendered text
+        for val, want in (("inf", sv.MAX_RENDER_WAIT_S), ("1e999", sv.MAX_RENDER_WAIT_S),
+                          ("600", sv.MAX_RENDER_WAIT_S), (" 8\n", 8.0)):
+            with mock.patch.dict(os.environ, {"RENDER_WAIT_S": val}):
+                prof = sv._profile_with_env_overrides("claude-code")
+            self.assertEqual(prof.get("render_wait_s"), want, repr(val))
+
+    def test_profile_defaults_match_measured_rollout(self):
+        self.assertEqual(sv.get_profile("claude-code")["render_wait_s"], 8.0)
+        self.assertNotIn("render_wait_s", sv.get_profile("hermes"))
+
+
+class TestRenderGate(unittest.TestCase):
+    """T-6130: the fresh-TUI render race (consultant 2026-11-03 22:57Z)."""
+
+    TEXT = "You (codex) just (re)started. Resume the standing instructions and report."
+
+    @staticmethod
+    def watchman_pending_fixture():
+        """T-5739: Recovery's 2026-10-29 two-line collapsed wake capture shape."""
+        return (
+            Path(__file__).with_name("testdata")
+            / "watchman_pending_collapsed_wake_2026-10-29.txt"
+        ).read_text(encoding="utf-8")
+
+    def run_sv(self, pane, profile=None):
+        prof = dict(profile or sv.get_profile("codex"))
+        prof["settle_delay_s"] = 0
+        return sv.submit_verify(prof, "codex-session", self.TEXT, send_text=pane.send_text,
+                                send_enter=pane.send_enter, capture=pane.capture,
+                                sleep=pane.sleep)
+
+    def test_codex_profile_gates_and_other_profiles_do_not(self):
+        self.assertEqual(sv.get_profile("codex")["render_wait_s"], 8.0)
+        self.assertEqual(sv.get_profile("claude-code")["render_wait_s"], 8.0)
+        self.assertNotIn("render_wait_s", sv.get_profile("hermes"))
+
+    def test_late_render_incident_replay_enter_waits_for_the_text(self):
+        # The text renders 3s after typing. The old algorithm sent Enter at ~0s
+        # (swallowed), read the blank composer as submitted and returned ok=True.
+        pane = ClockedPane(render_after_s=3.0, text=self.TEXT)
+        r = self.run_sv(pane)
+        self.assertTrue(r.ok, r)
+        self.assertTrue(pane.submitted, "the Enter was sent before the paste rendered")
+        first_enter_t = next(t for kind, t in pane.events if kind == "enter")
+        self.assertGreaterEqual(first_enter_t, 3.0)
+
+    def test_text_that_never_renders_is_unverified_and_sends_no_enter(self):
+        pane = ClockedPane(render_after_s=None, text=self.TEXT)
+        r = self.run_sv(pane)
+        self.assertFalse(r.ok)
+        self.assertIn("never observed", r.detail)
+        self.assertEqual(pane.enter_calls, 0)
+        self.assertLessEqual(pane.t, 8.5, "gate is bounded by render_wait_s")
+
+    def test_blank_pane_never_confirms(self):
+        # Every capture empty (a failed capture reads ""): not a vote, not a confirm.
+        fake = FakePane([""])
+        r = self.run_sv_fake(fake)
+        self.assertFalse(r.ok)
+        self.assertEqual(fake.enter_calls, 0)
+
+    def run_sv_fake(self, fake):
+        prof = dict(sv.get_profile("codex"))
+        prof["settle_delay_s"] = 0
+        return sv.submit_verify(prof, "codex-session", self.TEXT, send_text=fake.send_text,
+                                send_enter=fake.send_enter, capture=fake.capture,
+                                sleep=_no_sleep)
+
+    def test_retry_does_not_repaste_over_its_own_pending_text(self):
+        # An earlier call pasted the text and gave up; the caller retries. The
+        # composer already holds it: no second send_text, just Enter + verify.
+        fake = FakePane([f"› {self.TEXT}", f"› {self.TEXT}", f"› {self.TEXT}", "› Type a message",
+                         "› Type a message", "› Type a message"])
+        r = self.run_sv_fake(fake)
+        self.assertTrue(r.ok, r)
+        self.assertEqual(fake.text_calls, 0)
+        self.assertGreaterEqual(fake.enter_calls, 1)
+
+    def test_collapsed_paste_counts_as_rendered(self):
+        collapsed = "› [Pasted Content 1020 chars]"
+        fake = FakePane([collapsed, collapsed, "› Type a message", "› Type a message",
+                         "› Type a message"])
+        r = self.run_sv_fake(fake)
+        self.assertTrue(r.ok, r)
+
+    def test_watchman_two_line_collapsed_wake_is_pending(self):
+        pane = self.watchman_pending_fixture()
+        self.assertTrue(sv.submit_pending(sv.get_profile("codex"), pane, self.TEXT))
+
+    def test_acceptance_waits_for_watchman_collapsed_wake_to_clear(self):
+        pending = self.watchman_pending_fixture()
+        cleared = "› Type a message\n\n  gpt-5.6-sol xhigh fast · ~ · Main [default]\n"
+        # The first capture discovers an earlier stuck wake, so the verifier
+        # must not paste a duplicate. The first Enter still leaves Recovery's exact
+        # two-line collapsed shape in the composer; only the second clears it.
+        # Two cleared samples are required before runtime_submission_accepted.
+        fake = FakePane([pending, pending, pending, cleared, cleared])
+
+        r = self.run_sv_fake(fake)
+
+        self.assertTrue(r.ok, r)
+        self.assertEqual(r.attempts, 2)
+        self.assertEqual(fake.text_calls, 0)
+        self.assertEqual(fake.enter_calls, 2)
+
+    def test_claude_code_gate_refuses_enter_when_text_never_renders(self):
+        prof = dict(sv.get_profile("claude-code"))
+        prof["settle_delay_s"] = 0
+        pane = ClockedPane(render_after_s=None, text="hello there general")
+        r = sv.submit_verify(
+            prof, "p", "hello there general",
+            send_text=pane.send_text, send_enter=pane.send_enter,
+            capture=pane.capture, sleep=pane.sleep)
+        self.assertFalse(r.ok)
+        self.assertIn("never observed", r.detail)
+        self.assertEqual(pane.enter_calls, 0)
+        self.assertLessEqual(pane.t, 8.5)
+
+
+class TestHarnessVendoredCopy(unittest.TestCase):
+    def test_codex_harness_copy_is_byte_identical(self):
+        # T-6130: the harness copy had rotted since the T-4755 import. It ships
+        # standalone to the mirror, so it is a copy, pinned equal to this source.
+        root = Path(__file__).resolve().parent.parent
+        a = (root / "tools" / "submit_verify.py").read_bytes()
+        b = (root / "harness" / "codex" / "codex_telegram" / "submit_verify.py").read_bytes()
+        self.assertEqual(a, b, "re-vendor: cp tools/submit_verify.py harness/codex/codex_telegram/")
+
+
+
+class TestFirstPasteRenderWaitSource(unittest.TestCase):
+    """T-6293: the harness profile is the one source of the first-paste render bound."""
+
+    def test_profiles_that_carry_the_gate_return_their_own_bound(self):
+        for harness in ("claude-code", "codex"):
+            self.assertEqual(sv.first_paste_render_wait(harness),
+                             sv.get_profile(harness)["render_wait_s"])
+
+    def test_profile_without_a_gate_falls_back_to_the_default_bound(self):
+        self.assertNotIn("render_wait_s", sv.get_profile("hermes"))
+        self.assertEqual(sv.first_paste_render_wait("hermes"), sv.DEFAULT_RENDER_WAIT_S)
+
+    def test_cli_prints_the_bound_as_plain_decimal(self):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdout", out):
+            rc = sv.main(["--harness", "claude-code", "--print-first-paste-render-wait"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue().strip(), "8")
 
 if __name__ == "__main__":
     unittest.main()

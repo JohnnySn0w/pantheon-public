@@ -31,6 +31,7 @@ DEFAULT_PRIORITY_LIST_PATH = REPO_ROOT / "rulebook" / "priority-list.md"
 _SENTINEL_START = "<!-- PRIORITY-LIST-START -->"
 _SENTINEL_END = "<!-- PRIORITY-LIST-END -->"
 _FENCE_RE = re.compile(r"```yaml\s*\n(.*?)```", re.DOTALL)
+EXPECTED_BROAD_KEY = "expected-broad"
 _PRIORITY_KEY_RE = re.compile(r"^priority-(\d+)$")
 
 
@@ -40,12 +41,9 @@ class PriorityListParseError(Exception):
     — see module docstring for the failure-class vocabulary."""
 
 
-def parse(md_text: str) -> dict[str, int]:
-    """Parse *md_text* (the full contents of a priority-list.md-shaped file)
-    into a flat `{label: rank}` mapping. Rank 1 = highest priority. Duplicate
-    labels across ranks resolve to the LOWEST (ceiling) rank. An empty
-    ranked-labels YAML region is a legal "no priorities defined" state and
-    returns `{}`."""
+def _load_region(md_text: str):
+    """Extract + YAML-load the sentinel-delimited fenced region of *md_text*.
+    Returns the loaded object (may be None for an empty region)."""
     start = md_text.find(_SENTINEL_START)
     end = md_text.find(_SENTINEL_END)
     if start == -1 or end == -1 or end < start:
@@ -64,9 +62,19 @@ def parse(md_text: str) -> dict[str, int]:
     yaml_text = fence_match.group(1)
 
     try:
-        loaded = yaml.safe_load(yaml_text)
+        return yaml.safe_load(yaml_text)
     except yaml.YAMLError as exc:
         raise PriorityListParseError(f"yaml-parse-fail: {exc}") from exc
+
+
+def parse(md_text: str) -> dict[str, int]:
+    """Parse *md_text* (the full contents of a priority-list.md-shaped file)
+    into a flat `{label: rank}` mapping. Rank 1 = highest priority. Duplicate
+    labels across ranks resolve to the LOWEST (ceiling) rank. An empty
+    ranked-labels YAML region is a legal "no priorities defined" state and
+    returns `{}`. The optional `expected-broad:` key is not a tier and never
+    affects the result (see `parse_expected_broad`)."""
+    loaded = _load_region(md_text)
 
     if loaded is None:
         return {}
@@ -78,6 +86,8 @@ def parse(md_text: str) -> dict[str, int]:
 
     result: dict[str, int] = {}
     for key, value in loaded.items():
+        if key == EXPECTED_BROAD_KEY:
+            continue
         match = _PRIORITY_KEY_RE.match(key) if isinstance(key, str) else None
         if match is None or int(match.group(1)) < 1:
             raise PriorityListParseError(
@@ -113,3 +123,38 @@ def parse_file(path: str | Path | None = None) -> dict[str, int]:
         raise PriorityListParseError(f"file-not-found: {resolved}")
     text = resolved.read_text(encoding="utf-8")
     return parse(text)
+
+
+def parse_expected_broad(md_text: str) -> dict[str, str]:
+    """Optional top-level `expected-broad:` mapping (T-6239): `{label: reason}`
+    for labels that are broad by design, exempt from the high-volume and
+    semantic-drift validator heuristics. Absent key (or empty region) -> `{}`.
+    Malformed value (not a mapping of string -> string) raises a `schema:`
+    `PriorityListParseError`."""
+    loaded = _load_region(md_text)
+    if not isinstance(loaded, dict) or EXPECTED_BROAD_KEY not in loaded:
+        return {}
+    value = loaded[EXPECTED_BROAD_KEY]
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise PriorityListParseError(
+            f"schema: {EXPECTED_BROAD_KEY} must be a mapping of label -> "
+            f"reason, got {type(value).__name__}"
+        )
+    for label, reason in value.items():
+        if not isinstance(label, str) or not isinstance(reason, str):
+            raise PriorityListParseError(
+                f"schema: {EXPECTED_BROAD_KEY} entries must be string -> "
+                f"string, got {label!r}: {type(reason).__name__}"
+            )
+    return dict(value)
+
+
+def parse_file_expected_broad(path: str | Path | None = None) -> dict[str, str]:
+    """File-reading wrapper for `parse_expected_broad`; same path default and
+    strict missing-file behavior as `parse_file`."""
+    resolved = Path(path) if path is not None else DEFAULT_PRIORITY_LIST_PATH
+    if not resolved.exists():
+        raise PriorityListParseError(f"file-not-found: {resolved}")
+    return parse_expected_broad(resolved.read_text(encoding="utf-8"))

@@ -170,6 +170,13 @@ class HermesInputsBuilderTests(unittest.TestCase):
     def test_absent_is_none(self):
         self.assertIsNone(self._build({}))
 
+    def test_sha_digest_requires_the_whole_string(self):
+        for value in ("a" * 64 + "\n", "a" * 64 + "trailing"):
+            with self.subTest(value=repr(value)), self.assertRaises(pi.ManifestError):
+                self._build(_hermes_installer(
+                    main={"source_sha256": value}, soul={"source_sha256": value},
+                ))
+
     def test_refusals(self):
         for overrides in ({"main": {"target": "seat/AGENTS.md"}}, {"soul": {"target": ".hermes/x.md"}},
                           {"soul": {"source_sha256": "b" * 64}}, {"main": {"source_sha256": "short"}},
@@ -277,7 +284,10 @@ class HermesSeatFilesTests(unittest.TestCase):
     def test_no_bundled_skills_marker_and_managed_are_rendered(self):
         with tempfile.TemporaryDirectory() as tmp:
             inputs = self._inputs(Path(tmp))
-            hermes_render.prepare_hermes_launch(inputs, _launch(), repo_probe=lambda p: False)
+            hermes_render.prepare_hermes_launch(
+                inputs, _launch(), repo_probe=lambda p: False,
+                install_root_resolver=lambda _executable: Path(tmp) / "package",
+            )
             hh = inputs.account_home / ".hermes"
             self.assertEqual((hh / ".no-bundled-skills").read_bytes(), b"")
             self.assertTrue((hh / ".managed").exists())
@@ -289,10 +299,16 @@ class HermesSeatFilesTests(unittest.TestCase):
             env.parent.mkdir(parents=True)
             env.write_text("DEEPSEEK_API_KEY=x\n", encoding="utf-8")
             env.chmod(0o644)
-            result = hermes_render.prepare_hermes_launch(inputs, _launch(), repo_probe=lambda p: False)
+            def resolver(_executable):
+                return Path(tmp) / "package"
+            result = hermes_render.prepare_hermes_launch(
+                inputs, _launch(), repo_probe=lambda p: False, install_root_resolver=resolver,
+            )
             self.assertEqual(result.env_file_mode, "tightened")
             self.assertEqual(stat.S_IMODE(env.stat().st_mode), 0o600)
-            again = hermes_render.prepare_hermes_launch(inputs, _launch(), repo_probe=lambda p: False)
+            again = hermes_render.prepare_hermes_launch(
+                inputs, _launch(), repo_probe=lambda p: False, install_root_resolver=resolver,
+            )
             self.assertEqual(again.env_file_mode, "0600")
 
     def test_absent_env_and_chmod_failure(self):

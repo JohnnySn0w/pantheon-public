@@ -546,6 +546,208 @@ COMPARABILITY_CHECKED_FIELDS = (
     "function_semantics",
     "test_selection",
 )
+SEMANTIC_MANIFEST_SCHEMA = "org083.adapter-run-manifest.v1"
+SEMANTIC_MAP_MEMBER = "semantic-map.resolved.json"
+_RECORD_BOUND_PREFIXES = ("collector.", "scope.")
+_RECORD_DIRECT_RUN_FIELDS = ("dimension", "unit")
+_ABSENT = object()
+
+
+class _SemanticEvidenceError(Exception):
+    """Retained semantic evidence is missing, malformed, unretrievable, digest-invalid or contradictory."""
+
+
+def _canonical_or_absent(value: Any) -> bytes | None:
+    if value is _ABSENT:
+        return None
+    try:
+        return _canonical_json_bytes(value)
+    except (TypeError, ValueError) as exc:
+        raise _SemanticEvidenceError("a compared value is not canonical JSON") from exc
+
+
+def _record_field_value(record: Mapping[str, Any], field: str) -> Any:
+    if field.startswith(_RECORD_BOUND_PREFIXES):
+        section, _, key = field.partition(".")
+        nested = record.get(section)
+        return nested.get(key, _ABSENT) if isinstance(nested, Mapping) else _ABSENT
+    return record.get(field, _ABSENT)
+
+
+def _verified_artifact_json(
+    artifact_id: Any, indexes: Mapping[str, Mapping[str, Mapping[str, Any]]], repo_root: Path
+) -> tuple[Any, bytes]:
+    artifact = indexes["artifact_records"].get(artifact_id) if isinstance(artifact_id, str) else None
+    if not isinstance(artifact, Mapping):
+        raise _SemanticEvidenceError(f"artifact record {artifact_id!r} is missing")
+    content = _retrieve_artifact_bytes(artifact, repo_root)
+    if content is None:
+        raise _SemanticEvidenceError(f"artifact {artifact_id!r} bytes could not be retrieved")
+    if (
+        artifact.get("digest_algorithm") != "sha256"
+        or artifact.get("digest") != hashlib.sha256(content).hexdigest()
+        or artifact.get("size") != len(content)
+    ):
+        raise _SemanticEvidenceError(f"artifact {artifact_id!r} bytes do not match its ArtifactRecord digest/size")
+    try:
+        return _parse_json_bytes(content), content
+    except RepositoryEvidenceError as exc:
+        raise _SemanticEvidenceError(f"artifact {artifact_id!r} is not valid JSON: {exc}") from exc
+
+
+def _resolve_semantic_side(
+    record: Mapping[str, Any],
+    indexes: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    repo_root: Path,
+) -> tuple[str, Mapping[str, Any]]:
+    """The record's digest-verified manifest id and `compared` map; raises on anything unverifiable."""
+    manifest, _ = _verified_artifact_json(record.get("artifact_id"), indexes, repo_root)
+    if not isinstance(manifest, Mapping) or manifest.get("schema") != SEMANTIC_MANIFEST_SCHEMA:
+        raise _SemanticEvidenceError("run manifest schema is not the adapter run manifest")
+    members = manifest.get("members")
+    named = [m for m in members if isinstance(m, Mapping) and m.get("name") == SEMANTIC_MAP_MEMBER] if isinstance(members, list) else []
+    if len(named) != 1:
+        raise _SemanticEvidenceError("run manifest must carry exactly one semantic-map.resolved.json member")
+    member = named[0]
+    resolved, map_bytes = _verified_artifact_json(member.get("artifact_id"), indexes, repo_root)
+    if member.get("sha256") != hashlib.sha256(map_bytes).hexdigest():
+        raise _SemanticEvidenceError("resolved-map bytes differ from the run manifest member digest")
+    if "size" in member and member["size"] != len(map_bytes):
+        raise _SemanticEvidenceError("resolved-map bytes differ from the run manifest member size")
+    collector = record.get("collector")
+    adapter_id = collector.get("adapter_id") if isinstance(collector, Mapping) else None
+    if manifest.get("adapter_id") != adapter_id or not isinstance(resolved, Mapping) or resolved.get("adapter_id") != adapter_id:
+        raise _SemanticEvidenceError("manifest/map adapter_id contradicts the measurement collector.adapter_id")
+    if manifest.get("revision") != record.get("revision"):
+        raise _SemanticEvidenceError("run manifest revision contradicts its measurement record revision")
+    compared = resolved.get("compared")
+    if not isinstance(compared, Mapping) or set(compared) != set(COMPARABILITY_CHECKED_FIELDS):
+        raise _SemanticEvidenceError("resolved map `compared` key set differs from COMPARABILITY_CHECKED_FIELDS")
+    for key, entry in compared.items():
+        if not isinstance(entry, Mapping) or "declaration" not in entry or "instance" not in entry:
+            raise _SemanticEvidenceError(f"resolved map entry {key!r} lacks declaration/instance")
+        if key.startswith(_RECORD_BOUND_PREFIXES) and _canonical_or_absent(entry["instance"]) != _canonical_or_absent(
+            _record_field_value(record, key)
+        ):
+            raise _SemanticEvidenceError(f"resolved map instance for {key!r} contradicts the measurement record")
+    return str(record.get("artifact_id")), compared
+
+
+def _derive_comparability_changes(
+    record: Mapping[str, Any],
+    comparability: Mapping[str, Any],
+    indexes: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    repo_root: Path,
+) -> list[str]:
+    """COMPARABILITY_CHECKED_FIELDS that differ between the baseline and current records and their retained
+    semantic maps, in tuple order.  Raises _SemanticEvidenceError (fail closed) on any unverifiable evidence."""
+    baseline_id, current_id = comparability.get("baseline_measurement_id"), comparability.get("current_measurement_id")
+    measurements = indexes["quantitative_measurements"]
+    baseline = measurements.get(baseline_id) if isinstance(baseline_id, str) else None
+    current = measurements.get(current_id) if isinstance(current_id, str) else None
+    if not isinstance(baseline, Mapping) or not isinstance(current, Mapping):
+        raise _SemanticEvidenceError("baseline/current measurement record is not in the contract")
+    nested_baseline, nested_current = record.get("baseline"), record.get("current")
+    if (
+        not isinstance(nested_baseline, Mapping)
+        or not isinstance(nested_current, Mapping)
+        or nested_baseline.get("measurement_id") != baseline_id
+        or nested_current.get("measurement_id") != current_id
+        or record.get("measurement_id") != current_id
+    ):
+        raise _SemanticEvidenceError("comparability ids contradict the measurement baseline/current/measurement ids")
+    if baseline_id != current_id and baseline.get("artifact_id") == current.get("artifact_id"):
+        raise _SemanticEvidenceError("distinct baseline and current measurements share one run manifest")
+    # EVERY side binds its manifest to its own record (revision, adapter_id, 10 collector/scope instances),
+    # whatever the record's verdict, so a refused baseline cannot smuggle contradictory evidence in.
+    _, base_compared = _resolve_semantic_side(baseline, indexes, repo_root)
+    _, cur_compared = _resolve_semantic_side(current, indexes, repo_root)
+    direct = {
+        field
+        for field in COMPARABILITY_CHECKED_FIELDS
+        if field.startswith(_RECORD_BOUND_PREFIXES) or field in _RECORD_DIRECT_RUN_FIELDS
+    }
+    changed: list[str] = []
+    for field in COMPARABILITY_CHECKED_FIELDS:
+        differs = _canonical_or_absent(base_compared[field]) != _canonical_or_absent(cur_compared[field])
+        if field in direct:
+            differs = differs or _canonical_or_absent(_record_field_value(baseline, field)) != _canonical_or_absent(
+                _record_field_value(current, field)
+            )
+        if differs:
+            changed.append(field)
+    return changed
+
+
+def _canonical_manifest(record: Mapping[str, Any], indexes: Mapping[str, Mapping[str, Mapping[str, Any]]], repo_root: Path) -> bytes:
+    """Canonical bytes of the digest-verified parsed run manifest, member artifact_id strings INCLUDED
+    (nothing stripped).  Raises _SemanticEvidenceError on anything unverifiable."""
+    manifest, _ = _verified_artifact_json(record.get("artifact_id"), indexes, repo_root)
+    if not isinstance(manifest, Mapping):
+        raise _SemanticEvidenceError("run manifest is not an adapter run manifest")
+    canonical = _canonical_or_absent(manifest)
+    assert canonical is not None
+    return canonical
+
+
+def _comparison_distinct(
+    measurement: Mapping[str, Any],
+    indexes: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    repo_root: Path,
+) -> bool:
+    """True only when a measurement's baseline/current are two distinct, independently evidenced runs.
+
+    Compared: distinct measurement ids, distinct artifact ids, a different canonical parsed run manifest
+    (member artifact_id strings included, so honest reruns differ via their nonce-bearing member ids and a copy
+    or re-wrap does not), and the full revision-bound comparability derivation.  Resolved maps are deliberately
+    NOT compared: honest same-content reruns have byte-identical maps.  Distinctness is id- and content-level
+    only and does NOT prove run lineage (a forger can still edit a member id and map); T-6090 covers that.
+    A self-baseline (baseline id == current id) may derive `baseline` but never satisfies this."""
+    comparability = measurement.get("comparability")
+    if not isinstance(comparability, Mapping):
+        return False
+    baseline_id, current_id = comparability.get("baseline_measurement_id"), comparability.get("current_measurement_id")
+    if not isinstance(baseline_id, str) or not isinstance(current_id, str) or baseline_id == current_id:
+        return False
+    baseline = indexes["quantitative_measurements"].get(baseline_id)
+    current = indexes["quantitative_measurements"].get(current_id)
+    if not isinstance(baseline, Mapping) or not isinstance(current, Mapping):
+        return False
+    if baseline.get("artifact_id") == current.get("artifact_id"):
+        return False
+    try:
+        _derive_comparability_changes(measurement, comparability, indexes, repo_root)
+        return _canonical_manifest(baseline, indexes, repo_root) != _canonical_manifest(current, indexes, repo_root)
+    except (_SemanticEvidenceError, RepositoryEvidenceError):
+        # Fail closed: unverifiable or non-canonical (e.g. non-finite number) evidence is simply not distinct.
+        return False
+
+
+def _above_baseline_comparison_distinct(
+    data: Mapping[str, Any],
+    indexes: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    repo_root: Path,
+) -> bool:
+    """Every measured line/branch measurement has a distinct baseline/current comparison."""
+    dispositions = {
+        record.get("dimension"): record for record in data.get("dimension_dispositions", []) if isinstance(record, Mapping)
+    }
+    seen = 0
+    for dimension in ("line", "branch"):
+        record = dispositions.get(dimension)
+        if not isinstance(record, Mapping) or record.get("status") != "measured":
+            continue
+        measurement_ids = _list_refs(record.get("measurement_ids"))
+        if not measurement_ids:
+            return False  # a measured dimension with no comparison must not be vacuously satisfied by the other
+        for measurement_id in measurement_ids:
+            measurement = indexes["quantitative_measurements"].get(measurement_id) if isinstance(measurement_id, str) else None
+            if not isinstance(measurement, Mapping) or not _comparison_distinct(measurement, indexes, repo_root):
+                return False
+            seen += 1
+    return seen > 0
+
+
 ISSUE_FACT_BLOCKERS = {
     "missing_root_field": ("structural_valid", "above_inventory"),
     "unknown_root_field": ("structural_valid", "above_inventory"),
@@ -704,6 +906,7 @@ class RepositoryEvidenceFacts:
     boundary_prerequisites: bool
     generated_treatment_valid: bool
     comparability_valid: bool
+    above_baseline_comparison_distinct: bool
     parity_eligible: bool
     positive_effectiveness_or_waiver: bool
     efficiency_complete: bool
@@ -1462,6 +1665,29 @@ def _validate_refs_and_semantics(
                     )
                 )
             changed_fields = _list_refs(comparability.get("changed_fields"))
+            derived_fields: list[str] = []
+            if comparability.get("verdict") in ("comparable", "reset_required"):
+                try:
+                    derived_fields = _derive_comparability_changes(record, comparability, indexes, repo_root)
+                except _SemanticEvidenceError as exc:
+                    issues.append(
+                        _issue(
+                            "comparability_reset_required",
+                            f"{path}/comparability/semantic_evidence",
+                            f"comparability fails closed: {exc}",
+                        )
+                    )
+                omitted = [field for field in derived_fields if field not in changed_fields]
+                if omitted:
+                    issues.append(
+                        _issue(
+                            "comparability_material_change_unapproved",
+                            f"{path}/comparability/changed_fields",
+                            "producer changed_fields omits validator-derived changes: "
+                            + ", ".join(repr(field) for field in omitted),
+                        )
+                    )
+            changed_fields = [*changed_fields, *(field for field in derived_fields if field not in changed_fields)]
             if comparability.get("verdict") == "comparable" and changed_fields and (
                 comparability.get("equivalence_decision") is None or not isinstance(comparability.get("equivalence_artifact_id"), str)
             ):
@@ -2756,6 +2982,7 @@ def _compute_facts(
         boundary_prerequisites=_boundary_prerequisites(data) and not _blocked(error_codes, "boundary_prerequisites"),
         generated_treatment_valid=not _blocked(error_codes, "generated_treatment_valid"),
         comparability_valid=not _blocked(error_codes, "comparability_valid"),
+        above_baseline_comparison_distinct=_above_baseline_comparison_distinct(data, indexes, repo_root),
         parity_eligible=parity_eligible,
         positive_effectiveness_or_waiver=positive_effectiveness_or_waiver and advisory_support_retained,
         efficiency_complete=_all_cost_classes_recorded(data) and advisory_support_retained and not _blocked(error_codes, "efficiency_complete"),
@@ -2796,8 +3023,11 @@ def derive_repository_maturity(facts: RepositoryEvidenceFacts) -> str:
     ):
         return "inventory_only"
     stage = "baseline"
+    # Above baseline needs distinct comparable baseline/current evidence; a self-baseline stops here.
+    # Distinctness is id- and content-level only; run lineage is not proved (T-6090).
     if (
-        facts.positive_effectiveness_or_waiver
+        facts.above_baseline_comparison_distinct
+        and facts.positive_effectiveness_or_waiver
         and facts.efficiency_complete
         and facts.dry_run_retained
         and facts.threshold_proposed

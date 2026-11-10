@@ -20,6 +20,7 @@ Returns typed operation data only. Reconciler refusals are plan refusals.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import fields
 from pathlib import Path
 
@@ -28,6 +29,10 @@ from tools.repo_reconciler import ACTION_CLONE, ACTION_FF_ADVANCE, CheckoutObser
 
 LOGICAL_REPO = "pantheon-config"
 HANDLER = "pantheon-config-repo"
+LOCAL_HANDLER = "pantheon-config-local"
+HOOKS_PATH = ".githooks"
+HOOK_NAMES = ("pre-commit", "commit-msg", "pre-push")  # the handlers module's tuple (pinned equal); only these decide hook health
+STABLE_EVIDENCE = ("checkout_id", "origin", "hooks_path", "hook_modes")
 CHECKOUTS_DIR = Path(__file__).resolve().parents[3] / "checkouts"
 _OBS_FIELDS = tuple(f.name for f in fields(CheckoutObservation))
 
@@ -118,16 +123,150 @@ def _advance_ops(request, from_rev, to_rev, *, leg):
     return ops
 
 
+def _local_observed(request):
+    observed = (request.get("observed") or {}).get(LOCAL_HANDLER)
+    if not isinstance(observed, dict):
+        raise PlanRefused(f"request carries no {LOCAL_HANDLER} observation")
+    return observed.get("checkouts") or {}
+
+
+def _canon(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def _hooks_op(entry, item, plan, prior="unset"):
+    return _op(
+        "hooks-activate", "repo.hooks-activate", entry, item, plan,
+        {"hooks_path": prior}, {"hooks_path": HOOKS_PATH}, {"hooks_path": prior},
+    )
+
+
+def _attest_op(entry, item, plan, local, *, re_attest):
+    stable = {k: local["evidence"][k] for k in STABLE_EVIDENCE}
+    desired = {"evidence": _canon(stable), "observed_head": str(local["evidence"].get("observed_head")), "basis": "observed-legacy"}
+    if re_attest:
+        desired["re_attest"] = "true"
+    prior = local.get("attestation")
+    op = _op(
+        "adopt-attest", "pantheon-config.adopt-attest", entry, item, plan,
+        {"attestation": "present" if prior else "none"}, desired, {"attestation": _canon(prior) if prior else "none"},
+    )
+    op["provenance"]["basis"] = "observed-legacy"
+    return op
+
+
+def _plan_present_install(cid, entry, item, plan, raw, local):
+    """A present checkout at install. Engine-installed ones plan nothing (drift is
+    configure's and verify's); a hand-installed one is adopted by attestation when
+    healthy, and refused when not (the hand-run tools/install_hooks.sh is the fix)."""
+
+    if raw.get("installed_sha"):
+        return []
+    hooks_path = local.get("hooks_path")
+    if hooks_path is not None and local.get("hooks_path_own") is not True:  # the handler resolved it; a missing fact fails closed
+        raise PlanRefused(f"{cid}: hooksPath set to {hooks_path}; refusing to overwrite")
+    if not local.get("hooks_active"):
+        modes = local.get("hook_modes") or {}
+        bad = sorted(n for n in HOOK_NAMES if n in modes and modes[n] != "exec")
+        raise PlanRefused(
+            f"{cid}: hand-installed checkout has inactive hooks (hooksPath {hooks_path}, not executable: {bad}); "
+            "run tools/install_hooks.sh, then re-plan"
+        )
+    attested = local.get("attestation")
+    if attested is None:
+        return [_attest_op(entry, item, plan, local, re_attest=False)]
+    if all(attested.get(k) == local["evidence"].get(k) for k in STABLE_EVIDENCE):
+        return []
+    return [_attest_op(entry, item, plan, local, re_attest=True)]
+
+
 def plan_install(request):
     spec, checkouts, plan = _reconcile(request)
     _require_ok(plan)
+    local_all = _local_observed(request)
     ops = []
     for item in sorted(plan.items, key=lambda i: i.checkout_id):
-        if item.action != ACTION_CLONE:
-            continue  # present checkouts are the update leg's; noop is nothing
-        entry = spec.checkouts[item.checkout_id]
-        to = checkouts[item.checkout_id]["desired_target"]
-        ops.append(_op("clone", "repo.clone", entry, item, plan, {"exists": "false"}, {"head": to}, {"exists": "false"}))
+        cid = item.checkout_id
+        entry = spec.checkouts[cid]
+        if item.action == ACTION_CLONE:
+            to = checkouts[cid]["desired_target"]
+            ops.append(_op("clone", "repo.clone", entry, item, plan, {"exists": "false"}, {"head": to}, {"exists": "false"}))
+            ops.append(_hooks_op(entry, item, plan))  # adjacent: the engine applies in list order, rolls back reversed
+            continue
+        local = local_all.get(cid)
+        if local is None:
+            raise PlanRefused(f"no {LOCAL_HANDLER} observation for checkout {cid!r}")
+        ops.extend(_plan_present_install(cid, entry, item, plan, checkouts[cid], local))
+    return ops
+
+
+def _manifest_op(entry, item, plan, digest, prior):
+    return _op(
+        "manifest-attest", "pantheon-config.manifest-attest", entry, item, plan,
+        {"attestation": prior, "manifest_digest": digest}, {"digest": digest}, {"attestation": prior},
+    )
+
+
+def _configure_hooks(cid, entry, item, plan, local):
+    """Hooks convergence for an engine-recorded checkout. The only repair is the
+    activation PR1 owns (hooksPath unset; an own absolute path is healthy and is never
+    converged to the relative form); everything else is the hand-run
+    tools/install_hooks.sh's, so it is refused, never guessed at."""
+
+    hooks_path = local.get("hooks_path")
+    if hooks_path is not None and local.get("hooks_path_own") is not True:
+        raise PlanRefused(f"{cid}: hooksPath set to {hooks_path}; refusing to overwrite")
+    modes = local.get("hook_modes") or {}
+    missing = sorted(n for n in HOOK_NAMES if modes.get(n) == "missing")
+    if missing:
+        raise PlanRefused(f"{cid}: hooks missing: {missing}; run tools/install_hooks.sh, then re-plan")
+    if hooks_path is None:
+        return [_hooks_op(entry, item, plan, "unset")]
+    noexec = sorted(n for n in HOOK_NAMES if n in modes and modes[n] != "exec")
+    if noexec:
+        raise PlanRefused(f"{cid}: hooks not executable under {hooks_path}: {noexec}; run tools/install_hooks.sh, then re-plan")
+    return []
+
+
+def _configure_manifest(cid, entry, item, plan, local):
+    """Check-and-record the instance.yaml manifest: attest its digest when it is valid
+    and the recorded one is absent or stale. Never plans a write to the manifest."""
+
+    manifest = local.get("manifest")
+    if manifest is None:
+        raise PlanRefused(f"{cid}: no instance.yaml manifest observed; nothing to attest")
+    if not manifest.get("valid"):
+        raise PlanRefused(f"{cid}: instance.yaml manifest is invalid: {manifest.get('detail')}")
+    recorded = local.get("manifest_attestation")
+    if recorded is not None and recorded.get("digest") == manifest["digest"]:
+        return []
+    prior = recorded["digest"] if recorded is not None else "none"
+    return [_manifest_op(entry, item, plan, manifest["digest"], prior)]
+
+
+def plan_configure(request):
+    """Converge hooks and attest the instance.yaml manifest on engine-recorded checkouts.
+
+    Every refusal is fail-closed: a checkout configure cannot positively classify is
+    never touched (the hand-run tools/install_hooks.sh and hand-authored instance.yaml
+    PRs remain the repairs)."""
+
+    spec, checkouts, plan = _reconcile(request)
+    _require_ok(plan)
+    local_all = _local_observed(request)
+    ops = []
+    for item in sorted(plan.items, key=lambda i: i.checkout_id):
+        cid = item.checkout_id
+        entry = spec.checkouts[cid]
+        if item.action == ACTION_CLONE:
+            raise PlanRefused(f"{cid} is absent; the configure leg never clones (run install)")
+        local = local_all.get(cid)
+        if local is None:
+            raise PlanRefused(f"no {LOCAL_HANDLER} observation for checkout {cid!r}")
+        if not checkouts[cid].get("installed_sha") and local.get("attestation") is None:
+            raise PlanRefused(f"{cid}: no engine record; run germinate install first")
+        ops.extend(_configure_hooks(cid, entry, item, plan, local))
+        ops.extend(_configure_manifest(cid, entry, item, plan, local))
     return ops
 
 

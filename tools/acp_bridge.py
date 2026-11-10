@@ -61,7 +61,7 @@ import json
 import logging
 import os
 import re
-import select
+import selectors
 import subprocess
 import sys
 import time
@@ -83,6 +83,12 @@ try:
     from tools import keep_going as _keep_going
 except ImportError:  # bare run with cwd=tools/
     import keep_going as _keep_going  # type: ignore
+
+# T-4382: neutralize '@<path>' file mentions in mail-derived prompt fields.
+try:
+    from tools.inject_sanitize import neutralize_at_mentions
+except ImportError:  # bare run with cwd=tools/
+    from inject_sanitize import neutralize_at_mentions  # type: ignore
 
 # Senders whose messages are idempotent, fire-and-forget heartbeats: the whole
 # point is to un-park an idle seat, so the nudge has SUCCEEDED the moment a turn
@@ -336,30 +342,34 @@ class AcpTransport:
         message carrying "method" with no "id" is a notification — dropped,
         same as always (pred would have returned False on it anyway)."""
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            r, _, _ = select.select([self.proc.stdout], [], [], 0.5)
-            if r:
-                chunk = os.read(self.proc.stdout.fileno(), 65536)
-                if not chunk:
-                    break
-                self._buf += chunk
-            while b"\n" in self._buf:
-                line, self._buf = self._buf.split(b"\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if "method" in msg:
-                    if msg.get("id") is not None:
-                        self._send(_build_response_for_request(self.handlers, msg))
-                    continue
-                if pred(msg):
-                    return msg
-            if self.proc.poll() is not None:
-                return None
+        # T-5872: selectors (poll), not select.select() — the latter raises
+        # ValueError for any fd >= FD_SETSIZE (1024). One selector per wait call.
+        with selectors.PollSelector() as sel:
+            sel.register(self.proc.stdout, selectors.EVENT_READ)
+            while time.monotonic() < deadline:
+                r = sel.select(0.5)
+                if r:
+                    chunk = os.read(self.proc.stdout.fileno(), 65536)
+                    if not chunk:
+                        break
+                    self._buf += chunk
+                while b"\n" in self._buf:
+                    line, self._buf = self._buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if "method" in msg:
+                        if msg.get("id") is not None:
+                            self._send(_build_response_for_request(self.handlers, msg))
+                        continue
+                    if pred(msg):
+                        return msg
+                if self.proc.poll() is not None:
+                    return None
         return None
 
     def request(self, method: str, params=None, timeout: float = 60.0):
@@ -782,14 +792,20 @@ class AcpBridge:
         """Compose the prompt text from the REAL mailbox record shape
         {id, sender, subject, ts, payload} (tools/mailbox.py send()) — not
         the spike's flat from/to/subject/body shape."""
-        sender = msg.get("sender", "unknown")
-        subject = msg.get("subject") or "(no subject)"
+        # T-4382: sender, subject and payload are all peer-authored. Neutralize
+        # '@<path>' tokens in each before they reach the session/prompt text block
+        # (Claude Code loads an @-mentioned file pre-model, with no tool call). The
+        # fixed "[mailbox:...]" frame is left as is. str() first (r1 F2): a dict or
+        # list sender/subject would otherwise skip the helper and be str()-ed by the
+        # f-string afterwards; f"{x}" == str(x), so clean values are byte-identical.
+        sender = neutralize_at_mentions(str(msg.get("sender", "unknown")))
+        subject = neutralize_at_mentions(str(msg.get("subject") or "(no subject)"))
         payload = msg.get("payload")
         if isinstance(payload, (dict, list)):
             body = json.dumps(payload, sort_keys=True)
         else:
             body = str(payload)
-        return f"[mailbox:{sender}] {subject}: {body}"
+        return f"[mailbox:{sender}] {subject}: {neutralize_at_mentions(body)}"
 
     # Bound the hint scan so a pathological queue can never make delivery
     # expensive. Past this we still report the count, just not the breakdown.
@@ -849,14 +865,16 @@ class AcpBridge:
             if superseded_by:
                 parts.append(
                     f"!! THIS MESSAGE HAS ALREADY BEEN SUPERSEDED by a later one from the same "
-                    f"sender ({superseded_by}), which is still queued. Do not act on this; "
-                    f"drain first.")
+                    f"sender ({neutralize_at_mentions(str(superseded_by))}), which is still "
+                    f"queued. Do not act on this; drain first.")
             elif same:
                 parts.append(
-                    f"{same} later message(s) from {msg.get('sender')} are ALREADY QUEUED behind "
+                    f"{same} later message(s) from {neutralize_at_mentions(str(msg.get('sender')))}"
+                    f" are ALREADY QUEUED behind "
                     f"this one — this may be superseded or retracted. Prefer draining before "
                     f"acting on anything consequential from this sender.")
-            breakdown = ", ".join(f"{s} x{c}" for s, c in
+            # T-4382: queued senders are peer-set free text too.
+            breakdown = ", ".join(f"{neutralize_at_mentions(str(s))} x{c}" for s, c in
                                   sorted(by_sender.items(), key=lambda kv: -kv[1]))
             age = ""
             if oldest_ns:

@@ -158,3 +158,23 @@ def test_reconcile_requires_postboot(tmp_path):
     eng.backend.postboot_marker_path.unlink()
     with pytest.raises(EngineRefusal, match="postboot-unmet"):
         eng.reconcile_run(run_id, executor_dead=True)
+
+
+def test_kill_reconcile_rollback_cycles_do_not_accumulate_fds(tmp_path):
+    """T-5147: a whole-suite process runs hundreds of kill cases; each must leave no run fd behind."""
+    import os
+
+    def fds() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    def cycle(i: int) -> None:
+        (tmp_path / f"c{i}").mkdir()
+        eng, run_id, _pre = _killed_run(tmp_path / f"c{i}", "stageable", "after-execute")
+        eng.reconcile_run(run_id, executor_dead=True)
+        eng.rollback(run_id)
+
+    cycle(0)  # warm imports / lazily opened files
+    before = fds()
+    for i in range(1, 4):
+        cycle(i)
+    assert fds() <= before + 1

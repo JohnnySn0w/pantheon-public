@@ -68,6 +68,7 @@ from tools import quota_probe_detector
 from tools import codex_telegram_bridge
 from tools import mailbox as pantheon_mailbox
 from tools import mailbox_wake
+from tools.inject_sanitize import neutralize_at_mentions  # T-4382
 from tools.persona_brief import PersonaBriefError, resolve_persona_brief_path
 from tools import runtime_controller
 from tools import subscription_usability
@@ -865,6 +866,13 @@ def select_recorded_runtime_binding(
 ) -> PersonaBinding:
     """Keep a swapped fallback active until an explicit recovery decision."""
 
+    reconciled = _reconcile_stale_planned_runtime_selection(
+        manifest_path,
+        binding,
+        state_dir=state_dir,
+    )
+    if reconciled is not None:
+        return reconciled
     state = runtime_controller.transition_state(
         binding.persona,
         state_root=state_dir,
@@ -873,9 +881,10 @@ def select_recorded_runtime_binding(
     if phase in {"preparing", "recovered"}:
         harness = state.get("outgoing_harness")
         profile = state.get("outgoing_profile")
-    elif phase in {"awaiting-successor-read", "completed"} and state.get(
-        "runtime_swapped"
-    ) is True:
+    elif phase in {"awaiting-successor-read", "completed"} and (
+        state.get("runtime_swapped") is True
+        or state.get("runtime_reconciled") is True
+    ):
         harness = state.get("incoming_harness")
         profile = state.get("incoming_profile")
     else:
@@ -891,6 +900,118 @@ def select_recorded_runtime_binding(
             f"recorded fallback {reference!r} is no longer allowed by the manifest"
         )
     return load_runtime_reference(manifest_path, binding, reference)
+
+
+def _reconcile_stale_planned_runtime_selection(
+    manifest_path: Path,
+    binding: PersonaBinding,
+    *,
+    state_dir: Path,
+) -> PersonaBinding | None:
+    """Repair a quota barrier that was opened against the wrong live runtime.
+
+    A ``preparing`` record normally pins its outgoing runtime.  The narrow
+    exception here is a planned-quota barrier which has not requested a handoff
+    or begun a runtime mutation, whose recorded primary is still under an active
+    subscription-cap cooldown, and whose intended fallback is already the
+    uniquely matched live pane.  That combination means quota-check described
+    an already-active fallback as a not-yet-run swap.  Record the observed
+    fallback as reconciled and terminal so later consume/quota fires do not
+    recreate the bad barrier.
+
+    The active-runtime cache is deliberately not authority.  If the operation
+    lock is busy or the live pane cannot be matched uniquely, retain the normal
+    fail-closed transition selection for this cycle.
+    """
+
+    try:
+        with runtime_controller.persona_operation_lock(
+            binding.persona,
+            state_root=state_dir,
+            blocking=False,
+        ):
+            state = runtime_controller.transition_state(
+                binding.persona,
+                state_root=state_dir,
+            )
+            if not (
+                state.get("phase") == "preparing"
+                and state.get("trigger") == "planned-quota"
+                and state.get("runtime_swapped") is not True
+                and not state.get("handoff_requested")
+                and not runtime_controller._unresolved_runtime_mutation(state)
+            ):
+                return None
+
+            outgoing = f"{state.get('outgoing_harness')}/{state.get('outgoing_profile')}"
+            incoming = f"{state.get('incoming_harness')}/{state.get('incoming_profile')}"
+            if outgoing != runtime_reference(binding):
+                return None
+
+            attempt = runtime_controller.load_last_attempt(
+                binding.persona,
+                runtime_controller._binding_runtime_slug(binding),
+                state_root=state_dir,
+            )
+            cooldown_until = runtime_controller._parse_iso_or_none(
+                (attempt or {}).get("cooldown_until")
+            )
+            if not (
+                (attempt or {}).get("outcome") == "failed"
+                and (attempt or {}).get("failure_class") == "subscription_cap"
+                and cooldown_until is not None
+                and cooldown_until.tzinfo is not None
+                and cooldown_until > datetime.now(timezone.utc)
+            ):
+                return None
+
+            candidates = configured_runtime_bindings(manifest_path, binding)
+            try:
+                live_binding, live_pid, _live_argv = (
+                    runtime_controller._match_live_binding(candidates)
+                )
+            except RuntimeError:
+                # A tmux probe failure is not evidence; keep fail-closed selection.
+                return None
+            live_reference = runtime_reference(live_binding)
+            if live_reference != incoming or live_reference == outgoing:
+                return None
+
+            now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            repaired = dict(state)
+            repaired.update(
+                {
+                    "phase": "completed",
+                    "fallback_active": True,
+                    "runtime_reconciled": True,
+                    "reconciled_live_runtime": live_reference,
+                    "reconciliation_reason": "stale-preparing-live-runtime-mismatch",
+                    "reconciled_from_phase": "preparing",
+                    "reconciled_at": now,
+                    "completed_at": now,
+                }
+            )
+            runtime_controller._atomic_json(
+                runtime_controller._transition_path(binding.persona, state_dir),
+                repaired,
+            )
+            runtime_controller._append_controller_evidence(
+                binding.persona,
+                "stale_preparing_transition_reconciled",
+                {
+                    "reason": "stale-preparing-live-runtime-mismatch",
+                    "recorded_outgoing": outgoing,
+                    "live_runtime": live_reference,
+                    "live_pid": live_pid,
+                },
+                state_root=state_dir,
+            )
+            return live_binding
+    except (
+        runtime_controller.OperationLockBusy,
+        runtime_controller._ReconcileRefused,
+    ):
+        return None
 
 
 def _claude_probe_valid(
@@ -2161,7 +2282,9 @@ def process_mail_record(
     submitted_state = "cached" if cached is not None else "durably_queued"
     if cached is None:
         session_id = load_session_id(state_dir, binding.persona)
-        task = _record_task(record)
+        # T-4382: the mail payload is peer-authored; neutralize '@<path>' tokens
+        # before it becomes a harness prompt (same helper as the pane/ACP sites).
+        task = neutralize_at_mentions(_record_task(record))
         prompt = (
             continuation_prompt(binding, task)
             if session_id

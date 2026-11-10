@@ -346,25 +346,45 @@ def _timed_out(o: Outcome) -> bool:
     return TIMED_OUT_MARKER in o.out
 
 
+def _both_timed_out_alike(r: Outcome, n: Outcome) -> bool:
+    return r == n and _timed_out(r)
+
+
 def compare_scripts(ref: Path, new: Path, cases: list[Case], workers: int = 8,
                     timeout_reruns: int = TIMEOUT_RERUNS) -> Comparison:
     """Run `ref` and `new` over `cases`; (rc, stdout, stderr) must be byte-identical for every case.
-    A differing pair where either side hit the guard's T-4389 deadline is re-run serially, up to
-    `timeout_reruns` times (T-5817), and judged on the re-run."""
+    A pair where either side hit the guard's T-4389 deadline is re-run serially, up to
+    `timeout_reruns` times (T-5817), until a re-run decides it with neither side timed out.
+
+    T-5838: two identical timeouts are not a decision, so they cannot clear a pair that once
+    differed: a pair first seen as a one-sided timeout passes only on a re-run that matches with
+    neither side timed out. A pair that timed out on BOTH sides alike in the pool and never
+    showed a difference stays a match if its re-runs keep timing out alike (both sides fail
+    closed the same way; counting it would turn every slow-host run red)."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         ref_out = list(pool.map(lambda c: run_script(ref, c[1]), cases))
         new_out = list(pool.map(lambda c: run_script(new, c[1]), cases))
+    masked: dict[int, tuple[Outcome, Outcome]] = {}
     for i, (_label, raw) in enumerate(cases):
+        r, n = ref_out[i], new_out[i]
+        first_diff = None if _both_timed_out_alike(r, n) else (r, n)
         for _ in range(timeout_reruns):
-            r, n = ref_out[i], new_out[i]
-            if r == n or not (_timed_out(r) or _timed_out(n)):
+            if not (_timed_out(r) or _timed_out(n)):
                 break
-            ref_out[i], new_out[i] = run_script(ref, raw), run_script(new, raw)
-    mismatches = [
-        f"{label}: ref[{_describe(r)}] != new[{_describe(n)}]"
-        for (label, _raw), r, n in zip(cases, ref_out, new_out)
-        if r != n
-    ]
+            r, n = run_script(ref, raw), run_script(new, raw)
+            if first_diff is None and r != n:
+                first_diff = (r, n)
+        ref_out[i], new_out[i] = r, n
+        if first_diff is not None and _both_timed_out_alike(r, n):
+            masked[i] = first_diff
+    mismatches = []
+    for i, ((label, _raw), r, n) in enumerate(zip(cases, ref_out, new_out)):
+        if i in masked:
+            fr, fn = masked[i]
+            mismatches.append(f"{label}: ref[{_describe(fr)}] != new[{_describe(fn)}], and every "
+                              f"re-run timed out on both sides (T-4389), so it was never cleared")
+        elif r != n:
+            mismatches.append(f"{label}: ref[{_describe(r)}] != new[{_describe(n)}]")
     return Comparison(len(cases), sum(r.is_deny() for r in ref_out), mismatches)
 
 

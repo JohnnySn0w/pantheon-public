@@ -683,15 +683,27 @@ class ApprovalStatusJsonTests(unittest.TestCase):
             state="issued",
             expires_at="2026-08-12T01:00:00+00:00",
             summary="grant issued; target=recovery; families=persona.install",
+            plan_handle="b" * 64,
+            plan_owner="recovery",
         )
         encoded = wire.approval_status_json(status)
         raw = json.loads(encoded)
         self.assertEqual(encoded, canonical_json(raw))
-        self.assertEqual(raw["schema"], "pantheon-approval-status/v1")
+        self.assertEqual(raw["schema"], "pantheon-approval-status/v2")
         self.assertEqual(
             set(raw),
-            {"schema", "approval_handle", "state", "expires_at", "summary"},
+            {
+                "schema",
+                "approval_handle",
+                "state",
+                "expires_at",
+                "summary",
+                "plan_handle",
+                "plan_owner",
+            },
         )
+        self.assertEqual(raw["plan_handle"], "b" * 64)
+        self.assertEqual(raw["plan_owner"], "recovery")
         self.assertEqual(raw["state"], "issued")
         self.assertLessEqual(len(encoded.encode("utf-8")), 65536)
 
@@ -1580,6 +1592,8 @@ class ConsumerWireMappingTests(unittest.TestCase):
             state="issued",
             expires_at="2026-08-12T01:00:00+00:00",
             summary="grant issued; target=recovery; families=persona.install",
+            plan_handle="b" * 64,
+            plan_owner="recovery",
         )
         service = RecordingApprovalService(approval_status=status)
         state, payload = _invoke(
@@ -1590,7 +1604,7 @@ class ConsumerWireMappingTests(unittest.TestCase):
         )
         self.assertEqual(state, "issued")
         raw = json.loads(payload)
-        self.assertEqual(raw["schema"], "pantheon-approval-status/v1")
+        self.assertEqual(raw["schema"], "pantheon-approval-status/v2")
         self.assertEqual(raw["approval_handle"], "a" * 64)
 
     def test_decide_denied_returns_empty_handle_slot(self) -> None:
@@ -2433,7 +2447,7 @@ class ConsumerBusTests(ApprovalPrivateBusCase):
         )
         self.assertEqual(str(state), "issued")
         raw = json.loads(str(payload))
-        self.assertEqual(raw["schema"], "pantheon-approval-status/v1")
+        self.assertEqual(raw["schema"], "pantheon-approval-status/v2")
         self.assertEqual(
             raw["approval_handle"],
             self.state["approval_b_handle"],

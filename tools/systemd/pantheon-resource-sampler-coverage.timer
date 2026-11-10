@@ -1,0 +1,12 @@
+[Unit]
+Description=Pantheon resource-sampler coverage guard — every 5 minutes (T-6211)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=pantheon-resource-sampler-coverage.service
+
+[Install]
+WantedBy=timers.target

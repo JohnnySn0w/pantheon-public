@@ -1269,6 +1269,10 @@ def fixture_inputs(repo_root: Path = REPO_ROOT) -> dict[str, bytes]:
 
     manifest = json.loads((repo_root / "tools" / "host_broker_install.manifest.example.json").read_text("utf-8"))
     manifest["approvers"]["seat_ids"] = ["rehearsal-approver"]
+    # the disposable rehearsal requester is a protocol-test seat (ORG-052 E37; section 8
+    # clarification, #1665); the approver seat is never one (parse_manifest refuses it)
+    manifest["plan_registration"] = {"protocol_test_seat_ids": [sid for sid, _uid, _h in FIXTURE_SEATS
+                                                                 if sid not in manifest["approvers"]["seat_ids"]]}
     registry = {
         "schema": H.REGISTRY_SCHEMA,
         "seats": [{"seat_id": sid, "uid": uid, "persona": sid, "role": "fixture-seat", "instance": "rehearsal",

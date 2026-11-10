@@ -1,7 +1,7 @@
 """Postboot marker -- read/write side of the C3 runtime completion signal.
 
 Mechanism PICK (T-3294 DECISIONS): a runtime marker checked at
-library-call tier, per adr/ORG-080-germination-engine.md L343-347
+library-call tier, per adr/ORG-080-germination-engine.md (relocated to notes/2026-11-02-org-080-run-state-relocated.md §Reboot recovery and postboot marker)
 (``[Documentary -- informs C3]``, but the ADR's own v8->v9 fold already
 found cross-manager systemd-target ordering structurally broken and
 converged on exactly this shape -- "the gate therefore lives at the
@@ -14,7 +14,7 @@ see harness/fixtures.py).
 
 Marker body is versioned JSON, NOT the ADR's plain-boot_id-only
 documentary shape (``{"marker_version": 1, "boot_id": "<36-char>"}``).
-Deviation licensed by ORG-080 L60 ("documentary specifics ... the
+Deviation licensed by ORG-080 §Architectural-tier scope carve ("documentary specifics ... the
 reference-implementation is free to demonstrate a different one").
 Necessary because C4-3 (postboot-indicator compat warning) requires a
 "valid-but-warning body shape (e.g. reserved-for-future-use marker
@@ -30,7 +30,7 @@ from pathlib import Path
 
 from .exceptions import PrimitiveUnavailable
 
-#: Production marker path (ORG-080 L345). Non-root callers (tests, dev)
+#: Production marker path (ORG-080 run-state note §Reboot recovery and postboot marker). Non-root callers (tests, dev)
 #: override this module attribute directly -- see module docstring.
 MARKER_PATH: Path = Path("/run/pantheon/germinate/postboot-complete.marker")
 

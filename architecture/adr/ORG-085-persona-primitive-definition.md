@@ -7,7 +7,7 @@ date: 2026-09-01
 author: Consultant
 steward: consultant
 hitl: Autonomous
-relates: [ORG-027, ORG-031, ORG-057, ORG-058, ORG-059, ORG-075, ORG-079, ORG-080, ORG-081, ORG-084]
+relates: [ORG-027, ORG-031, ORG-057, ORG-058, ORG-059, ORG-075, ORG-079, ORG-080, ORG-081, ORG-084, ORG-088, ORG-100]
 build_disposition: no-build-needed
 scoping_ticket: T-3029
 no_registry_row_waiver: "Conceptual identity-and-composition decision only. It registers no component and leaves component contracts and registry coverage to ORG-080/081, while installed and runtime observations remain non-authoritative evidence governed by their adopted component/runtime contracts."
@@ -100,151 +100,25 @@ it is not current runtime authority and is not adopted or promoted here.
 These signatures name required field families. They are conceptual contracts,
 not a new file format or registry.
 
-```text
-HarnessDefinition {
-  harness_id: StableId
-  display_label: String
-  adapter_contract_ref: AuthorityRef
-  controller_ref: AuthorityRef
-  substrate_refs: Set[AuthorityRef]
-  trigger_periodic_refs: Set[AuthorityRef]
-  mcp_plugin_mechanism_refs: Set[AuthorityRef]
-  storage_mechanism_refs: Set[AuthorityRef]
-  memory_mechanism_refs: Set[AuthorityRef]
-  install_contract_refs: Set[AuthorityRef]
-  source_revision: RevisionRef
-  source_digest: Digest
-  lifecycle: declared | deprecated | retired
-}
-```
-
-```text
-RoleDefinition {
-  role_id: StableId
-  display_label: String
-  work_envelope_refs: NonEmptySet[AuthorityRef]
-  capability_policy_refs: Set[AuthorityRef]
-  mcp_capability_refs: Set[AuthorityRef]
-  skill_policy_refs: Set[AuthorityRef]
-  model_requirement: CapabilityTierRef   # harness-neutral, e.g. "strong-reasoning" (amended 2026-10-07)
-  effort_intent: EffortIntentRef         # harness-neutral (amended 2026-10-07)
-  authentication_permission_refs: Set[AuthorityRef]
-  autonomy_trust_policy_refs: NonEmptySet[AuthorityRef]
-  decision_authority_refs: NonEmptySet[AuthorityRef]
-  ratifiable_scope_refs: Set[AuthorityRef]
-  ratifiable_class_access_refs: Set[AuthorityRef]
-  credential_reference_policy_ref: Optional[AuthorityRef]
-  persona_narrowable_fields: Set[FieldPath]
-  source_revision: RevisionRef
-  source_digest: Digest
-  lifecycle: declared | deprecated | retired
-}
-```
+The conceptual `HarnessDefinition` and `RoleDefinition` signatures are relocated verbatim to `notes/2026-11-03-org-085-conceptual-contracts-relocated.md` §HarnessDefinition and §RoleDefinition.
 
 `role_id` is the functional Role. There is no separate `functional_role_class`.
 
-```text
-PersonaDefinition {
-  persona_id: StableId
-  display_label: String
-  role_ids: NonEmptySet[RoleId]
-  default_role_id: RoleId
-  binding_refs: NonEmptySet[BindingId]
-  default_binding_id: BindingId
-  identity_canon_refs: NonEmptySet[AuthorityRef]
-  memory_content_refs: Set[AuthorityRef]
-  relationship_history_refs: Set[AuthorityRef]
-  pinned_persona_source_ref: AuthorityRef
-  communication_style_source_ref: AuthorityRef
-  override_record_refs: Set[OverrideId]
-  source_revision: RevisionRef
-  source_digest: Digest
-  lifecycle: declared | deprecated | retired
-}
-```
+The conceptual `PersonaDefinition` signature is relocated verbatim to `notes/2026-11-03-org-085-conceptual-contracts-relocated.md` §PersonaDefinition.
 
 `default_role_id` MUST be a member of `role_ids` and `default_binding_id` MUST
 be a member of `binding_refs`. The default binding declares the persona's
 present/default embodiment, including its specific account by reference. It is
 not a claim that the binding is healthy or the sole runtime authority holder.
 
-```text
-PersonaBinding {
-  binding_id: StableId
-  persona_id: PersonaId
-  harness_id: HarnessId
-  instance_role_key_ref: Optional[BindingKeyRef]
-  account_ref: AccountRef
-  mailbox_ref: MailboxRef
-  telegram_ref: Optional[CommunicationEndpointRef]
-  install_manifest_ref: AuthorityRef
-  harness_adapter_ref: AuthorityRef
-  runtime_binding_ref: Optional[RuntimeObservationRef]
-  model_resolution: ModelRef             # concrete, harness-specific; resolves L2 model_requirement (amended 2026-10-07)
-  effort_resolution: EffortRef           # concrete, harness-specific; resolves L2 effort_intent (amended 2026-10-07)
-  source_revision: RevisionRef
-  source_digest: Digest
-  lifecycle: planned | enabled | disabled | retired
-}
-```
+The conceptual `PersonaBinding` signature is relocated verbatim to `notes/2026-11-03-org-085-conceptual-contracts-relocated.md` §PersonaBinding.
 
 The binding does not own functional-role membership. `instance_role_key_ref`
 preserves the current `instance.yaml`/`agent_role_map` binding namespace without
 turning it into a second Role authority. Communication endpoints live here;
 communication style remains in PersonaDefinition.
 
-```text
-OverrideRecord {
-  override_id: StableId
-  subject_ref: PersonaId | BindingId
-  from_layer: L1 | L2
-  to_layer: L2 | L3
-  field_path: FieldPath
-  value_digest: Digest
-  applicability: TypedPredicate
-  authority_ref: AuthorityRef
-  provenance_ref: EvidenceRef
-  waiver_ref: Optional[AuthorityRef]
-  expires_at_or_trigger: Optional[Expiry]
-}
-```
-
-```text
-ResolvedPersona {
-  persona_id: PersonaId
-  selected_role_id: RoleId
-  selected_binding_id: BindingId
-  harness_id: HarnessId
-  account_ref: AccountRef
-  effective_model: ModelRef
-  effective_effort: EffortRef
-  effective_capability_refs: Set[AuthorityRef]
-  effective_authority_refs: Set[AuthorityRef]
-  memory_mechanism_refs: Set[AuthorityRef]
-  memory_content_refs: Set[AuthorityRef]
-  mailbox_ref: MailboxRef
-  telegram_ref: Optional[CommunicationEndpointRef]
-  resolution_receipt: ResolutionReceipt
-}
-```
-
-```text
-ResolutionReceipt {
-  receipt_id: StableId
-  purpose_ref: PurposeRef
-  input_authority_refs: NonEmptySet[AuthorityRef]
-  source_revisions: NonEmptySet[RevisionRef]
-  source_digests: NonEmptySet[Digest]
-  selected_role_id: RoleId
-  selected_binding_id: BindingId
-  applied_override_ids: Set[OverrideId]
-  selector_policy_ref: Optional[AuthorityRef]
-  authority_holder_receipt_ref: Optional[EvidenceRef]
-  graph_digest: Digest
-  issued_at: Timestamp
-  refusal: Optional[TypedRefusal]
-}
-```
+The conceptual `OverrideRecord`, `ResolvedPersona` and `ResolutionReceipt` signatures are relocated verbatim to `notes/2026-11-03-org-085-conceptual-contracts-relocated.md` §OverrideRecord, §ResolvedPersona and §ResolutionReceipt.
 
 ## Field ownership and authority
 
@@ -273,40 +147,7 @@ Composition is purpose- and Role-specific. A persona with several Roles never
 receives the union of their authority merely because the same identity holds
 them.
 
-```text
-compose(persona_id, requested_role_id?, requested_binding_id?, purpose):
-  persona = load_current_definition(persona_id)
-  require persona.lifecycle == declared
-
-  role_id = requested_role_id or persona.default_role_id
-  require role_id in persona.role_ids
-  role = load_current_definition(role_id)
-  require role.lifecycle == declared
-
-  binding_id = requested_binding_id or persona.default_binding_id
-  require binding_id in persona.binding_refs
-  binding = load_current_binding(binding_id)
-  require binding.persona_id == persona_id
-  require binding.lifecycle == enabled
-
-  harness = load_current_definition(binding.harness_id)
-  require harness.lifecycle == declared
-
-  effective = instantiate(harness)
-  specialize effective with role-owned fields
-  attach persona-owned identity, content, and style references
-
-  for record in canonical_order(persona.override_record_refs):
-    require record.from_layer < record.to_layer
-    require record.field_path is declared overrideable
-    require record.applicability matches purpose, role, persona, and binding
-    require authority/provenance/waiver valid and not stale
-    require record cannot widen L2 authority, trust, credentials, or capability
-    refuse unknown field, duplicate writer, incomparable values, or conflict
-    apply record and retain its id
-
-  emit digest-bound ResolutionReceipt
-```
+The conceptual `compose(persona_id, requested_role_id?, requested_binding_id?, purpose)` procedure is relocated verbatim to `notes/2026-11-03-org-085-conceptual-contracts-relocated.md` §compose.
 
 Normative invariants:
 
@@ -330,38 +171,14 @@ Normative invariants:
 A persona target pins the named logical identity. It does not mean “any account
 with the same label.”
 
-```text
-resolve_persona_target(persona_id, purpose):
-  require one current declared PersonaDefinition
-  require one valid active-authority receipt, or one enabled default binding
-          when no runtime authority has yet been established
-  compose(persona_id, default_role_id, selected_binding_id, purpose)
-  refuse no eligible binding, stale evidence, or multiple authority holders
-  return one binding plus ResolutionReceipt
-```
+The conceptual `resolve_persona_target(persona_id, purpose)` procedure is relocated verbatim to `notes/2026-11-03-org-085-conceptual-contracts-relocated.md` §resolve_persona_target.
 
 ### Functional-Role-target routing
 
 A Role target identifies an eligible set, not an actor and not an authority
 grant.
 
-```text
-resolve_role_target(role_id, work_ref, purpose):
-  candidates = declared personas whose role_ids contains role_id
-  for each candidate:
-    resolve exactly one enabled/authoritative binding
-    require current lifecycle/availability evidence under its freshness rule
-    require role and binding eligible for this work
-
-  if candidates is empty:
-    retain queued work and emit no_eligible_persona receipt
-  if candidates has one member:
-    atomically claim with work_ref + idempotency key; emit receipt
-  if candidates has multiple members:
-    require a named deterministic selector policy with authority-sourced inputs
-    otherwise retain queued work and emit ambiguous_persona_for_role refusal
-    atomically claim the selected candidate; emit selector + claim receipt
-```
+The conceptual `resolve_role_target(role_id, work_ref, purpose)` procedure is relocated verbatim to `notes/2026-11-03-org-085-conceptual-contracts-relocated.md` §resolve_role_target.
 
 [[T-3028]] owns ticket target syntax, WIP and availability rules, selector
 policy, atomic claim mechanics, and [[ORG-003]]/[[ORG-078]] integration. This
@@ -372,15 +189,7 @@ request accepted and owned by the receiving Role under its native authority.
 
 ### Germination and installation
 
-```text
-project_install(binding_id, purpose):
-  resolve L1 definition + exactly one L2 role context + L3 persona + binding
-  produce a desired projection and ResolutionReceipt
-  submit references and digests to ORG-080 plan/apply/verify/rollback
-  obtain component coverage from ORG-081
-  record installed/runtime observations under their adopted component/runtime contracts
-  refuse digest drift, duplicate field authority, or unsupported applicability
-```
+The conceptual `project_install(binding_id, purpose)` procedure is relocated verbatim to `notes/2026-11-03-org-085-conceptual-contracts-relocated.md` §project_install.
 
 [[ORG-079-l1-install-completeness-contract|ORG-079]] supplies persona-stack L1 install-completeness; role/persona values
 remain L2/L3 inputs. [[ORG-080]] owns germination process and component
@@ -397,14 +206,7 @@ Every ordinary delivery resolves to one PersonaBinding and uses its
 `mailbox_ref` as the durable per-persona destination. `telegram_ref` is an
 optional bound endpoint, not identity or authority.
 
-```text
-deliver(target, message_id):
-  resolve persona or Role target to exactly one binding
-  require destination and sender authority from canonical binding/policy refs
-  write once using message_id as idempotency key
-  emit target -> persona -> binding -> destination receipt
-  refuse duplicate delivery or implicit fan-out
-```
+The conceptual `deliver(target, message_id)` procedure is relocated verbatim to `notes/2026-11-03-org-085-conceptual-contracts-relocated.md` §deliver.
 
 Explicit fan-out, if ever needed, requires a separate downstream contract. A
 Role target does not cause one message to be copied to every persona holding the
@@ -415,17 +217,7 @@ Role.
 Persona identity survives binding replacement; action authority does not exist
 twice.
 
-```text
-handoff(persona_id, old_binding_id, candidate_binding_id, checkpoint):
-  require old binding is the sole active authority holder
-  require candidate is referenced by the PersonaDefinition
-  start candidate in non-authoritative verification mode
-  verify persona/role refs, authority limits, source digests, checkpoint,
-         memory/content refs, communication, and bounded functional behavior
-  on mismatch: retire/rollback candidate and preserve old authority
-  on success: atomically transfer the active-authority receipt
-  refuse any state with two action-authoritative bindings
-```
+The conceptual `handoff(persona_id, old_binding_id, candidate_binding_id, checkpoint)` procedure is relocated verbatim to `notes/2026-11-03-org-085-conceptual-contracts-relocated.md` §handoff.
 
 `default_binding_id` is desired/default selection; the active-authority receipt
 is observed continuity state. [[T-3176]] may serialize references, checkpoints,
@@ -546,19 +338,7 @@ Costs and tensions:
 
 ## Source and falsifier map
 
-| Claim | Primary authority | Observation that falsifies this ADR's use of it |
-|---|---|---|
-| the operator fixed L1/L2/L3 and four assignments | [[T-3029]] final-skeleton transition entry | canonical ticket lacks or supersedes that entry with different assignments |
-| D2 pen and current below-goal adoption path | `rulebook/directives.md` D2, D3, D7 | current directive requires worker-authored ADR bytes or the operator ratification for this below-goal decision |
-| Harness adapter is keyed independently of persona identity | [[ORG-031]] Decision §i | adapter contract makes persona identity its authority key |
-| Functional Role owns domain/work authority rather than identity | [[ORG-027]] Decision and [[ORG-075-seat-ability-model|ORG-075]] D1–D3 | current authority is granted solely by persona/account label |
-| Session/account/harness are replaceable embodiments | [[ORG-057]] §§1–3 | continuity canon names an embodiment as immutable logical identity or permits two active action authorities |
-| Memory mechanism/content and hidden-state boundaries | [[ORG-058]] §§1–4 | hidden/native/session memory becomes durable identity authority without governed envelope |
-| Discovery/delegation cannot launder privilege | [[ORG-059]] §§3–4 | requester may mint approval or execute merely by naming a stronger Role/persona |
-| Persona-stack L1 mechanism vs L2 values seam | [[ORG-079-l1-install-completeness-contract|ORG-079]] §Persona-stack L1/L2 partition | current ratified install contract assigns role values to L1 or persona style to L2 |
-| Germination and registry have ratified owners; runtime observations remain contract-owned non-authoritative evidence | [[ORG-080]], [[ORG-081]] Decision/D-10, adopted component/runtime contracts; proposed [[ORG-084-executable-runtime-contract-projection|ORG-084]] is informative only | this ADR needs to write a component row or make Proposed ORG-084/current observation into persona authority |
-| Current role-key binding is mostly 1:1 | [[T-1922]], `instance.yaml`, `repos.yaml`, `tools/agent_role_map.py` | current consumer already resolves a shared functional Role directly to multiple personas |
-| Downstream dependency truth | [[T-3027]], [[T-3028]], [[T-3030]], [[T-3176]] transition/frontmatter records | T-3027 or T-3028 regains a hard T-3029 dependency, or T-3176 loses it |
+The source and falsifier map (claim, primary authority, and the observation that falsifies this ADR's use of it) is relocated verbatim to `notes/2026-11-03-org-085-evidence-basis-relocated.md` §Source and falsifier map.
 
 No version-sensitive external claim is load-bearing. No web source is required.
 
@@ -612,23 +392,7 @@ Revisit this decision when any of the following occurs:
 
 ## Independent-reviewer rulings 1–15
 
-| # | Ruling | Status |
-|---|---|---|
-| 1 | L1 Harness | built |
-| 2 | L2 Role | built |
-| 3 | L3 Persona | built |
-| 4 | L1 → L2 → L3 | built |
-| 5 | bounded provenance-bearing downward override | built |
-| 6 | L2 model/effort default and persona-narrow override | built; amended 2026-10-07 (see §Amendment) |
-| 7 | L2 autonomy/authority/trust | built |
-| 8 | L1 memory mechanism vs L3 content | built |
-| 9 | L3 communication style | built |
-| 10 | capability/MCP composition cannot launder privilege | built |
-| 11 | account/harness/runtime binding is not primitive identity | built |
-| 12 | persona- and Role-target resolution fail closed | built conceptually; ticket mechanics deferred-with-disclosure to T-3028 |
-| 13 | germination composes layers without registry duplication | built conceptually; implementation unchanged-from-last-increment |
-| 14 | continuity preserves one active authority holder | built conceptually; implementation deferred-with-disclosure to T-3176 |
-| 15 | Proposed → reviewed → Adopted unless goal-level | built; transitioned to Adopted after review with no goal-level trigger |
+The independent-reviewer ruling table (rulings 1–15 and their status) is relocated verbatim to `notes/2026-11-03-org-085-review-history.md` §Independent-reviewer rulings 1–15.
 
 No ruling is infeasible-stopped. No implementation claim is made.
 

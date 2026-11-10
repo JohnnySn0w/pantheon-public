@@ -24,36 +24,13 @@ Make the reach, effectiveness, and cost of Pantheon's tests measurable without s
 
 ## Context and fleet baseline
 
-The survey behind this ADR covers every project row in `repos.yaml`: 13 live repositories, retired `pantheon-bridge`, and six ignored rows. Consultant directly inspected `pantheon-config@f114a947e538834830f9432a7e744f4b1429c6d5` and `codex-config@79f6b4ed8cc7328f38c3fefb1dea44ca3c501a61`; T-3377 inspected the head-owned repositories and resolved at `24d03d7162`. Absence below means the cited readable revision was searched. Retired and ignored rows were classified, not searched and then mislabeled absent.
+The survey behind this ADR covers every project row in `repos.yaml`: 13 live repositories, retired `pantheon-bridge`, and six ignored rows. Consultant directly inspected `pantheon-config@f114a947e538834830f9432a7e744f4b1429c6d5` and `codex-config@79f6b4ed8cc7328f38c3fefb1dea44ca3c501a61`; T-3377 inspected the head-owned repositories and resolved at `24d03d7162`. Absence in the availability and evidence ledger (`notes/2026-11-03-org-083-evidence-basis-relocated.md` §Availability and evidence ledger) means the cited readable revision was searched. Retired and ignored rows were classified, not searched and then mislabeled absent.
 
 At those revisions, no surveyed live code repository configures line, branch, function, changed-code, or mutation measurement, and none retains a measured flake history. Existing CI and boundary-test maturity varies widely. Therefore every repository begins this policy at `inventory_only`; a test suite or green build does not imply a measured baseline.
 
 ### Availability and evidence ledger
 
-| Repository | Registry class / surveyed revision | Test and CI surface | Corrected evidence classification |
-|---|---|---|---|
-| `pantheon-config` | live; `f114a947e538834830f9432a7e744f4b1429c6d5` | Python and shell; self-hosted Python 3.11/3.12 CI | No quantitative tooling; production-subprocess, shell-suite, temporary-git, and integration evidence exist |
-| `codex-config` | live; `79f6b4ed8cc7328f38c3fefb1dea44ca3c501a61` | Python 3.12 CI; pytest; unittest documented | No quantitative tooling; staged-hook subprocess, fixture-git, scrubbed-environment, and host-path boundary evidence exist |
-| `echo-prismatic` | live; `9a27393e5883` | Rust workspace, Bun/Vitest frontend, active CI and daemon E2E | No quantitative tooling; the E2E test starts the real Echo binary, so production-subprocess and integration evidence are present; a shell-test framework is absent |
-| `echo-recorder` | live; `0a3f5096720d` (`master`) | TypeScript/Bun application; no runner or CI | Live-code test-surface gap |
-| `echo_vault` | live non-code; `c14a16b37245` | Obsidian architecture vault | Test dimensions not applicable while it remains non-code |
-| `pantheon-pwa` | live; `7e2d94391de3` | Bun unit, Playwright E2E/visual, shell build smoke; no active CI | No quantitative tooling; real daemon/auth/UI boundary present; Playwright retry is retry policy, not measured flakiness |
-| `revenue-project` | live non-code at survey; `8a2eaa286601` | Research/docs; no runner or CI | Explicit non-code/test-surface disposition; re-evaluate if executable work appears |
-| `personal-site-astro` | live; `5234b908182e` | Astro/Node; CI builds only | Live-code test-surface gap; build success is not test-effectiveness evidence |
-| `vibecamp-scheduler` | live; `4fe5c3684ee6` | Astro/Node deploy workflow; no test runner | Tolerated refresh-data failure is deploy tolerance, not retry or measured flakiness |
-| `claude-config` | live; `3bdc5992acf7` | Python 3.12 CI; pytest | No quantitative tooling or configured real-boundary receipt identified |
-| `codex-config-template` | live; `da38cfdcc8ed` | Python tests; reference mirror intentionally has no active CI | Test surface present; no quantitative tooling in the mirror |
-| `exocortex-skeleton` | live; `5c919cf34857` | Local pytest suite; no CI | No quantitative tooling or configured boundary/flake evidence identified |
-| `pantheon-public` | live; `ebae67b0e311` (`master`) | Python and shell tests; inactive workflow template only | Shell and live-acceptance evidence present; expected-failure manifest is quarantine/known-failure evidence, not measured flakiness |
-| `pantheon-bridge` | retired | Not surveyed | Historical classification only; no revival implied |
-| `excalidraw-diagram-skill` | ignored | Not surveyed | Non-project tool |
-| `sentient-internal` | ignored | Not surveyed | Client/business material |
-| `sentienthardware` | ignored | Not surveyed | Client/business material |
-| `studio-operator` | ignored | Not surveyed | Firm/business material |
-| `toys` | ignored | Not surveyed | Experiment/catchall |
-| `vibecamp-trials-tracker` | ignored | Not surveyed | Non-Pantheon personal project |
-
-The full command/file evidence and access classifications remain in [[T-2954]] and [[T-3377]]. The semantic corrections in this table are authoritative for this ADR: production subprocess is distinct from shell-suite execution, and retry, deploy tolerance, quarantine, and measured flakiness are four different things.
+The per-repository availability and evidence ledger (registry class and surveyed revision, test and CI surface, and corrected evidence classification for the 13 live, one retired and six ignored `repos.yaml` rows), its pointer to the full command/file evidence and access classifications in [[T-2954]] and [[T-3377]], and its statement that the table's semantic corrections are authoritative for this ADR (production subprocess is distinct from shell-suite execution, and retry, deploy tolerance, quarantine, and measured flakiness are four different things) are relocated verbatim to `notes/2026-11-03-org-083-evidence-basis-relocated.md` §Availability and evidence ledger.
 
 ## Decision
 
@@ -71,41 +48,7 @@ The controlled results of Inozemtseva and Holmes support caution about using cov
 
 The downstream build must implement a versioned `RepositoryEvidenceContract`. Its root makes every specialized record reachable; prose-only or orphaned evidence is invalid.
 
-```yaml
-schema_version:
-contract_id:
-repository:
-registry_revision:
-evidence_revision:
-collected_at:
-repo_class: live_code | live_noncode | retired | ignored
-arc_author:
-fleet_steward_role:
-repo_evidence_owner_role:
-owner_resolution:
-maturity:
-target_maturity:
-next_review:
-dimension_dispositions: []
-quantitative_measurements: []
-changed_code_records: []
-mutation_records: []
-flake_observations: []
-boundary_records: []
-retry_policy_records: []
-deploy_tolerance_records: []
-test_surface_gaps: []
-effectiveness_receipts: []
-efficiency_records: []
-parity_records: []
-retention_records: []
-generated_source_records: []
-exclusion_records: []
-waiver_records: []
-maturity_deferrals: []
-quarantine_records: []
-artifact_records: []
-```
+The root's field list (schema and contract identity, repository, registry and evidence revisions, collection time, repository class `live_code | live_noncode | retired | ignored`, arc author, fleet-steward and repository-evidence-owner roles, owner resolution, maturity and target maturity, next review, and the record collections from `dimension_dispositions` to `artifact_records`) is relocated verbatim to `notes/2026-11-03-org-083-record-schemas-relocated.md` §Root contract fields.
 
 Validator invariants:
 
@@ -121,52 +64,11 @@ The shared provenance fields bind evidence to the canonical repository name, the
 
 ### 3. Dimensions and quantitative measurements
 
-A `DimensionDisposition` contains:
-
-```yaml
-dimension: line | branch | function | changed_code | mutation | flake
-status: measured | unsupported | deferred | not_applicable | excluded
-authority:
-reason:
-scope:
-effective_revision:
-measurement_ids: []
-changed_code_record_id:
-mutation_record_id:
-flake_observation_ids: []
-deferral_id:
-exclusion_id:
-re_evaluate_trigger:
-```
+A `DimensionDisposition` records one dimension (`line | branch | function | changed_code | mutation | flake`) and its status (`measured | unsupported | deferred | not_applicable | excluded`); its full field list (including authority, reason, scope, effective revision, linked measurement and specialized-record IDs, deferral and exclusion IDs, and re-evaluate trigger) is relocated verbatim to `notes/2026-11-03-org-083-record-schemas-relocated.md` §Dimension disposition fields.
 
 `unsupported` and `deferred` require a live `MaturityDeferral`; `excluded` requires a live `ExclusionRecord`; `not_applicable` requires evidence and approval. An enum alone is never a completed disposition.
 
-Each `QuantitativeMeasurementRecord` contains at least:
-
-```yaml
-measurement_id:
-repository:
-revision:
-collected_at:
-dimension:
-unit:
-collector: {adapter_id, tool_name, tool_version, command_fingerprint,
-            config_digest, runner_fingerprint}
-scope: {include_selectors, exclusion_ids, generated_source_ids, scope_fingerprint}
-numerator:
-denominator:
-value:
-baseline: {measurement_id, numerator, denominator, value}
-current: {measurement_id, numerator, denominator, value}
-threshold: {state, comparator, value, tolerance, authority_record}
-ratchet: {direction, proposed_value, adopted_value, tolerance, authority_record}
-comparability: {verdict, baseline_measurement_id, checked_fields,
-                changed_fields, reason, reset_record}
-changed_code_record_id:
-mutation_record_id:
-flake_observation_ids: []
-artifact_id:
-```
+Each `QuantitativeMeasurementRecord` contains at least the fields relocated verbatim to `notes/2026-11-03-org-083-record-schemas-relocated.md` §Quantitative measurement record fields: measurement identity, repository, revision, and collection time; dimension and unit; collector and scope blocks; numerator, denominator, and value; baseline and current blocks; threshold, ratchet, and comparability blocks; and changed-code, mutation, flake, and artifact links.
 
 Threshold state is `unset | proposed | advisory | enforcing`; ratchet direction is `nondecreasing | nonincreasing | bounded`; comparability is `comparable | reset_required | refused`. A reviewed equivalence record is required to preserve a comparison after any material change to the runner, language substrate, adapter/tool version, command, configuration, source scope, exclusion set, generated-source treatment, denominator semantics, branch/function semantics, or test selection. Otherwise the baseline resets or comparison is refused. A favorable trend never survives a denominator change by default.
 
@@ -203,30 +105,11 @@ An `EfficiencyRecord` binds revision, environment/command/test-set fingerprints,
 - `divergent_with_waiver` expires with its waiver.
 - Commands need not be byte-identical, but the governed scope and semantics must be evidenced equivalent.
 
-An `ArtifactRecord` contains `artifact_id`, class, repository/revision, `created_at`, producer/tool/config identity, storage locator, media type, digest algorithm/digest, size, and sensitivity/access class.
+The `ArtifactRecord` field list (artifact ID, class, repository/revision, creation time, producer/tool/config identity, storage locator, media type, digest algorithm and digest, size, and sensitivity/access class) is relocated verbatim to `notes/2026-11-03-org-083-record-schemas-relocated.md` §Artifact record fields.
 
-Every artifact used for maturity, a threshold/ratchet, an exception, or enforcement has a `RetentionRecord`:
+Every artifact used for maturity, a threshold/ratchet, an exception, or enforcement has a `RetentionRecord`.
 
-```yaml
-retention_id:
-artifact_id:
-artifact_class:
-created_at:
-storage_locator:
-digest_algorithm:
-digest:
-availability:
-  state: verified_available | unavailable | deleted
-  verified_at:
-  retrieval_receipt_id:
-retention_end:
-  kind: timestamp | event
-  value:
-expiry_action: retain_tombstone | archive_with_tombstone | delete_with_tombstone
-tombstone_artifact_id:
-owner:
-superseded_by:
-```
+The `RetentionRecord` field list (retention and artifact identity, artifact class, creation time, storage locator, digest, an availability state of `verified_available | unavailable | deleted` with verification time and retrieval receipt, a `timestamp | event` retention end, an expiry action of `retain_tombstone | archive_with_tombstone | delete_with_tombstone`, tombstone artifact, owner, and supersession) is relocated verbatim to `notes/2026-11-03-org-083-record-schemas-relocated.md` §Retention record fields.
 
 Exactly one deterministic retention-end kind is selected. Availability means a retrieval was verified at `verified_at`, not merely that a locator was configured. Expiry, deletion, or unexpected unavailability creates a retained tombstone recording the prior digest, locator, reason, authority, action time, and last successful retrieval receipt. Evidence required to reconstruct a live maturity, ratchet, waiver, or enforcement decision cannot expire while that decision remains active.
 
@@ -332,19 +215,7 @@ It makes gaps and costs explicit and supports language-specific adapters without
 
 ## Source-to-claim and falsifier map
 
-| Normative claim | Primary source | Applicability limit | Falsifier / re-open condition |
-|---|---|---|---|
-| Coverage alone is not an effectiveness proof | [Inozemtseva & Holmes, ICSE 2014](https://doi.org/10.1145/2568225.2568271) | Controlled study of five large Java systems; not a language-universal theorem | Replicated cross-language evidence that coverage alone robustly predicts relevant fault detection |
-| Mutation can add effectiveness signal beyond coverage | [Just et al., FSE 2014](https://doi.org/10.1145/2635868.2635929) | Five studied applications; does not establish universal operators or thresholds | Pilot evidence that the selected mutants do not correlate with relevant real faults |
-| Mutation scores are confounded by suite size/operator choices | [Papadakis et al., ICSE 2018](https://doi.org/10.1145/3180155.3180183) and [mutation survey](https://doi.org/10.1016/bs.adcom.2018.03.015) | Language, tool, operator, and corpus dependent | A governed adapter showing stable semantics across the relevant changes |
-| Retry configuration is not measured flakiness | [Luo et al., FSE 2014](https://doi.org/10.1145/2635868.2635920) | Empirical causes in studied projects; governance distinction is an inference | Comparable fixed-revision observations showing the signal maps one-to-one to genuine flakes |
-| Differential coverage detects some flakes but is not a complete metric | [Bell et al., ICSE 2018](https://doi.org/10.1145/3180155.3180164) | Studied implementation/ecosystem | Pilot shows no useful signal or validated completeness under Pantheon conditions |
-| Repeated comparable runs are needed for a measured flake rate | Luo et al.; [Parry et al., ESE 2023](https://doi.org/10.1007/s10664-023-10307-w) | Study populations and definitions vary; policy is a design inference | A validated alternative distinguishes deterministic failures without repeated comparable observations |
-| Branch denominators are tool-defined transitions | [Coverage.py branch documentation](https://coverage.readthedocs.io/en/stable/branch.html) | Python vocabulary only; not a tool mandate | An adapter's authoritative semantics differ, requiring its own typed denominator |
-| Patch and project coverage are distinct scopes | [diff-cover documentation](https://github.com/Bachmann1234/diff_cover) and [Codecov documentation](https://docs.codecov.com/docs/frequently-asked-questions) | Tool vocabulary/examples, not evidence that patch scope is superior | Selected adapter cannot reproduce a stable base/head denominator |
-| Defect evidence should prove the real failure red then restored green | `sop/standard/testing-depth-and-scope.md` Amendments G/H | Pantheon process rule; scope-proportionate | Reviewed evidence that the receipt is impossible or misleading for a specific test class |
-| Machine validation and immutable provenance outrank prose-only compliance | P1, P3, P4 and D5 | Pantheon governance design inference | Validator cannot distinguish malformed/incomparable evidence from valid evidence |
-| The current fleet has no configured quantitative coverage/mutation/flake machinery | [[T-2954]] direct survey and [[T-3377]] at `24d03d7162` | Exact surveyed revisions only | A cited file at those revisions showing a configured collector and retained result |
+The map pairing the normative claims it lists with their primary source, applicability limit, and falsifier / re-open condition (covering coverage versus effectiveness, mutation signal and its confounds, retry versus measured flakiness, differential coverage, repeated comparable runs, tool-defined branch denominators, patch versus project scope, red-then-green defect evidence, machine validation over prose-only compliance, and the surveyed fleet's lack of configured quantitative coverage, mutation, and flake machinery) is relocated verbatim to `notes/2026-11-03-org-083-evidence-basis-relocated.md` §Source-to-claim and falsifier map.
 
 ## Downstream build obligations
 
@@ -363,9 +234,7 @@ After ratification, the spawned build child must scope and independently review:
 
 ## Ratification and provenance
 
-This draft derives from T-2954, the T-3377 survey, direct repository-object audits, and three antagonistic proposal-review rounds. The third-boundary amendments make specialized records root-reachable, make retention availability observable, correct the HITL lifecycle, and require the future ratification Ask itself to identify the frozen bytes.
-
-After this file is committed and independently reviewed at that exact commit, Consultant files the the operator ratification ticket through `tools/ticket.py file` with `--intent ratify`, the exact `--ratifiable-file pantheon-config:architecture/adr/ORG-083-code-coverage-governance-and-test-effectiveness-evidence.md`, and `--spawn-impl`. The `--ask` text—not only context—must name the frozen ADR commit and the independent exact-commit verdict/pointer. The generated implementation child then receives `build` and `org-083` labels. No ratification surface is filed while review is red.
+The pre-ratification derivation and review-round provenance and the instructions for filing the the operator ratification ticket are relocated verbatim to `notes/2026-11-03-org-083-review-history.md` §Ratification and provenance.
 
 ## DECISIONS
 

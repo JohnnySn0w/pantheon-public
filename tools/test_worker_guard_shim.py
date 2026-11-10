@@ -189,6 +189,36 @@ class TestCompareScriptsTimeoutRerun(unittest.TestCase):
         cmp, _ = self._compare({"ref": [self._TIMEOUT, self._ALLOW], "new": [self._ALLOW]}, reruns=0)
         self.assertEqual(len(cmp.mismatches), 1)
 
+    # T-5838: identical timeouts are no decision, so they cannot clear a pair that once differed.
+    def test_one_sided_timeout_then_both_timed_out_stays_a_mismatch(self):
+        cmp, calls = self._compare({"ref": [self._TIMEOUT], "new": [self._ALLOW, self._TIMEOUT]})
+        self.assertEqual(len(cmp.mismatches), 1)
+        self.assertIn("never cleared", cmp.mismatches[0])
+        self.assertIn("rc=0 out=b''", cmp.mismatches[0])  # the first, differing pair is shown
+        self.assertEqual(calls, {"ref": 1 + smoke.TIMEOUT_RERUNS, "new": 1 + smoke.TIMEOUT_RERUNS})
+
+    def test_one_sided_timeout_cleared_after_double_timeouts_by_a_clean_rerun(self):
+        cmp, calls = self._compare({"ref": [self._TIMEOUT, self._TIMEOUT, self._ALLOW],
+                                    "new": [self._ALLOW, self._TIMEOUT, self._ALLOW]})
+        self.assertEqual(cmp.mismatches, [])
+        self.assertEqual(calls, {"ref": 3, "new": 3})
+
+    def test_both_sides_timed_out_alike_throughout_is_a_match(self):
+        cmp, calls = self._compare({"ref": [self._TIMEOUT], "new": [self._TIMEOUT]})
+        self.assertEqual(cmp.mismatches, [])
+        self.assertEqual(calls["ref"], 1 + smoke.TIMEOUT_RERUNS)
+
+    def test_both_timed_out_in_the_pool_is_judged_on_a_clean_rerun(self):
+        cmp, _ = self._compare({"ref": [self._TIMEOUT, self._DENY], "new": [self._TIMEOUT, self._ALLOW]})
+        self.assertEqual(len(cmp.mismatches), 1)
+        cmp, _ = self._compare({"ref": [self._TIMEOUT, self._ALLOW], "new": [self._TIMEOUT, self._ALLOW]})
+        self.assertEqual(cmp.mismatches, [])
+
+    def test_a_difference_seen_on_a_rerun_is_not_cleared_by_double_timeouts(self):
+        cmp, _ = self._compare({"ref": [self._TIMEOUT, self._TIMEOUT],
+                                "new": [self._TIMEOUT, self._ALLOW, self._TIMEOUT]})
+        self.assertEqual(len(cmp.mismatches), 1)
+
 
 class TestShimAlone(unittest.TestCase):
     def test_fast_path_never_imports_the_impl_and_missing_impl_fails_loud(self):
@@ -714,7 +744,7 @@ class TestDeadlineUnderHarnessTimeouts(unittest.TestCase):
 
     def test_codex_rendered_command_runs_the_real_shim_isolated(self):
         """T-4395 / T-4397 A: the EXACT argv codex runs (`/usr/bin/python3 -I <home>/pantheon-config/
-        tools/hooks/worker-guard.py`) reaches the impl and decides. TestShimInvocationForms covers the
+        tools/hooks/worker-guard-v2.py`) reaches the impl and decides. TestShimInvocationForms covers the
         `-I` form with sys.executable; this pins the adapter's own rendered command end to end."""
         import shlex
         from tools.harness_adapter import codex

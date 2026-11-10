@@ -149,5 +149,54 @@ class TestFailedUnitsProbe(unittest.TestCase):
             self.assertEqual(fur.failed_units("x"), {"a.service", "b.timer"})
 
 
+class TestSystemScope(unittest.TestCase):
+    """T-6364: system units (the mosquitto drop-in, the host-approval ingress) gained
+    StartLimit latches in T-6352/T-6359 but have no OnFailure, and this sweep only
+    asked --user managers, so a latched SYSTEM failure was silent."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.inbox = pathlib.Path(self.tmp.name)
+
+    def test_system_probe_uses_the_system_manager_without_sudo(self):
+        class R:
+            returncode = 0
+            stdout = "mosquitto.service loaded failed failed Mosquitto\n"
+        with patch.object(fur.subprocess, "run", return_value=R()) as run:
+            got = fur.failed_units(fur.SYSTEM)
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[:2], ["systemctl", "list-units"])
+        self.assertNotIn("--user", argv)
+        self.assertNotIn("sudo", argv)
+        self.assertEqual(got, {"mosquitto.service"})
+
+    def test_unreadable_system_manager_is_UNKNOWN_not_clean(self):
+        class R:
+            returncode = 1
+            stdout = ""
+        with patch.object(fur.subprocess, "run", return_value=R()):
+            self.assertIs(fur.failed_units(fur.SYSTEM), fur.UNKNOWN)
+
+    def test_default_sweep_includes_system_scope(self):
+        seen = []
+        def fake(acct, **kw):
+            seen.append(acct)
+            return set()
+        with patch.object(fur, "failed_units", side_effect=fake), \
+             patch.object(fur, "account_persona_map", return_value={"claude": "orchestrator"}):
+            fur.reconcile(inbox=self.inbox)
+        self.assertIn(fur.SYSTEM, seen)
+        self.assertIn("claude", seen)
+
+    def test_latched_system_unit_without_alert_is_SILENT(self):
+        def fake(acct, **kw):
+            return {"mosquitto.service"} if acct == fur.SYSTEM else set()
+        with patch.object(fur, "failed_units", side_effect=fake), \
+             patch.object(fur, "account_persona_map", return_value={"claude": "orchestrator"}):
+            r = fur.reconcile(inbox=self.inbox)
+        self.assertEqual(r["SILENT"].get(fur.SYSTEM), ["mosquitto.service"])
+
+
 if __name__ == "__main__":
     unittest.main()

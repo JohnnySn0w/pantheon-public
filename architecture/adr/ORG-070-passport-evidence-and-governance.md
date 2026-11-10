@@ -84,6 +84,8 @@ The evidence trail is written to the existing ledger / ORG-065 audit substrate, 
 - **E9 (D3/D4) — Counterparty card minimization.** Log the DID + card fingerprint/version + issuer/provenance metadata + approval-time normalized claims — not necessarily the full card (reconciles D3's "DID/card" with D4 minimization).
 - **E10 (D1) — Audit-write-failure behavior.** If evidence emission fails, the action fails closed (or enters a named break-glass/degraded mode with its own audited marker); "allowed but not audited" is forbidden for authorization decisions except under an explicit break-glass mode.
 
+> Status note on E5 (2026-11-03): the interim bridge ended when ORG-065 was built; its closure gate went live in gate mode on 2026-08-12 (T-2934, flip `39a46c7c62`; `tools/ticket.py` `_closure_gate_mode()` defaults to `gate`), before this ADR's 2026-09-06 ratification. This ADR's own evidence-emission build (T-2863) is still open. The text of E5 is unchanged.
+
 ## Alternatives considered
 
 - **A bespoke federation-only audit log.** Rejected — it forks the audit chain, making federation events un-correlatable with the internal actions they cause (D5).

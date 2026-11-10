@@ -80,7 +80,7 @@ cd <the-ancestor home> && exec env XDG_RUNTIME_DIR=/run/user/<uid> \
 **Result contract:** `Result.status ∈ {ok, skipped, failed}`. `ok` = subprocess exited 0 AND the HANDOFF exists non-empty. `skipped` = another veneration holds the lease (back off, don't block). `failed` = subprocess error/timeout, or clean exit with no file written. Default `harvest_timeout` is 300s (large-transcript reload + write).
 
 ### 3. Verify
-- `Result` is `ok`, and its detail ends `rules: <path>`: the pinned-rules file the turn was told to re-read. `rules: none readable` means no file matched `agent` (a non-persona label, or orchestrator, whose Claude rules live in claude-config). That handoff reflects the dead session's start-time rules, so check it against the current ones before the successor relies on it.
+- `Result` is `ok`, and its detail ends `rules: <path>`: the pinned-rules file the turn was told to re-read. `rules: none readable` means no file matched `agent` (for example, a non-persona label); Orchestrator's Claude rules are `pinned-rules/orchestrator.md` in pantheon-config. That handoff reflects the dead session's start-time rules, so check it against the current ones before the successor relies on it.
 - `cat <handoff_target>` — confirm the content is a **real** handoff (identity, current state, in-flight work, next actions), not a stub. A good harvest also self-attests the constraints (no messages/channels/mutation).
 - Clean teardown (should be automatic — the subprocess self-exits): no `veneration-*` tmux session, no orphan `claude --resume` process (`pgrep -u the-ancestor -af claude`), and the lockfile is 0-byte + unlocked (flock released on exit).
 

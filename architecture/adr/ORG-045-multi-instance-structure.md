@@ -91,6 +91,9 @@ ticket per agent) and **claim-locking**, the `agent/<task>`-branch + **HO-exclus
 operator-initiated) may later move it toward active S1/S2 curation duties — see Re-evaluate.
 
 ### S1 — Operations (the value-producing units)
+
+> Read through (operator-ratified framing, not an ADR edit): the 2026-09-07 peer-orchestrator framing (the operator, TG 9294/9296/9298/9300; recorded in `pinned-rules/orchestrator.md` "Regular engineering orchestrators" and typed as role `engineering_orchestrator` in ORG-100): the sub-orchestrator seats listed here are peer orchestrators with a chain position, not workers.
+
 The units that do the primary work; each is itself a **viable system one recursion level down**.
 - **The sub-orchestrator seats** — `suborch1`/`suborch2` (**Mason**/**Artisan**), a horizontally
   scalable N+ tier under the HO (N per deployment, including N=0). Mason/Artisan are *current instances,

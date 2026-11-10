@@ -59,6 +59,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tools import _frontmatter_block  # noqa: E402
 from tools._git_utils import (  # noqa: E402
     commit_scoped,
     pull_repo_or_warn,
@@ -406,13 +407,16 @@ def bugs_handler(d: Path) -> list[str]:
 
 
 def _parse_frontmatter(path: Path) -> dict[str, str]:
-    """Parse simple YAML-style frontmatter (key: value lines between --- delimiters)."""
+    """Parse simple YAML-style frontmatter, including shared block scalars."""
     text = path.read_text()
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         return {}
     result: dict[str, str] = {}
-    for line in lines[1:]:
+    idx = 1
+    while idx < len(lines):
+        line = lines[idx]
+        idx += 1
         if line.strip() == "---":
             break
         # T-5689: an indented line is block-scalar content (`key: |` / `>`), never a key.
@@ -420,7 +424,17 @@ def _parse_frontmatter(path: Path) -> dict[str, str]:
             continue
         if ":" in line:
             key, _, val = line.partition(":")
-            result[key.strip()] = val.strip().strip('"').strip("'")
+            key = key.strip()
+            val = val.strip()
+            if _frontmatter_block.parse_block_header(val) is not None:
+                block, next_idx = _frontmatter_block.consume_block(
+                    lines, idx, val, key=key
+                )
+                if block is not None:
+                    result[key] = block
+                    idx = next_idx
+                    continue
+            result[key] = val.strip('"').strip("'")
     return result
 
 
@@ -505,12 +519,20 @@ def adr_handler(d: Path) -> list[str]:
         if md.name == "README.md":
             continue
         fm = _parse_frontmatter(md)
-        title = fm.get("title", "—")
-        status = fm.get("status", "—")
-        date = fm.get("date", "—")
+        # Literal YAML blocks are semantically multi-line, but a physical line
+        # break would split one Markdown table row into several. Keep the parser
+        # faithful and encode display line breaks only at this rendering seam.
+        title = _adr_cell_text(fm.get("title", "—"))
+        status = _adr_cell_text(fm.get("status", "—"))
+        date = _adr_cell_text(fm.get("date", "—"))
         stem = md.name
         rows.append(_md_row(f"[{stem}]({stem})", title, status, date))
     return rows
+
+
+def _adr_cell_text(value: str) -> str:
+    """Encode semantic line breaks without creating physical Markdown rows."""
+    return "<br>".join(value.splitlines())
 
 
 # ---------------------------------------------------------------------------

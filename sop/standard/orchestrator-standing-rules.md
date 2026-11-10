@@ -1,6 +1,6 @@
 # Orchestrator standing rules — the HO playbook for any orchestrator seat
 
-**Status:** Adopted 2026-09-28 by Orchestrator (HO) under T-2892, which is ORG-075 D2/E2 deliverable (b), "the HO playbook". This is an HO-drafted SOP per ORG-012 and is below goal level, so it is autonomous per msg-3733. The source is Orchestrator's pinned rules (`claude-config/pinned-rules/orchestrator.md`), cut down to the durable, role-general subset.
+**Status:** Adopted 2026-09-28 by Orchestrator (HO) under T-2892, which is ORG-075 D2/E2 deliverable (b), "the HO playbook". This is an HO-drafted SOP per ORG-012 and is below goal level, so it is autonomous per msg-3733. The source is Orchestrator's pinned rules (`pinned-rules/orchestrator.md`), cut down to the durable, role-general subset.
 
 ## When to use this
 
@@ -180,7 +180,7 @@ When running a team, also load `pantheon-role-project-orchestrator` for the disp
 
 ## Maintenance
 
-- `claude-config/pinned-rules/orchestrator.md` restates most of these rules, because it is auto-loaded where their failure rate is highest. When a rule here changes, change it there in the same arc, or the two copies drift.
+- `pinned-rules/orchestrator.md` restates most of these rules, because it is auto-loaded where their failure rate is highest. When a rule here changes, change it there in the same arc, or the two copies drift.
 - The rendered skills stamp this file's commit. Re-render per `rulebook/persona-orientation/README.md` after any edit, and propagate to peer seats.
 
 ## Cross-references

@@ -72,6 +72,11 @@ Reproduce: from a seat that is NOT the cache's original builder, with a shared `
 
 - T-3823 (echo ha-mcp fix push), 2026-09-28, artisan. Complements the seat-side operating note in artisan memory `shared-cargo-target-dir-cross-seat` (umask-002-insufficient extension).
 
+
+Sibling: `bugs/shared-cargo-target-cross-worktree-artifact-bleed.md` (cross-worktree artifact bleed on the same shared dir; the correctness face).
+
+Contradicts: `notes/echo-cargo-target-sharing-eval.md` (T-3550), which treats `umask 002` + the setgid `pantheon-shared` dir as the permission answer. As this entry shows, it does not prevent EPERM on a foreign-owned OUT dir; the durable fix is the adopt step (T-4071, `tools/echo_target_adopt.py` via `tools/echo-cargo.sh`).
+
 ## Keywords
 
 fs::copy, std::fs::copy, EPERM, Operation not permitted, os error 1, PermissionDenied, failed to run custom build command, build.rs, OUT_DIR, aws-lc-sys, libsqlite3-sys, openssl-sys, ring, x11-dl, tauri, echo-demo-app, PERMISSION_FILES_PATH, CARGO_TARGET_DIR, shared target, cross-seat, setgid, umask 002, pantheon-shared, echo-target, pre-push hook, chmod ownership, cargo-lock, flock, concurrent gates, T-3604, T-3777, T-4955

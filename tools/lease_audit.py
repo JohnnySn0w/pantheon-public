@@ -58,7 +58,7 @@ is the account name (the sample manifest's convention). A repair on an account
 that is not a manifest target cannot be leased at all: it is counted
 (repairs_unleasable), not flagged.
 
-ROUTING (dry-run prints only). A finding by codex-fallback -> MAIL_RECOVERY; by
+ROUTING. A finding by codex-fallback -> MAIL_RECOVERY; by
 claude-fallback -> MAIL_RECOVERY_SEAT; the same (actor, target, class) >= 3 times in
 24h -> PAGE_OPERATOR (once per key per 24h). Mails per key are rate-limited by a
 cooldown. LEASE_STATE_UNKNOWN is logged, not mailed (expected until the broker is
@@ -66,11 +66,14 @@ installed, B11). Each mail line names its recipient persona (`to=`), resolved fr
 instance.yaml by the OTHER seat's account (mail_recipient()); the recovery seat's
 persona is recovery_watcher.recovery_seat_persona(), so a rename is data-only.
 
-INERTNESS CONTRACT (design §8, same as tools/recovery_watcher.py). Dry-run is the
-default and the ONLY mode in this step: `--live` exits 3. Live senders exist only
-behind make_live_senders(), which only live mode calls and whose implementations
-are NotImplementedError stubs. Dry-run side effects are exactly: the journalctl
-read, stdout lines and the --state-file.
+INERTNESS CONTRACT (design §8, same as tools/recovery_watcher.py). Dry-run remains
+the default. Live senders exist only behind make_live_senders(), which only live
+mode calls and only when an action is due. Dry-run side effects are exactly: the
+journalctl read, stdout lines and the --state-file. A failed live delivery is loud
+and never earns a delivery cooldown or finding-dedupe stamp. The cadence retries
+at most twice, then holds that route for 24h before allowing another bounded
+attempt window; the transition to the hold exits non-zero once instead of sending
+or paging every five minutes forever.
 
 UNTRUSTED INPUT. Nothing from COMMAND text, PWD or any export-log string is ever
 printed or stored. Output carries only enum members, ints, and account names that
@@ -106,13 +109,13 @@ from tools.codex_recovery import (  # noqa: E402
 )
 from tools.health_export import atomic_write_json  # noqa: E402
 from tools.recovery_watcher import (  # noqa: E402
+    PAGE_TAG,
     RECOVERY_SEAT_ACCOUNT,
     RECOVERY_PERSONA,
     recovery_seat_persona,
 )
 
 DEFAULT_STATE_FILE = Path.home() / ".local/state/pantheon/lease_audit.json"
-LIVE_REFUSAL = "live mode not enabled until T-4884 B13"
 DEFAULT_SINCE = "-15min"
 
 RECOVERY_ACCOUNT = "claude-fallback"
@@ -131,6 +134,8 @@ MAIL_COOLDOWN_S = 3600
 SUBMIT_PAIR_WINDOW_S = 30
 REPORTED_TTL_S = 48 * 3600
 MAX_STATE_ENTRIES = 5000
+DELIVERY_MAX_ATTEMPTS = 2
+DELIVERY_HOLD_S = 24 * 3600
 
 
 class RepairClass(enum.Enum):
@@ -706,7 +711,8 @@ def load_target_keys(manifest_path: Path) -> dict[str, str] | None:
 
 # ------------------------------------------------------------- state
 def _fresh_state() -> dict:
-    return {"reported": {}, "history": [], "mailed": {}, "paged": {}}
+    return {"reported": {}, "seen": {}, "history": [], "mailed": {}, "paged": {},
+            "delivery_failures": {}, "delivery_blocked": {}}
 
 
 def load_state(path: Path) -> dict:
@@ -717,11 +723,19 @@ def load_state(path: Path) -> dict:
         return state
     if not isinstance(doc, dict):
         return state
-    for key in ("reported", "mailed", "paged"):
+    for key in ("reported", "seen", "mailed", "paged", "delivery_blocked"):
         v = doc.get(key)
         if isinstance(v, dict):
             state[key] = {k: t for k, t in v.items()
                           if isinstance(k, str) and isinstance(t, int) and not isinstance(t, bool)}
+    failures = doc.get("delivery_failures")
+    if isinstance(failures, dict):
+        state["delivery_failures"] = {
+            k: [v[0], v[1]] for k, v in failures.items()
+            if isinstance(k, str) and isinstance(v, list) and len(v) == 2
+            and all(isinstance(n, int) and not isinstance(n, bool) for n in v)
+            and v[0] > 0
+        }
     hist = doc.get("history")
     if isinstance(hist, list):
         state["history"] = [h for h in hist if isinstance(h, list) and len(h) == 2
@@ -735,27 +749,63 @@ def _prune(state: dict, now: int) -> dict:
         return dict(kept[-MAX_STATE_ENTRIES:])
     return {
         "reported": newest(state["reported"], REPORTED_TTL_S),
+        "seen": newest(state["seen"], REPORTED_TTL_S),
         "mailed": newest(state["mailed"], MAIL_COOLDOWN_S),
         "paged": newest(state["paged"], PAGE_COOLDOWN_S),
+        "delivery_failures": dict(sorted(
+            ((k, v) for k, v in state["delivery_failures"].items()
+             if now - v[1] < DELIVERY_HOLD_S), key=lambda kv: kv[1][1])[-MAX_STATE_ENTRIES:]),
+        "delivery_blocked": newest(state["delivery_blocked"], DELIVERY_HOLD_S),
         "history": [h for h in state["history"] if now - h[1] < PAGE_WINDOW_S][-MAX_STATE_ENTRIES:],
     }
 
 
-# ------------------------------------------------------------- live (stubs)
+# ------------------------------------------------------------- live
 class LiveSenders:
-    """Live side effects. NOT IMPLEMENTED until T-4884 B13; never built in dry-run."""
+    """Mailbox + alert-bot side effects. Never built in dry-run."""
 
-    def __init__(self):
-        raise NotImplementedError("live senders (mail to recovery, mail to the recovery seat, the operator page) "
-                                  "are not implemented until T-4884 B13")
+    def __init__(self, page, mail):
+        self._page = page
+        self._mail = mail
 
-    def send(self, action: Action, line: str) -> None:  # pragma: no cover
-        raise NotImplementedError
+    def send(self, action: Action, payload):
+        if action is Action.PAGE_OPERATOR:
+            return self._page.send(payload)
+        if action in (Action.MAIL_RECOVERY, Action.MAIL_RECOVERY_SEAT):
+            return self._mail.send(payload)
+        raise ValueError(f"unsupported live action: {action.value}")
 
 
 def make_live_senders() -> LiveSenders:
     """The ONLY constructor of live side-effect objects. Called only in live mode."""
-    return LiveSenders()
+    from tools.recovery_watcher import MailSender, PageSender
+    return LiveSenders(PageSender(), MailSender())
+
+
+def action_payload(action: Action, *, actor: str, target: str, repair_class: RepairClass,
+                   ts_epoch: int, count_24h: int):
+    """Render an enum/allowlist-only payload. Journal COMMAND/PWD never enter it."""
+    common = {
+        "finding": FindingClass.REPAIR_WITHOUT_LEASE.value,
+        "actor_account": actor,
+        "target_account": target,
+        "repair_class": repair_class.value,
+        "ts_epoch": ts_epoch,
+        "count_24h": count_24h,
+    }
+    if action is Action.PAGE_OPERATOR:
+        lines = [PAGE_TAG, "LEASE_AUDIT escalation"]
+        lines.extend(f"{key}: {value}" for key, value in common.items())
+        return "\n".join(lines)
+    recipient = mail_recipient(action)
+    sender = agent_role_map.account_persona(os.environ.get("USER", "")) or "lease-audit"
+    return {
+        "recipient": f"{agent_role_map.mailbox_hub()}/{recipient}",
+        "sender": sender,
+        "subject": f"lease audit: {FindingClass.REPAIR_WITHOUT_LEASE.value}",
+        "severity": "urgent",
+        "body": common,
+    }
 
 
 # ------------------------------------------------------------- run
@@ -765,7 +815,7 @@ def _finding(fc: FindingClass, **fields) -> str:
 
 def run(*, since: str, state_file: Path, lease_events: Path, manifest: Path,
         source=None, fleet: Iterable[str] | None = None, now: int | None = None,
-        out=None) -> int:
+        out=None, live: bool = False, senders: LiveSenders | None = None) -> int:
     out = sys.stdout if out is None else out
     now = int(time.time()) if now is None else int(now)
     source = JournalctlSource() if source is None else source
@@ -781,7 +831,8 @@ def run(*, since: str, state_file: Path, lease_events: Path, manifest: Path,
         events = sudo_events(source.records(since), counts)
     except JournalUnreadable:
         print(_finding(FindingClass.JOURNAL_UNREADABLE), file=out)
-        log("summary mode=dry-run journal=unreadable (run under `sg systemd-journal`)")
+        log(f"summary mode={'live' if live else 'dry-run'} journal=unreadable "
+            "(run under `sg systemd-journal`)")
         return 2
 
     intervals = load_lease_intervals(lease_events)
@@ -791,7 +842,7 @@ def run(*, since: str, state_file: Path, lease_events: Path, manifest: Path,
                             "other", "repairs_unleasable", "repairs_unadjudicated",
                             "repairs_other_actors", "findings", "new_findings", "suppressed", "pages")}
     by_class = {c: 0 for c in RepairClass}
-    new_findings: list[tuple[str, str, RepairClass, int, str]] = []
+    pending_findings: list[tuple[str, str, RepairClass, int, str, bool]] = []
     last_text: dict[tuple[str, str], int] = {}
 
     for ev in events:
@@ -839,37 +890,106 @@ def run(*, since: str, state_file: Path, lease_events: Path, manifest: Path,
             tally["findings"] += 1
             fid = f"{ev.event_id}:{rc.value}"
             if fid not in state["reported"]:  # overlapping windows: report each repair once
-                print(_finding(FindingClass.REPAIR_WITHOUT_LEASE, actor_account=ev.actor,
-                               target_account=ev.user, repair_class=rc.value,
-                               ts_epoch=ev.ts_epoch), file=out)
-                new_findings.append((ev.actor, ev.user, rc, ev.ts_epoch, fid))
+                first_seen = fid not in state["seen"]
+                if first_seen:
+                    print(_finding(FindingClass.REPAIR_WITHOUT_LEASE, actor_account=ev.actor,
+                                   target_account=ev.user, repair_class=rc.value,
+                                   ts_epoch=ev.ts_epoch), file=out)
+                    state["seen"][fid] = now
+                    pkey = f"{ev.actor}|{ev.user}|{rc.value}"
+                    state["history"].append([pkey, ev.ts_epoch])
+                pending_findings.append((ev.actor, ev.user, rc, ev.ts_epoch, fid, first_seen))
 
     if intervals is None:
         print(_finding(FindingClass.LEASE_STATE_UNKNOWN), file=out)
 
-    for actor, target, rc, ts, fid in new_findings:
-        tally["new_findings"] += 1
-        state["reported"][fid] = now
+    live_senders = senders
+    attempted_delivery_keys: set[str] = set()
+    rc_send = 0
+
+    def dispatch(action: Action, payload, delivery_key: str) -> bool:
+        """One bounded delivery attempt per route key per cadence fire."""
+        nonlocal live_senders, rc_send
+        blocked_at = state["delivery_blocked"].get(delivery_key)
+        if blocked_at is not None and now - blocked_at < DELIVERY_HOLD_S:
+            log(f"suppressed_delivery_blocked action={action.value} hold_s={DELIVERY_HOLD_S}")
+            return False
+        if blocked_at is not None:
+            state["delivery_blocked"].pop(delivery_key, None)
+            state["delivery_failures"].pop(delivery_key, None)
+        if delivery_key in attempted_delivery_keys:
+            return False
+        attempted_delivery_keys.add(delivery_key)
+        if live_senders is None:
+            live_senders = make_live_senders()
+        try:
+            result = live_senders.send(action, payload)
+            if result is False:
+                raise RuntimeError("unconfirmed")
+        except Exception as exc:  # noqa: BLE001 - sender failure is enum-only and fail-loud
+            prior = state["delivery_failures"].get(delivery_key, [0, 0])[0]
+            attempts = prior + 1
+            state["delivery_failures"][delivery_key] = [attempts, now]
+            rc_send = 4
+            if attempts >= DELIVERY_MAX_ATTEMPTS:
+                state["delivery_blocked"][delivery_key] = now
+                log(f"delivery_blocked action={action.value} attempts={attempts} "
+                    f"hold_s={DELIVERY_HOLD_S} error={exc.__class__.__name__}")
+            else:
+                log(f"send_failed action={action.value} attempt={attempts}/"
+                    f"{DELIVERY_MAX_ATTEMPTS} error={exc.__class__.__name__}")
+            return False
+        state["delivery_failures"].pop(delivery_key, None)
+        state["delivery_blocked"].pop(delivery_key, None)
+        return True
+
+    for actor, target, rc, ts, fid, first_seen in pending_findings:
+        tally["new_findings"] += int(first_seen)
         pkey = f"{actor}|{target}|{rc.value}"
-        state["history"].append([pkey, ts])
         tag = f"actor={actor} target={target} class={rc.value}"
+        recent = sum(1 for k, t in state["history"] if k == pkey and now - t < PAGE_WINDOW_S)
+        mail_action = ACTOR_ROUTE[actor]
+        all_done = True
         if now - state["mailed"].get(pkey, -MAIL_COOLDOWN_S) >= MAIL_COOLDOWN_S:
-            state["mailed"][pkey] = now
-            log(f"would_act action={ACTOR_ROUTE[actor].value} to={mail_recipient(ACTOR_ROUTE[actor])} "
-                f"finding=REPAIR_WITHOUT_LEASE {tag}")
+            if live:
+                log(f"act action={mail_action.value} to={mail_recipient(mail_action)} "
+                    f"finding=REPAIR_WITHOUT_LEASE {tag}")
+                payload = action_payload(mail_action, actor=actor, target=target,
+                                         repair_class=rc, ts_epoch=ts, count_24h=recent)
+                if dispatch(mail_action, payload, f"{mail_action.value}|{pkey}"):
+                    state["mailed"][pkey] = now
+                else:
+                    all_done = False
+            else:
+                state["mailed"][pkey] = now
+                log(f"would_act action={mail_action.value} to={mail_recipient(mail_action)} "
+                    f"finding=REPAIR_WITHOUT_LEASE {tag}")
         else:
             tally["suppressed"] += 1
-            log(f"suppressed_cooldown action={ACTOR_ROUTE[actor].value} "
-                f"to={mail_recipient(ACTOR_ROUTE[actor])} {tag}")
-        recent = sum(1 for k, t in state["history"] if k == pkey and now - t < PAGE_WINDOW_S)
-        if recent >= PAGE_THRESHOLD and now - state["paged"].get(pkey, -PAGE_COOLDOWN_S) >= PAGE_COOLDOWN_S:
-            state["paged"][pkey] = now
+            log(f"suppressed_cooldown action={mail_action.value} "
+                f"to={mail_recipient(mail_action)} {tag}")
+        page_due = (recent >= PAGE_THRESHOLD
+                    and now - state["paged"].get(pkey, -PAGE_COOLDOWN_S) >= PAGE_COOLDOWN_S)
+        if page_due:
             tally["pages"] += 1
-            log(f"would_act action={Action.PAGE_OPERATOR.value} finding=REPAIR_WITHOUT_LEASE "
-                f"{tag} count_24h={recent}")
+            if live:
+                log(f"act action={Action.PAGE_OPERATOR.value} finding=REPAIR_WITHOUT_LEASE "
+                    f"{tag} count_24h={recent}")
+                payload = action_payload(Action.PAGE_OPERATOR, actor=actor, target=target,
+                                         repair_class=rc, ts_epoch=ts, count_24h=recent)
+                if dispatch(Action.PAGE_OPERATOR, payload, f"{Action.PAGE_OPERATOR.value}|{pkey}"):
+                    state["paged"][pkey] = now
+                else:
+                    all_done = False
+            else:
+                state["paged"][pkey] = now
+                log(f"would_act action={Action.PAGE_OPERATOR.value} finding=REPAIR_WITHOUT_LEASE "
+                    f"{tag} count_24h={recent}")
+        if all_done:
+            state["reported"][fid] = now
 
     classes = ",".join(f"{c.value}:{by_class[c]}" for c in RepairClass)
-    log(f"summary mode=dry-run since={since} sudo_events={len(events)} "
+    log(f"summary mode={'live' if live else 'dry-run'} since={since} sudo_events={len(events)} "
         f"unparseable={counts['unparseable']} denied={counts['denied']} lease_state={'unknown' if intervals is None else 'known'} "
         f"targets={'manifest' if target_keys is not None else 'account-names'} "
         + " ".join(f"{k}={v}" for k, v in tally.items()) + f" repairs_by_class={classes}")
@@ -877,11 +997,11 @@ def run(*, since: str, state_file: Path, lease_events: Path, manifest: Path,
     try:
         state_file.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(state_file.parent, state_file.name,
-                          {"schema_version": 1, "updated_at": now, **_prune(state, now)})
+                          {"schema_version": 2, "updated_at": now, **_prune(state, now)})
     except OSError as exc:
         log(f"error state_file_write_failed {exc.__class__.__name__}")
         return 2
-    return 0
+    return rc_send
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -893,7 +1013,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST_PATH)
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="print would-act lines only (default)")
-    mode.add_argument("--live", action="store_true", help=f"refused: {LIVE_REFUSAL}")
+    mode.add_argument("--live", action="store_true",
+                      help="send enum-only mailbox/page actions for new findings")
     argv = list(sys.argv[1:] if argv is None else argv)
     # `--since -2h`: argparse reads a dash-led value as an option; glue it on.
     for i in range(len(argv) - 1):
@@ -901,14 +1022,11 @@ def main(argv: list[str] | None = None) -> int:
             argv[i:i + 2] = [f"--since={argv[i + 1]}"]
             break
     args = ap.parse_args(argv)
-    if args.live:
-        print(f"lease_audit: {LIVE_REFUSAL}", file=sys.stderr)
-        return 3
     if not _since_ok(args.since):
         print("lease_audit: --since must be -<N>{s,min,m,h,d} or @<epoch>", file=sys.stderr)
         return 64
     return run(since=args.since, state_file=args.state_file, lease_events=args.lease_events,
-               manifest=args.manifest)
+               manifest=args.manifest, live=args.live)
 
 
 if __name__ == "__main__":

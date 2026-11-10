@@ -12,8 +12,11 @@ Discipline mirrors `ticket_grooming.py`:
   - Scoped commit via `_git_utils.commit_scoped` (HERMES byte-guard + a scope
     guard that REFUSES any staged path outside the artifact roots). No force,
     no `--no-verify`.
-  - Plain-text Telegram digest ONLY when something was actually removed (a
-    weekly no-op stays silent — no recurring all-clear noise).
+  - A plain-text digest to the OWNER's mailbox (tools/owner_digest.py, default
+    recovery) ONLY when something was actually removed under --apply (a weekly
+    no-op stays silent; a report-only run delivers nothing). Never Telegram:
+    nothing here needs the operator (T-6370, the T-6369 pattern). A failed delivery
+    exits 1 so OnFailure pages the owner.
   - Report-only by default; `--apply` is required to remove + commit.
 
 Conservative by construction — a dir is removed ONLY when its ticket is found
@@ -39,7 +42,7 @@ screenshots domain.
 Usage:
     python3 tools/artifact_gc.py                 # live: sweep + commit + digest
     python3 tools/artifact_gc.py --dry-run       # report only
-    python3 tools/artifact_gc.py --no-digest     # sweep + commit, skip Telegram
+    python3 tools/artifact_gc.py --no-digest     # sweep + commit, skip the owner digest
     python3 tools/artifact_gc.py --grace 14d     # override screenshots grace
     python3 tools/artifact_gc.py --tmp-grace 24h # override tmp-target grace
     python3 tools/artifact_gc.py --only tmp-targets  # sweep one domain only
@@ -52,8 +55,6 @@ import os
 import re
 import shutil
 import sys
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -67,7 +68,7 @@ if str(_REPO_ROOT_DEFAULT) not in sys.path:
 from tools._git_utils import _git, commit_scoped, pull_or_rebase_strict  # noqa: E402
 from tools._lease import UNKNOWN  # noqa: E402  — tri-state sentinel (T-2307/T-2309)
 from tools.ticket import STATES  # noqa: E402
-from tools.watch_digest import read_telegram_token  # noqa: E402
+from tools.owner_digest import send_owner_digest  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Config.
@@ -107,18 +108,6 @@ PROC_ROOT_DEFAULT = Path("/proc")
 _LOG_BULLET_RE = re.compile(r"^-\s+(?P<ts>\S+)\s+\[(?P<actor>[^\]]+)\]\s+")
 
 GC_ACTOR = "artifact-gc"
-
-
-def _default_telegram_env() -> Path:
-    chan = Path.home() / ".claude" / "channels" / "telegram"
-    pantheon = chan / "pantheon.env"
-    return pantheon if pantheon.exists() else chan / ".env"
-
-
-TELEGRAM_ENV = Path(
-    os.environ.get("PANTHEON_TELEGRAM_ENV", str(_default_telegram_env()))
-)
-TELEGRAM_CHAT_ID = os.environ.get("PANTHEON_TELEGRAM_CHAT_ID", "424242424")  # the operator
 
 
 # ---------------------------------------------------------------------------
@@ -302,9 +291,17 @@ def find_tmp_target_dirs(tmp_root: Path) -> tuple[list[TmpCandidate], list[Path]
 
 
 def find_live_build_pids(workspace: Path, proc_root: Path = PROC_ROOT_DEFAULT) -> list[int]:
-    """Pids of cargo/rustc processes whose cwd is `workspace` or a descendant
-    of it, scanned via `proc_root` (default `/proc`; tests inject a fixture
-    dir with real symlinks — no filesystem mocking needed for correctness).
+    """Pids that may be building into ``workspace/target``.
+
+    A positive match is any process whose argv names the workspace/target, or
+    any cargo/rustc process owned by the target's owner.  The owner-wide check
+    is deliberately conservative: Cargo may run from a parent workspace and
+    pass an absolute ``--target-dir``, while rustc children commonly have a cwd
+    outside the target they are writing.  T-6205 proved that cwd/fd checks and
+    an advisory lock can both be negative during a live build.
+
+    Scanned via `proc_root` (default `/proc`; tests inject a fixture dir with
+    real symlinks — no filesystem mocking needed for correctness).
 
     Any per-entry read failure (process exited mid-scan, permission denied,
     malformed /proc entry) is skipped rather than raised — a transient miss
@@ -335,6 +332,11 @@ def find_live_build_pids(workspace: Path, proc_root: Path = PROC_ROOT_DEFAULT) -
     if not proc_root.is_dir():
         return UNKNOWN
     workspace = workspace.resolve()
+    target = workspace / "target"
+    try:
+        target_uid = target.stat().st_uid
+    except OSError:
+        return UNKNOWN
     for entry in proc_root.iterdir():
         if not entry.name.isdigit():
             continue
@@ -342,13 +344,27 @@ def find_live_build_pids(workspace: Path, proc_root: Path = PROC_ROOT_DEFAULT) -
             comm = (entry / "comm").read_text(encoding="utf-8").strip()
         except OSError:
             continue
-        if comm not in _BUILD_PROC_NAMES:
+        try:
+            raw_cmdline = (entry / "cmdline").read_bytes()
+        except OSError:
+            raw_cmdline = b""
+        argv = [os.fsdecode(part) for part in raw_cmdline.split(b"\0") if part]
+        if any(str(workspace) in arg for arg in argv):
+            pids.append(int(entry.name))
             continue
+        if comm in _BUILD_PROC_NAMES:
+            try:
+                proc_uid = entry.stat().st_uid
+            except OSError:
+                return UNKNOWN
+            if proc_uid == target_uid:
+                pids.append(int(entry.name))
+                continue
         try:
             cwd = (entry / "cwd").resolve()
         except OSError:
             continue
-        if cwd == workspace or workspace in cwd.parents:
+        if comm in _BUILD_PROC_NAMES and (cwd == workspace or workspace in cwd.parents):
             pids.append(int(entry.name))
     return pids
 
@@ -432,6 +448,18 @@ def sweep_tmp_targets(
 
     removed: list[TmpDecision] = []
     for d in to_remove:
+        # T-6206: classification and deletion are separated by the size walk.
+        # Recheck at the destructive boundary so a build that starts after the
+        # first scan cannot inherit the earlier "remove" decision.
+        live_pids = find_live_build_pids(d.workspace, proc_root)
+        if live_pids is UNKNOWN:
+            d.action = "keep"
+            d.reason = "build-liveness UNKNOWN at delete boundary — refusing removal"
+            continue
+        if live_pids:
+            d.action = "keep"
+            d.reason = f"live build process detected at delete boundary (pid {live_pids})"
+            continue
         try:
             shutil.rmtree(d.target)
         except OSError as exc:
@@ -442,32 +470,8 @@ def sweep_tmp_targets(
 
 
 # ---------------------------------------------------------------------------
-# Telegram digest (plain-text proof-of-life). Mirrors ticket_grooming.
+# Digest (plain text, to the owner's mailbox; T-6370).
 # ---------------------------------------------------------------------------
-
-_TELEGRAM_MAX_TEXT = 4000
-
-
-def _send_telegram_plain(token: str, chat_id: str, text: str) -> bool:
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return resp.status == 200
-    except Exception as exc:  # noqa: BLE001
-        print(f"telegram send failed: {exc}", file=sys.stderr)
-        return False
-
-
-def _send_digest(text: str) -> bool:
-    """Resolve token + send. No token = warning + treat as success (parity with
-    grooming: a missing token must not fail the whole run)."""
-    token = read_telegram_token(TELEGRAM_ENV)
-    if not token:
-        print(f"warning: no Telegram token at {TELEGRAM_ENV}; skipping send", file=sys.stderr)
-        return True
-    return _send_telegram_plain(token, TELEGRAM_CHAT_ID, text[:_TELEGRAM_MAX_TEXT])
 
 
 def build_digest(
@@ -600,7 +604,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Default is SAFE (report-only) — a destructive janitor must not delete on a
     # bare/accidental invocation. The timer passes --apply explicitly.
     p.add_argument("--apply", action="store_true", help="actually remove (+ commit for screenshots) (default: report-only)")
-    p.add_argument("--no-digest", action="store_true", help="skip the Telegram digest")
+    p.add_argument("--no-digest", action="store_true", help="skip the owner-mailbox digest")
     p.add_argument("--grace", default="30d", help="screenshots grace period, e.g. 30d or 12h (default 30d)")
     p.add_argument("--tmp-grace", default="48h", help="tmp-target grace period, e.g. 48h or 3d (default 48h)")
     p.add_argument("--repo-root", default=str(_REPO_ROOT_DEFAULT), help="repo clone to operate on (ticket lookups for both domains)")
@@ -658,18 +662,23 @@ def main(argv: list[str] | None = None) -> int:
         for u in tmp_result.unmanaged:
             print(f"[unmanaged] {u} (non-ticket-shaped echo-* workspace; not swept)")
 
-    # Digest only when there's something to report (removals, or would-be
-    # removals in a dry-run) in EITHER domain. A weekly janitor that finds
-    # nothing is a silent no-op — suppress the all-clear to avoid recurring
-    # noise (unlike grooming, which surfaces actionable stale tickets every
-    # fire).
+    # Digest only when something was removed in EITHER domain, and only under
+    # --apply: a weekly janitor that finds nothing is a silent no-op, and a
+    # report-only run delivers nothing durable (its decisions are on stdout).
+    # The digest goes to the owner's mailbox, never the operator's chat (T-6370).
     shot_removed = result.removed if result is not None else []
     tmp_removed = tmp_result.removed if tmp_result is not None else []
-    if not args.no_digest and (shot_removed or tmp_removed):
+    if not args.no_digest and not dry_run and (shot_removed or tmp_removed):
         shot_decisions = result.decisions if result is not None else []
         tmp_decisions = tmp_result.decisions if tmp_result is not None else []
         digest = build_digest(shot_decisions, shot_removed, tmp_decisions, tmp_removed, dry_run)
-        _send_digest(digest)
+        try:
+            send_owner_digest(digest, sender=GC_ACTOR, subject="artifact-gc digest")
+        except Exception as exc:  # noqa: BLE001 — any delivery failure is loud
+            print(f"error: owner digest not delivered ({type(exc).__name__}: {exc})",
+                  file=sys.stderr)
+            print(digest)
+            exit_code = exit_code or 1
 
     return exit_code
 

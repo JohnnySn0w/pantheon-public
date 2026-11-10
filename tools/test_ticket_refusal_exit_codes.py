@@ -116,6 +116,8 @@ class TestExitCodeContract(unittest.TestCase):
     def test_appetite_gates_are_refusals(self) -> None:
         self.assertTrue(issubclass(ticket.AppetiteRequired, ticket.TicketRefusal))
         self.assertTrue(issubclass(ticket.AppetiteOverrunNotResolvable, ticket.TicketRefusal))
+        # T-4680: the first-use SOP capture gate is a refusal too.
+        self.assertTrue(issubclass(ticket.SopStubNotFilled, ticket.TicketRefusal))
 
     def test_help_documents_the_exit_codes(self) -> None:
         out = io.StringIO()

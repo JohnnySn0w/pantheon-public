@@ -1433,6 +1433,58 @@ class BindMatrixTests(ApprovalCaseBase):
         self.assertEqual(self.grant_events(approval_handle), events_before)
         self.assertEqual(self.grant_row(approval_handle), row_before)
 
+    def test_identical_tuple_replay_after_grant_expiry_is_denied_without_write(self) -> None:
+        # T-5233: the bound_replay honours expires_at (gate 16 refuses on
+        # expiry). Denied "expired", zero writes, the grant stays BOUND.
+        plan_handle, approval_handle = self.issue_grant()
+        operation_handle = self.next_handle()
+        first = self.bind(plan_handle, approval_handle, operation_handle)
+        self.assertEqual(first.state, "bound")
+        events_before = self.grant_events(approval_handle)
+        row_before = self.grant_row(approval_handle)
+        late = self.build_service(clock=lambda: LATE_NOW)
+        replay = self.bind(
+            plan_handle, approval_handle, operation_handle, service=late
+        )
+        self.assertEqual(replay, BindOutcome("denied", None, "expired"))
+        self.assertEqual(self.grant_events(approval_handle), events_before)
+        self.assertEqual(self.grant_row(approval_handle), row_before)
+        self.assertEqual(row_before["state"], "bound")
+        # a different operation after expiry is still already_bound-class
+        # refused (never a fresh bind)
+        other = self.bind(
+            plan_handle, approval_handle, self.next_handle(), service=late
+        )
+        self.assertEqual(other.state, "denied")
+
+    def test_identical_tuple_replay_just_before_expiry_returns_original(self) -> None:
+        plan_handle, approval_handle = self.issue_grant()
+        operation_handle = self.next_handle()
+        first = self.bind(plan_handle, approval_handle, operation_handle)
+        expires = datetime.fromisoformat(
+            self.grant_row(approval_handle)["expires_at"]
+        )
+        edge = self.build_service(
+            clock=lambda: expires - timedelta(seconds=1)
+        )
+        replay = self.bind(
+            plan_handle, approval_handle, operation_handle, service=edge
+        )
+        self.assertEqual(
+            (replay.state, replay.reason_code, replay.authority_record_id),
+            ("bound", "bound_replay", first.authority_record_id),
+        )
+        at_expiry = self.build_service(clock=lambda: expires)
+        self.assertEqual(
+            self.bind(
+                plan_handle,
+                approval_handle,
+                operation_handle,
+                service=at_expiry,
+            ).reason_code,
+            "expired",
+        )
+
     def test_a_different_operation_can_never_acquire_a_bound_grant(self) -> None:
         # Gate 27's third clause.
         plan_handle, approval_handle = self.issue_grant()
@@ -2422,6 +2474,11 @@ class Gate28SurfaceTests(ApprovalCaseBase):
         self.assertLessEqual(len(status.summary), 256)
         self.assertFalse(hasattr(status, "authority_record_id"))
         self.assertFalse(hasattr(status, "nonce"))
+        # T-4875: the status names the grant's plan binding so the broker can
+        # refuse a read whose grant is not bound to the caller's own plan
+        self.assertEqual(status.plan_handle, plan_handle)
+        grant = self.service._journal.get_grant(approval_handle)
+        self.assertEqual(status.plan_owner, grant.plan_owner)
         # and the DecisionResult that minted it exposed only the opaque
         # handle (gate 21: grant payloads never enter model context)
         self.assertEqual(

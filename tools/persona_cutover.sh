@@ -259,6 +259,14 @@ echo "confirmed: default tmux socket has no ${PCX_TMUX_SESSION} session"
 # Deliberately unquoted word-split: PCX_COMPANION_UNITS is manifest-
 # controlled `unit=session` tokens (agent_role_map._encode_companion_units),
 # never glob- or space-bearing within a token.
+# T-5956: record each companion's pre-cutover ActiveState first, so a
+# rollback restores only those that were active.
+COMPANION_SNAPSHOT="$(companion_snapshot_path "$PCX_HOME" "$PERSONA" "$STAMP")"
+if [[ -n "$PCX_COMPANION_UNITS" ]]; then
+  # shellcheck disable=SC2086 # manifest-controlled tokens, word-split as below
+  companion_snapshot_write "$COMPANION_SNAPSHOT" $PCX_COMPANION_UNITS
+  echo "recorded companion pre-state: $COMPANION_SNAPSHOT ($(tr '\n' ' ' < "$COMPANION_SNAPSHOT"))"
+fi
 for tok in $PCX_COMPANION_UNITS; do
   companion_unit="${tok%%=*}"
   companion_session="${tok#*=}"

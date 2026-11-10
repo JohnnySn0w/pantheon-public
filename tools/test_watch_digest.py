@@ -688,5 +688,91 @@ class TestDayIndexDriftRow(unittest.TestCase):
         self.assertNotIn("Day-index", watch_digest.build_digest("2026-07-29", [], [], None))
 
 
+class TestSpotCheckMainWiring(unittest.TestCase):
+    """main() must hand the runner's tally verdict to build_digest."""
+
+    _BAD = {"samples": 20, "supported": 10, "refinement": 10, "over_broad": 0,
+            "unsupported": 0, "weeks": 5}
+
+    def _run_main(self, tally) -> tuple[str, list]:
+        import contextlib
+        from tools import watch_runner
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            day = root / "2026-11-03"
+            day.mkdir()
+            (day / "alpha.md").write_text(
+                "---\nsurface: routine\nheadline: Alpha line.\n---\n\n# A\n", encoding="utf-8")
+            (day / "README.md").write_text("# idx\n", encoding="utf-8")
+            buf = io.StringIO()
+            with patch.object(watch_digest, "REPORTS_ROOT", root), \
+                 patch.object(watch_digest, "pull_repo_or_warn"), \
+                 patch.object(watch_digest, "collect_operator_leans", return_value=[]), \
+                 patch.object(watch_digest, "collect_day_index_drift", return_value=None), \
+                 patch.object(watch_runner, "spot_check_tally", return_value=tally), \
+                 patch.object(sys, "argv", ["watch_digest", "--no-send", "--date", "2026-11-03"]), \
+                 contextlib.redirect_stdout(buf):
+                rc = watch_digest.main()
+            rows = watch_digest.collect_today(root / "2026-11-03")
+        self.assertEqual(rc, 0)
+        return buf.getvalue(), rows
+
+    def test_alert_case_prints_the_line(self):
+        out, _rows = self._run_main(self._BAD)
+        self.assertIn(watch_digest.spot_check_alert(self._BAD), out)
+
+    def test_no_data_case_is_byte_identical_to_plain_digest(self):
+        out, rows = self._run_main(None)
+        self.assertEqual(out, watch_digest.build_digest("2026-11-03", rows, [], None) + "\n")
+
+
+class TestSpotCheckAlert(unittest.TestCase):
+    """T-4877: phase-2-gate nudge only when non-SUPPORTED >30% over 4+ weeks and 15+ samples."""
+
+    @staticmethod
+    def _t(samples: int, nonsup: int, weeks: int) -> dict:
+        return {"samples": samples, "supported": samples - nonsup, "refinement": nonsup,
+                "over_broad": 0, "unsupported": 0, "weeks": weeks}
+
+    def test_none_is_none(self):
+        self.assertIsNone(watch_digest.spot_check_alert(None))
+
+    def test_fires_just_over_30_percent(self):
+        # 16 samples, 5 non-supported = 31.25%
+        out = watch_digest.spot_check_alert(self._t(16, 5, 4))
+        self.assertIsNotNone(out)
+        self.assertIn("phase-2", out)
+        self.assertIn("?", out)
+
+    def test_exactly_30_percent_is_silent(self):
+        self.assertIsNone(watch_digest.spot_check_alert(self._t(20, 6, 4)))
+
+    def test_just_under_30_percent_is_silent(self):
+        self.assertIsNone(watch_digest.spot_check_alert(self._t(20, 5, 8)))
+
+    def test_three_weeks_silent_four_fires(self):
+        self.assertIsNone(watch_digest.spot_check_alert(self._t(20, 10, 3)))
+        self.assertIsNotNone(watch_digest.spot_check_alert(self._t(20, 10, 4)))
+
+    def test_fourteen_samples_silent_fifteen_fires(self):
+        self.assertIsNone(watch_digest.spot_check_alert(self._t(14, 14, 8)))
+        self.assertIsNotNone(watch_digest.spot_check_alert(self._t(15, 15, 8)))
+
+    def test_digest_byte_identical_without_alert(self):
+        rows = [("alpha", True, "TL;DR: x", None), ("beta", False, "y", None)]
+        base = watch_digest.build_digest("2026-11-03", rows, [], None)
+        self.assertEqual(watch_digest.build_digest("2026-11-03", rows, [], None, spot_alert=None), base)
+        self.assertEqual(watch_digest.build_digest("2026-11-03", [], [], None,
+                                                   spot_alert=None),
+                         watch_digest.build_digest("2026-11-03", [], [], None))
+
+    def test_digest_carries_alert_line(self):
+        rows = [("alpha", False, "y", None)]
+        out = watch_digest.build_digest("2026-11-03", rows, [], None, spot_alert="ALERT-LINE")
+        self.assertIn("ALERT-LINE", out)
+        out2 = watch_digest.build_digest("2026-11-03", [], [], None, spot_alert="ALERT-LINE")
+        self.assertIn("ALERT-LINE", out2)
+
+
 if __name__ == "__main__":
     unittest.main()

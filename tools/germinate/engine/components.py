@@ -3,13 +3,16 @@
 For each registry row with a pinned internal contract
 ``tools/germinate/components/<id>.yaml``, the engine looks for the sibling
 executor-side module ``<id>_handlers.py`` (path-contained like the contract)
-and reads two optional names from it:
+and reads these optional names from it:
 
 * ``HANDLERS`` -- a sequence of ``backend.EffectHandler`` objects, one per
   group of op kinds the component brings;
 * ``VERIFY`` -- optional ``callable(list_doc, observed, scope) -> {"results": [...], "state": str | None}``
   that evaluates the component's invariant list over the backend's observation
   (T-5135 S1); each result is ``{"id", "status": pass|fail|vacuous|alarm, "detail"}``;
+* ``PREFLIGHT`` -- optional ``callable(ctx) -> [check, ...]`` (T-5921): the component's
+  read-only preflight checks, folded into the ``plan --preflight`` receipt; the
+  schema is in engine/preflight.py ("COMPONENT PREFLIGHT HOOK");
 * ``OP_KINDS`` -- ``{kind: (capability_class, privilege)}`` for kinds that are
   neither broker-envelope nor ORG-082 substrate kinds. It must be a literal
   (read with ``ast.literal_eval``, never by importing), so the validator can
@@ -26,16 +29,16 @@ edit per component.
 The handlers module is executor code (it actuates), reviewed like the backend;
 it is not a planner and runs outside the planner guard.
 
-Import trust (T-5477): before any handlers module runs, ``discover`` checks the
+Import trust (T-5477, T-5506): before any handlers module runs, ``discover`` checks the
 chain registry row ``contract.digest`` -> contract module -> its
 ``handlers_digest`` (``engine/handlers_digest.py``, over the entry file and its
 component-local helpers) and refuses (``ComponentLoadError``) on drift, on a
-missing pin, or on a pin with no handlers file. The entry module then runs from
-the exact bytes that were digested. Helpers are verified at discover time ONLY:
-they are imported later by the normal import system (from disk, or a matching
-``.pyc``), so a post-discover edit, ``.pyc`` shadowing, or a ``--repo-root``
-checkout other than the one on ``sys.path`` is a residual for helpers, tracked
-by T-5506. The validator path (``import_handlers=False``) runs no component
+missing pin, or on a pin with no handlers file. The entry AND every pinned helper
+then run from the exact bytes that were digested: component-local imports (eager or
+lazy, in the entry or in a helper) resolve to modules built from those bytes, never
+from disk or a ``.pyc``, and from the ``--repo-root`` checkout rather than ``sys.path``.
+An import of an unpinned name under ``components`` is refused. Shared ``tools.*``
+modules are the accepted shared-module residual. The validator path (``import_handlers=False``) runs no component
 code; the registry validator checks the same pin through
 ``contract.handlers_pin_errors``.
 """
@@ -43,9 +46,10 @@ code; the registry validator checks the same pin through
 from __future__ import annotations
 
 import ast
+import builtins
 import hashlib
-import importlib.util
 import sys
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -62,9 +66,11 @@ from tools.germinate.registry import schema as RS
 from tools.germinate.registry.contract_digest import ContractDigestError, compute_contract_digest
 from tools.germinate.registry.load import RegistryLoadError, load_file
 
+PKG = "tools.germinate.components"
 HANDLERS_ATTR = "HANDLERS"
 KINDS_ATTR = "OP_KINDS"
 VERIFY_ATTR = "VERIFY"
+PREFLIGHT_ATTR = "PREFLIGHT"
 
 
 class ComponentLoadError(RuntimeError):
@@ -78,35 +84,96 @@ class ComponentRegistration:
     handlers: tuple[Any, ...]
     op_kinds: Mapping[str, tuple[str, str]]
     verify: Any = None
+    preflight: Any = None
 
 
-def _import(path: Path, component: str, source: bytes) -> Any:
-    """Run the handlers module from ``source``: the exact bytes the pin verified (T-5477).
+class _PinnedImports:
+    """The import scope of one component's pinned code (T-5506).
 
-    The ENTRY module is never re-read from disk, so a swap between the digest
-    check and the import cannot substitute other bytes for it. This does not
-    extend to helpers: the entry's own ``import`` statements load them through
-    the normal import system after verification (disk or a matching ``.pyc``,
-    from the ``sys.path`` checkout), a residual tracked by T-5506.
+    Entry and helpers run from the in-memory bytes the handlers pin verified. Each is
+    exec'd with a ``__import__`` that resolves ``tools.germinate.components.<x>`` to the
+    pinned module (built lazily, on first import, from the verified source; never from
+    disk or a ``.pyc``), including lazy imports inside functions after discover. A name
+    under ``components`` that is not pinned is refused. Anything else imports normally
+    (shared ``tools.*`` is the accepted residual). Nothing global is rebound: the
+    canonical ``tools.germinate.components.<x>`` entries in ``sys.modules`` are untouched.
     """
 
-    tag = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:16]
-    spec = importlib.util.spec_from_file_location(f"_germinate_handlers_{tag}", path)
-    if spec is None or spec.loader is None:
-        raise ComponentLoadError(f"{component}: cannot load {path.name}")
-    module = importlib.util.module_from_spec(spec)
-    saved = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
-    try:
-        exec(compile(source, str(path), "exec", dont_inherit=True), module.__dict__)  # noqa: S102 -- pinned executor code
-    except Exception as exc:  # noqa: BLE001 -- a broken registration module is a typed load refusal
-        raise ComponentLoadError(f"{component}: {path.name} failed to import: {type(exc).__name__}: {exc}") from None
-    finally:
-        sys.dont_write_bytecode = saved
+    def __init__(self, component: str, directory: Path, sources: Mapping[str, bytes], tag: str):
+        self.component = component
+        self.directory = directory
+        self.sources = dict(sources)
+        self.tag = tag
+        self.modules: dict[str, Any] = {}
+        self.builtins = dict(builtins.__dict__)
+        self.builtins["__import__"] = self.import_
+
+    def _modname(self, name: str) -> str:
+        return f"_germinate_pinned_{self.tag}.{name}"
+
+    def exec_module(self, name: str, rel: str, module: Any) -> None:
+        path = self.directory / rel
+        module.__dict__["__builtins__"] = self.builtins
+        module.__dict__["__file__"] = str(path)
+        sys.modules[module.__name__] = module
+        saved = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        try:
+            exec(compile(self.sources[rel], str(path), "exec", dont_inherit=True), module.__dict__)  # noqa: S102 -- pinned executor code
+        except Exception as exc:  # noqa: BLE001 -- a broken registration module is a typed load refusal
+            sys.modules.pop(module.__name__, None)
+            raise ComponentLoadError(f"{self.component}: {rel} failed to import: {type(exc).__name__}: {exc}") from None
+        finally:
+            sys.dont_write_bytecode = saved
+
+    def helper(self, name: str) -> Any:
+        if name in self.modules:
+            return self.modules[name]
+        rel = f"{name}.py"
+        if not name.isidentifier() or rel not in self.sources:
+            raise ImportError(f"{self.component}: {PKG}.{name} is not a pinned helper (handlers_digest, T-5506)")
+        module = types.ModuleType(self._modname(name))
+        self.modules[name] = module  # registered before exec, so an import cycle terminates
+        try:
+            self.exec_module(name, rel, module)
+        except BaseException:
+            self.modules.pop(name, None)
+            raise
+        return module
+
+    def import_(self, name, globals=None, locals=None, fromlist=(), level=0):  # noqa: A002 -- the __import__ signature
+        if level == 0 and (name == PKG or name.startswith(PKG + ".")):
+            if name == PKG:
+                if not fromlist:
+                    raise ImportError(f"{self.component}: bare {PKG} import refused")
+                holder = types.ModuleType(PKG)
+                for item in fromlist:
+                    if item == "*":
+                        raise ImportError(f"{self.component}: star import from {PKG} refused")
+                    setattr(holder, item, self.helper(item))
+                return holder
+            if not fromlist:
+                raise ImportError(f"{self.component}: `import {name}` refused; use `from {PKG} import <name>`")
+            return self.helper(name[len(PKG) + 1 :].split(".")[0])
+        return builtins.__import__(name, globals, locals, fromlist, level)
+
+
+def _import(path: Path, component: str, pinned: Any) -> Any:
+    """Run the handlers module from the exact bytes the pin verified (T-5477, T-5506).
+
+    Entry and helpers both run from ``pinned.sources`` (see ``_PinnedImports``); the
+    import system never re-reads them, so a swap after the digest check, a planted
+    ``.pyc``, or a checkout other than ``--repo-root`` cannot substitute other code.
+    """
+
+    tag = hashlib.sha256((str(path.resolve()) + pinned.digest).encode("utf-8")).hexdigest()[:16]
+    scope = _PinnedImports(component, path.parent, pinned.sources, tag)
+    module = types.ModuleType(f"_germinate_pinned_{tag}.{path.stem}")
+    scope.exec_module(path.stem, path.name, module)
     return module
 
 
-def _verified_handlers_source(cid: str, row: Mapping[str, Any], module_path: Path) -> bytes:
+def _verified_handlers_source(cid: str, row: Mapping[str, Any], module_path: Path) -> Any:
     """T-5477 chain, fail-closed, before any component code runs.
 
     registry row ``contract.digest`` == recomputed contract digest (so the
@@ -126,7 +193,7 @@ def _verified_handlers_source(cid: str, row: Mapping[str, Any], module_path: Pat
         raise ComponentLoadError(f"{cid}: {exc}; handlers not imported") from None
     if pinned is None:  # pragma: no cover -- the caller only reaches here when the file exists
         raise ComponentLoadError(f"{cid}: handlers module vanished during load")
-    return pinned.entry_source
+    return pinned
 
 
 def _refuse_orphan_pin(cid: str, module_path: Path) -> None:
@@ -224,17 +291,22 @@ def discover_doc(repo_root: Path, doc: Any, *, import_handlers: bool = True) -> 
             if import_handlers:
                 _refuse_orphan_pin(cid, module_path)  # a pin with no handlers file refuses here too (T-5477)
             continue
-        source = _verified_handlers_source(cid, row, module_path) if import_handlers else None
+        pinned = _verified_handlers_source(cid, row, module_path) if import_handlers else None
+        source = pinned.entry_source if pinned is not None else None
         kinds = _op_kinds(cid, read_op_kinds(cid, path, source))
         handlers: tuple[Any, ...] = ()
         verify = None
-        if source is not None:
-            module = _import(path, cid, source)
+        preflight = None
+        if pinned is not None:
+            module = _import(path, cid, pinned)
             handlers = tuple(getattr(module, HANDLERS_ATTR, ()) or ())
             verify = getattr(module, VERIFY_ATTR, None)
             if verify is not None and not callable(verify):
                 raise ComponentLoadError(f"{cid}: {path.name} VERIFY must be a callable (list_doc, observed, scope) -> result")
-        regs.append(ComponentRegistration(cid, path, handlers, kinds, verify))
+            preflight = getattr(module, PREFLIGHT_ATTR, None)
+            if preflight is not None and not callable(preflight):
+                raise ComponentLoadError(f"{cid}: {path.name} PREFLIGHT must be a callable (ctx) -> [check, ...]")
+        regs.append(ComponentRegistration(cid, path, handlers, kinds, verify, preflight))
     return regs
 
 

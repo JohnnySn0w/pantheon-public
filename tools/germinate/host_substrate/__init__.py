@@ -20,9 +20,10 @@ Engine seam gaps this package works around without editing the engine
 
 * S5 backend selection: ``Engine.from_checkout`` / the CLI build only the
   simulated backend, so no engine-selectable root backend exists.
-* S6 invocation context: the engine carries no operator/scheduled/daemon
-  context and never reads ``execution_scope``; A-3 and staged cutover are
-  enforced here, component-side, only.
+* S6 invocation context (closed by T-5243): the engine now carries an
+  operator/scheduled/daemon context and enforces ``execution_scope`` at plan
+  time (engine/context.py); A-3 and staged cutover are ALSO enforced here,
+  component-side, as defence in depth.
 * S7 privilege at actuation: the executor dispatches by kind and never reads
   ``privilege``; the root/seat split is enforced here, component-side, only.
 """

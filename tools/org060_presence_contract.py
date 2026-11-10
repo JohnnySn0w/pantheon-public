@@ -385,7 +385,7 @@ def _z(moment: datetime) -> str:
 
 
 def _parse_z(value: object) -> datetime | None:
-    if not isinstance(value, str) or b.Z_RE.fullmatch(value) is None:
+    if type(value) is not str or b.Z_RE.fullmatch(value) is None:
         return None
     try:
         return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
@@ -401,18 +401,25 @@ def _is_fresh(value: object, now: datetime, freshness: b.FreshnessWindow) -> boo
 
 
 def _check_now(now: object) -> PresenceRefusal | None:
-    if not isinstance(now, datetime) or now.tzinfo is None:
+    if type(now) is not datetime or now.tzinfo is None:
         return _refuse("wrong-type", "now must be an aware datetime")
     return None
 
 
 def _check_freshness(freshness: object, field: str) -> PresenceRefusal | None:
-    if not isinstance(freshness, b.FreshnessWindow):
+    if type(freshness) is not b.FreshnessWindow:
         return _refuse("wrong-type", f"{field} must be FreshnessWindow")
     age = freshness.max_age_seconds
-    if not isinstance(age, int) or isinstance(age, bool) or age < 0:
+    if type(age) is not int or age < 0:
         return _refuse("wrong-type", f"{field}.max_age_seconds")
     return None
+
+
+def _install_anchor(pre_install_state_digest: str, install_evidence_digest: str) -> str:
+    return _sha_json({
+        "pre_install_state_digest": pre_install_state_digest,
+        "install_evidence_digest": install_evidence_digest,
+    })
 
 
 def _reject_key_lookalikes(value: object, *, path: str = "$") -> PresenceRefusal | None:
@@ -438,11 +445,6 @@ def _load(raw: object, *, limit: int, public: bool) -> dict[str, object] | Prese
     try:
         if not isinstance(raw, (bytes, str, Mapping)):
             return _refuse("wrong-type", "expected bytes, str or mapping")
-        if isinstance(raw, str):
-            try:
-                raw.encode("utf-8", errors="strict")
-            except UnicodeEncodeError:
-                return _refuse("malformed-input", "str input is not encodable UTF-8 (lone surrogate)")
         loaded = b.load_canonical_json_mapping(raw, limit=limit)
         if isinstance(loaded, b.TypedRefusal):
             return _lift(loaded)
@@ -836,7 +838,11 @@ def _bind_navigator(navigator: object, context: object) -> dict[str, object] | P
 def _companion_state(companion: object, now: datetime) -> dict[str, object] | PresenceRefusal:
     if type(companion) is not PresenceCompanionState:
         return _refuse("wrong-type", "server-owned PresenceCompanionState required")
-    if type(companion.fallback_channels) is not tuple or companion.fallback_channels != FALLBACK_CHANNELS:
+    if (
+        type(companion.fallback_channels) is not tuple
+        or not all(type(channel) is str for channel in companion.fallback_channels)
+        or companion.fallback_channels != FALLBACK_CHANNELS
+    ):
         return _refuse("fallback-incomplete", "server state must declare text/voice/control fallback")
     for value, allowed, name in (
         (companion.availability, AVAILABILITY, "availability"),
@@ -844,6 +850,8 @@ def _companion_state(companion: object, now: datetime) -> dict[str, object] | Pr
         (companion.recording, RECORDING_STATE, "recording"),
         (companion.action, ACTION_STATE, "action"),
     ):
+        if type(value) is not str:
+            return _refuse("wrong-type", name)
         if value not in allowed:
             return _refuse("invalid-enum", name)
     observed = _parse_z(companion.observed_at)
@@ -1058,13 +1066,16 @@ def record_presence_lifecycle(
     current, data = advanced
     if type(event) is not PresenceLifecycleEvent:
         return _refuse("wrong-type", "PresenceLifecycleEvent required")
+    for name in ("leg", "evidence_ref", "evidence_digest", "observed_at", "outcome"):
+        if type(getattr(event, name)) is not str:
+            return _refuse("wrong-type", f"event.{name}")
     if event.leg not in LIFECYCLE_LEGS:
         return _refuse("invalid-enum", "leg")
     if event.outcome not in LEG_OUTCOMES[event.leg]:
         return _refuse("invalid-enum", f"{event.leg}.outcome")
-    if not isinstance(event.evidence_ref, str) or b.ID_RE.fullmatch(event.evidence_ref) is None:
+    if b.ID_RE.fullmatch(event.evidence_ref) is None:
         return _refuse("invalid-pattern", "evidence_ref")
-    if not isinstance(event.evidence_digest, str) or b.SHA_RE.fullmatch(event.evidence_digest) is None:
+    if b.SHA_RE.fullmatch(event.evidence_digest) is None:
         return _refuse("invalid-pattern", "evidence_digest")
     seen = _parse_z(event.observed_at)
     if seen is None:
@@ -1073,7 +1084,7 @@ def record_presence_lifecycle(
         return _refuse("future-timestamp", "observed_at")
     needs_revision = event.leg == "update" and event.outcome == "verified"
     if needs_revision:
-        if not isinstance(event.to_revision, str) or b.ID_RE.fullmatch(event.to_revision) is None:
+        if type(event.to_revision) is not str or b.ID_RE.fullmatch(event.to_revision) is None:
             return _refuse("lifecycle-transition-invalid", "update(verified) requires to_revision")
     elif event.to_revision is not None:
         return _refuse("lifecycle-transition-invalid", "to_revision only applies to update(verified)")
@@ -1094,13 +1105,13 @@ def record_presence_lifecycle(
             lifecycle[name] = None
         lifecycle["install"] = evidence
         lifecycle["waiver"] = None
-        lifecycle["provisioning_anchor"] = current.digest
+        lifecycle["provisioning_anchor"] = _install_anchor(current.digest, event.evidence_digest)
         data["phase"] = "present"
     elif leg == "install":
         if phase != "present" or lifecycle["install"] is not None:
             return _refuse("lifecycle-transition-invalid", "install requires a new or removed surface")
         lifecycle["install"] = evidence
-        lifecycle["provisioning_anchor"] = current.digest
+        lifecycle["provisioning_anchor"] = _install_anchor(current.digest, event.evidence_digest)
     elif leg in ("configure", "health"):
         if phase != "present":
             return _refuse("lifecycle-transition-invalid", f"{leg} during {phase}")
@@ -1254,6 +1265,15 @@ def _check_readiness(
 ) -> PresenceRefusal | None:
     if type(readiness) is not PresenceReadiness:
         return _refuse("readiness-required", "PresenceReadiness required")
+    if (
+        any(type(getattr(readiness, name)) is not str for name in (
+            "surface_id", "surface_state_digest", "evaluated_at", "health_observed_at"
+        ))
+        or type(readiness.state_revision) is not int
+        or type(readiness.waived_legs) is not tuple
+        or not all(type(leg) is str for leg in readiness.waived_legs)
+    ):
+        return _refuse("readiness-required", "PresenceReadiness fields require exact built-in types")
     if (
         readiness.surface_id != surface.surface_id
         or readiness.surface_state_digest != surface.digest
@@ -1456,9 +1476,9 @@ def _interaction_envelope_schema() -> Mapping[str, object]:
 
 def _grant_fields_ok(grant: b.ConsentGrant) -> bool:
     return all(
-        isinstance(getattr(grant, name), str)
+        type(getattr(grant, name)) is str
         for name in ("stage", "purpose", "subject_scope", "consent_ref", "consent_digest", "consented_at", "expires_at")
-    ) and isinstance(grant.revoked, bool)
+    ) and type(grant.revoked) is bool
 
 
 def _evaluate_presence_consent(

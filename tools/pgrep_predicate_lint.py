@@ -146,11 +146,12 @@ ALLOWLIST: tuple[tuple[str, str], ...] = (
     (
         "harness/codex/codex_self_restart.sh",
         "T-4756 / ORG-091: imported VERBATIM from codex-config at T-4755 (C1); "
-        "Consultant-owned runtime. `pgrep -u \"$(id -u)\" -f 'codex-linux-x64.*/bin/codex$'` "
-        "is uid-scoped and anchored on the codex binary path suffix, the same shape "
-        "as the pantheon_oom_shield.sh entry above, so a false match is negligible. "
+        "Consultant-owned runtime. `pgrep -u \"$(id -u)\" -f "
+        "'codex-linux-x64.*/bin/codex (app-server|--remote)( |$)'` is uid-scoped, "
+        "anchored on the native codex binary plus its two app-server-era modes, and "
+        "excludes the node/tmux wrappers and codex-code-mode-host. "
         "It is listed per-file, not as a harness/ skip, so the rest of harness/ stays "
-        "linted. Re-examined when T-4750 C4b reworks the codex runtime.",
+        "linted. Re-examined for the T-5308 app-server cutover by T-6149.",
     ),
     (
         "tools/ho_resumer.py",

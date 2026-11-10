@@ -1,0 +1,14 @@
+[Unit]
+# T-6115 D-3 / T-6125: codex thread rotation for the seat on ACCOUNT %i. Instance and persona
+# rules as pantheon-codex-handoff-checkpoint@.service.
+Description=T-6115 D-3: codex thread rotation for the seat on account %i (rotates only past 3d or 60MB, idle)
+Documentation=file:///home/claude-fallback/pantheon-config/tools/codex_thread_rotate.py
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+# Runs AS the seat account from its own clone. not-due/busy exit 0; 3 = checkpoint not acked (soft).
+# The tool refuses the second codex seat live until T-6113, whatever the manifest gate says.
+ExecStart=/usr/bin/sudo -n -u %i /usr/bin/sg pantheon-mailbox -c "python3 /home/%i/pantheon-config/tools/codex_thread_rotate.py"
+SuccessExitStatus=3
+TimeoutStartSec=40min

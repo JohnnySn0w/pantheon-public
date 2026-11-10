@@ -28,7 +28,7 @@ Give Pantheon's persona-role vocabulary a durable, citable form. Prior state: ro
 
 ## Context
 
-- **ORG-085** (persona primitive) defines the layers: L2 RoleDefinition (functional roles), L3 PersonaDefinition (persona-to-role membership), binding layer (role-key → persona/account/harness). Section 253 owns field allocation.
+- **ORG-085** (persona primitive) defines the layers: L2 RoleDefinition (functional roles), L3 PersonaDefinition (persona-to-role membership), binding layer (role-key → persona/account/harness). §Field ownership and authority owns field allocation.
 - **ORG-088** (role-based ticket routing) locked the L2 vocabulary at ratification (T-3457/T-3757). D-2 named the roster: all seven personas hold `orchestrator` as a class-role, plus each persona's primary functional role (`orchestrator` / `sub_orchestrator` / `research` / `recovery` / `reviewer`).
 - **ORG-042** established the two-hemisphere topology (archivist as second head, "second-head" instance-role-key).
 - **ORG-043** established the sub-orchestrator retasking pattern (artisan/mason as "sub-orchestrator" seats).
@@ -54,8 +54,8 @@ These two meet in six places, each with its own local serialization convention b
 
 | # | Site | Authority | Role serialization | Purpose |
 |---|------|-----------|--------------------|---------|
-| 1 | `persona_roles.yaml` | ORG-085 §253 (L2 RoleDefinition) + ORG-088 D-2 | `snake_case` role_ids | Which roles each persona holds — the object of role-based routing. |
-| 2 | `instance.yaml` `roles.<role-key>:` | ORG-085 §253 (PersonaBinding / L3 binding) + ORG-030 (portable-config execution) | `kebab-case` role-key with numbered variants (`engineering-orchestrator-1/-2`) | Binds a role-key to (persona, account, harness). |
+| 1 | `persona_roles.yaml` | ORG-085 §Field ownership and authority (L2 RoleDefinition) + ORG-088 D-2 | `snake_case` role_ids | Which roles each persona holds — the object of role-based routing. |
+| 2 | `instance.yaml` `roles.<role-key>:` | ORG-085 §Field ownership and authority (PersonaBinding / L3 binding) + ORG-030 (portable-config execution) | `kebab-case` role-key with numbered variants (`engineering-orchestrator-1/-2`) | Binds a role-key to (persona, account, harness). |
 | 3 | `agent_role_map.AGENT_ROLE_MAP` | T-0492 normalization + P4 audit-chain-continuity | Role-labeled (`orchestrator → head_engineering_orchestrator`, `specialist → head_research_orchestrator`, etc.); legacy identity-labeled entries preserved for backward-resolve of historical audit-role-ids | Ledger `agent:` field + ticket `requester:`/`target:` field-writes normalize through this map. |
 | 4 | `organism/organs/*.yaml` + `organism/bindings/*.yaml` | ORG-056 (whole-organism topology and organ contracts) | `role:kebab-case` prefixed refs | Names the authority owner + escalation target for each organ contract (e.g. `owner_ref: role:head-memory-orchestrator`). |
 | 5 | `rulebook/persona-orientation/{manifest,role-deltas}.yaml` | T-3339 / T-3341 (persona-orientation renderer) | role-delta filenames (`head_engineering_orchestrator.md`, `project_orchestrator.md`, etc.) | Says what SOP content a subagent sees at spawn-time, keyed by role. When an orchestrator dispatches an implementer subagent, this decides which SOP sections get baked into that subagent's context on spawn. Freshness checked by `check_stale.py` against `source-bindings.yaml`. |
@@ -147,7 +147,7 @@ The L2 vocabulary post-retirement (all seven personas' primary role_ids):
 
 ## Composition with existing ADRs
 
-- **ORG-085** (persona primitive) — this ADR is the specific L2 RoleDefinition vocabulary ORG-085 §253 defers to. The head-X naming pattern is the ratified convention for future L2 RoleDefinitions.
+- **ORG-085** (persona primitive) — this ADR is the specific L2 RoleDefinition vocabulary ORG-085 §Field ownership and authority defers to. The head-X naming pattern is the ratified convention for future L2 RoleDefinitions.
 - **ORG-088** (role-based ticket routing) — D-2's roster + vocabulary section references the ADR here. `orchestrator` retirement is a D-2 amendment (see §Consequences).
 - **ORG-042** (two-hemisphere topology) — archivist's role designation `head_memory_orchestrator` is consistent with the ADR-042 "second head" domain framing; the instance-role-key `second-head` is renamed to `head-memory-orchestrator`.
 - **ORG-043** (sub-orchestrator retasking) — sub-orchestrator label retired in favor of `engineering_orchestrator`; retasking-pattern content unchanged.
@@ -169,7 +169,7 @@ The L2 vocabulary post-retirement (all seven personas' primary role_ids):
 
 **Pending downstream ADR amendments** (this ADR-worthy list, not blocking):
 - **ORG-088 amendment**: D-2 roster + vocabulary section references ORG-100 + drops universal `orchestrator` mention + adds `head_auditor` to the enumerated primary roles.
-- **ORG-085 amendment**: §253 references ORG-100 as the ratified head-X naming convention for future L2 RoleDefinition entries.
+- **ORG-085 amendment**: §Field ownership and authority references ORG-100 as the ratified head-X naming convention for future L2 RoleDefinition entries.
 
 **Ticket dispositions:**
 - **T-3333** (Consultant S3\* role formalization) — largely subsumed by this ADR; closeable-as-superseded on the operator's word.

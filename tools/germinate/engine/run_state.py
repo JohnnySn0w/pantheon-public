@@ -49,6 +49,16 @@ MAX_SEGMENT = 64
 # (T-5809): a full-seat install node is 86-123 KB, over the generic 64 KiB WAL
 # artifact cap, which stays in force for every other run-state artifact.
 MAX_PLAN_BYTES = 1 << 20
+# The ONE bound on a run's record.json, used by RunHandle._write AND read_record
+# (T-6146). The record embeds every op's precondition/postcondition plus a receipt
+# per committed op: ~1.9 KB/op for a decommission, linear in the op count. Measured
+# 2026-11-04: the largest real record is the orchestrator decommission, 73,999 B (33 ops),
+# then specialist 69,396 and orchestrator install 66,391; orchestrator/specialist already exceeded the
+# generic 64 KiB cap. Pending PRs add ~3-6 ops/seat (T-6141, T-6118), ~86 KB at worst.
+# 512 KiB = 4x the largest measured (74 KB -> 296 KB) rounded UP to a power of two;
+# it holds ~270 ops at 1.9 KB/op. The generic cap stays in force for every other
+# run-state artifact.
+MAX_RECORD_BYTES = 1 << 19
 
 
 class RunStateError(RuntimeError):
@@ -191,15 +201,27 @@ def validate_record(record: Mapping[str, Any], expected: RunTuple | None = None)
     halted = record["halted"]
     if (state is State.HALTED) != (halted is not None):
         raise RunStateError("halted is non-null exactly when state is HALTED")
-    if halted is not None and (not isinstance(halted, dict) or set(halted) != {"op_id", "reason", "at"}):
-        raise RunStateError("halted must be {op_id, reason, at}")
+    if halted is not None and (not isinstance(halted, dict) or set(halted) - {"escalations"} != {"op_id", "reason", "at"}):
+        raise RunStateError("halted must be {op_id, reason, at} (plus an optional escalations list)")
+    if halted is not None and "escalations" in halted:  # T-5858: an escalating halt's durable marker
+        marks = halted["escalations"]
+        keys = {"op_id", "subject", "reason", "recipient", "rollback"}
+        if not (isinstance(marks, list) and marks and all(
+                isinstance(m, dict) and set(m) == keys and all(isinstance(v, str) and v for v in m.values()) for m in marks)):
+            raise RunStateError("halted.escalations must be a non-empty list of {op_id, subject, reason, recipient, rollback}")
     if halted is not None:
         op_ids = {op.get("op_id") for op in record["operations"]}
         if halted["op_id"] != "system-reboot" and halted["op_id"] not in op_ids:
             raise RunStateError("halted.op_id must name one of the run's ops or be 'system-reboot'")
     incomplete = record["rollback_incomplete"]
-    if (state is State.ROLLBACK_INCOMPLETE) != (incomplete is not None):
-        raise RunStateError("rollback_incomplete is non-null exactly when state is ROLLBACK_INCOMPLETE")
+    if state is State.ROLLBACK_INCOMPLETE:
+        if incomplete is None:
+            raise RunStateError("rollback_incomplete is non-null exactly when state is ROLLBACK_INCOMPLETE")
+    elif incomplete is not None:
+        # T-5960: ROLLING_BACK may carry just the escalation marker, durable before any undo runs
+        if state is not State.ROLLING_BACK or not isinstance(incomplete, dict) or set(incomplete) != {"escalations"}:
+            raise RunStateError("rollback_incomplete is non-null exactly when state is ROLLBACK_INCOMPLETE "
+                                "(or ROLLING_BACK carrying only its escalations marker)")
     if record["parking"] is not None:
         raise RunStateError("parking is deferred past T-5074; a parked record is refused")
     for key in ("operations", "receipts"):
@@ -242,6 +264,7 @@ class RunHandle:
         self.store = store
         self.tuple = tup
         self.path = path
+        self._wals: list[WalStore] = []
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             self.held = HeldDir.from_fd(fd, expected_uid=store.uid, expected_mode=DIR_MODE)
@@ -251,6 +274,11 @@ class RunHandle:
             os.close(fd)
 
     def close(self) -> None:
+        # T-5147: wal() dup()s the run directory fd and its callers never close it, so the
+        # handle that issued each store releases them (HeldDir.close is idempotent).
+        for wal in self._wals:
+            wal.close()
+        self._wals.clear()
         self.held.close()
 
     def __enter__(self) -> "RunHandle":
@@ -260,12 +288,14 @@ class RunHandle:
         self.close()
 
     def wal(self) -> WalStore:
-        return WalStore.from_fd(self.held.fileno(), run_key=self.tuple.run_id, expected_uid=self.store.uid)
+        wal = WalStore.from_fd(self.held.fileno(), run_key=self.tuple.run_id, expected_uid=self.store.uid)
+        self._wals.append(wal)
+        return wal
 
     def read_record(self) -> dict[str, Any]:
         try:
-            data = self.held.read_regular("record.json", expected_uid=self.store.uid, expected_mode=FILE_MODE, max_bytes=1 << 20)
-            record = load_canonical_json(data)  # the generic artifact cap the record is written under (unchanged by T-5809)
+            data = self.held.read_regular("record.json", expected_uid=self.store.uid, expected_mode=FILE_MODE, max_bytes=MAX_RECORD_BYTES)
+            record = load_canonical_json(data, max_bytes=MAX_RECORD_BYTES)
         except Exception as exc:  # noqa: BLE001 -- every unreadable record refuses, typed
             raise RunStateError(f"record unreadable at {self.path}: {exc}") from None
         validate_record(record, self.tuple)
@@ -274,7 +304,7 @@ class RunHandle:
     def _write(self, record: Mapping[str, Any]) -> None:
         validate_record(record, self.tuple)
         try:
-            self.held.replace_regular("record.json", canonical_json_bytes(record), expected_uid=self.store.uid, mode=FILE_MODE)
+            self.held.replace_regular("record.json", canonical_json_bytes(record, max_bytes=MAX_RECORD_BYTES), expected_uid=self.store.uid, mode=FILE_MODE)
         except AuthorityError as exc:
             raise RunStateError(f"record write refused at {self.path}: {exc}") from None
 

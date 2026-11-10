@@ -199,6 +199,7 @@ class CiWiringTests(unittest.TestCase):
     def test_gate_requires_the_core_modules_and_a_floor(self):
         gate = next(r for r in self.runs if "check_dbus_tier_outcomes.py" in r)
         for module in ("test_host_control_dbus", "test_host_control_approval_dbus",
+                       "test_host_control_approval_get_async",  # T-6168: T-5644's async tier
                        "test_host_control_executor_user_bus", "test_host_control_executor_e39"):
             self.assertIn(f"--require-module {module}", gate)
         self.assertRegex(gate, r"--min-executed [1-9][0-9]{2,}")

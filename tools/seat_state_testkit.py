@@ -11,9 +11,12 @@ from tools import seat_state as ss
 def eff(state: str = ss.STATE_ACTIVE, *, asleep: bool = False, oom: bool = False,
         maintenance: bool = False, fault: str | None = None,
         owner: str | None = "operator", reason: str | None = "r",
-        expires: str | None = None) -> ss.EffectiveSeatState:
+        expires: str | None = None, run_state_pause: bool = False,
+        rollback_cmd: str = "python3 -m tools.germinate rollback --run r1") -> ss.EffectiveSeatState:
     """state: active | paused-intake | deep-sleep. asleep => deep-sleep phase asleep
-    (expected_down). oom / maintenance add those sources on top of the record."""
+    (expected_down). oom / maintenance add those sources on top of the record.
+    run_state_pause => a paused-intake record from a harness-manager run_state pause
+    (T-5918: repair_vetoed)."""
     sources = []
     if oom:
         sources.append(ss.SRC_OOM)
@@ -21,8 +24,9 @@ def eff(state: str = ss.STATE_ACTIVE, *, asleep: bool = False, oom: bool = False
         sources.append(ss.SRC_SEAT_STATE)
     if maintenance:
         sources.append(ss.SRC_MAINTENANCE)
-    if state == ss.STATE_PAUSED_INTAKE:
+    if state in (ss.STATE_PAUSED_INTAKE, ss.STATE_HALTED):
         sources.append(ss.SRC_SEAT_STATE)
+    halted = state == ss.STATE_HALTED
     sleeping = state == ss.STATE_DEEP_SLEEP
     return ss.EffectiveSeatState(
         state=state,
@@ -35,4 +39,7 @@ def eff(state: str = ss.STATE_ACTIVE, *, asleep: bool = False, oom: bool = False
         reason=reason if sources else None,
         expires=expires if sources else None,
         fault=fault,
+        repair_vetoed=halted or (run_state_pause and state == ss.STATE_PAUSED_INTAKE),
+        alertable=halted,
+        rollback_cmd=rollback_cmd if halted else None,
     )

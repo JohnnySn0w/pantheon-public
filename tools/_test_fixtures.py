@@ -36,7 +36,9 @@ Usage:
 
 from __future__ import annotations
 
+import ast
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -48,6 +50,154 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _BASELINE_FILENAME = "BASELINE.md"
 _BASELINE_CONTENT = "# integration test baseline\n"
+
+
+# ---------------------------------------------------------------------------
+# Minimal tools/ trees for synthetic-repo subprocess tests
+# ---------------------------------------------------------------------------
+
+
+def copy_tools_import_closure(
+    destination_tools: Path,
+    *,
+    source_tools: Path | None = None,
+    entry_modules: tuple[str, ...] = ("ticket.py",),
+) -> tuple[Path, ...]:
+    """Copy entry modules and their required import-time ``tools`` closure.
+
+    Synthetic-repo tests should not maintain their own lists of modules imported
+    by ``ticket.py``. This helper follows direct module-body imports transitively
+    within the source ``tools/`` package, copies the resulting files, and returns
+    their paths relative to ``tools/`` in deterministic order. Imports inside
+    module-level control flow execute while the module loads and are included.
+
+    Imports nested in functions are lazy and intentionally excluded. Class bodies
+    execute while their containing module imports, so they are traversed; method
+    bodies remain excluded by the function-body rule. A test exercising a lazy
+    command path can name that module as another ``entry_modules`` item (for
+    example ``("ticket.py", "ticket_lint.py")``).
+    """
+    source_root = (
+        Path(source_tools) if source_tools is not None else Path(__file__).resolve().parent
+    ).resolve()
+    destination_root = Path(destination_tools)
+    pending: list[Path] = []
+    for entry_module in entry_modules:
+        entry = (source_root / entry_module).resolve()
+        if not entry.is_relative_to(source_root) or not entry.is_file():
+            raise FileNotFoundError(
+                f"tools entry module does not exist under {source_root}: {entry_module}"
+            )
+        pending.append(entry)
+
+    closure: set[Path] = set()
+    while pending:
+        module_path = pending.pop()
+        if module_path in closure:
+            continue
+        closure.add(module_path)
+
+        parent = module_path.parent
+        while parent.is_relative_to(source_root):
+            package_init = parent / "__init__.py"
+            if package_init.is_file() and package_init not in closure:
+                pending.append(package_init)
+            if parent == source_root:
+                break
+            parent = parent.parent
+
+        tree = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
+        for statement in _module_scope_imports(tree):
+            for module_name in _direct_imported_module_names(statement, module_path, source_root):
+                imported_path = _resolve_tools_module(module_name, source_root)
+                if imported_path is not None and imported_path not in closure:
+                    pending.append(imported_path)
+
+    relative_paths = tuple(sorted(path.relative_to(source_root) for path in closure))
+    for relative_path in relative_paths:
+        destination = destination_root / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_root / relative_path, destination)
+    return relative_paths
+
+
+class _ModuleScopeImportVisitor(ast.NodeVisitor):
+    """Collect imports executed in module scope, pruning lazy definition bodies."""
+
+    def __init__(self) -> None:
+        self.imports: list[ast.Import | ast.ImportFrom] = []
+
+    def visit_Import(self, node: ast.Import) -> None:  # noqa: N802 — ast API
+        self.imports.append(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:  # noqa: N802 — ast API
+        self.imports.append(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802 — ast API
+        del node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802
+        del node
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:  # noqa: N802 — ast API
+        del node
+
+
+def _module_scope_imports(tree: ast.Module) -> tuple[ast.Import | ast.ImportFrom, ...]:
+    visitor = _ModuleScopeImportVisitor()
+    visitor.visit(tree)
+    return tuple(visitor.imports)
+
+
+def _direct_imported_module_names(
+    statement: ast.Import | ast.ImportFrom,
+    module_path: Path,
+    source_root: Path,
+) -> tuple[str, ...]:
+    """Return possible module names from one direct module-body import."""
+    if isinstance(statement, ast.Import):
+        return tuple(alias.name for alias in statement.names)
+    if not isinstance(statement, ast.ImportFrom):
+        return ()
+
+    if statement.level:
+        relative = module_path.relative_to(source_root)
+        package_parts = list(relative.parent.parts)
+        parents_to_drop = statement.level - 1
+        if parents_to_drop > len(package_parts):
+            return ()
+        package_parts = package_parts[: len(package_parts) - parents_to_drop]
+        base_parts = ["tools", *package_parts]
+        if statement.module:
+            base_parts.extend(statement.module.split("."))
+        base_module = ".".join(base_parts)
+    else:
+        if statement.module is None:
+            return ()
+        base_module = statement.module
+
+    names = [base_module]
+    names.extend(
+        f"{base_module}.{alias.name}"
+        for alias in statement.names
+        if alias.name != "*"
+    )
+    return tuple(names)
+
+
+def _resolve_tools_module(module_name: str, source_root: Path) -> Path | None:
+    """Resolve an absolute ``tools.*`` module name inside ``source_root``."""
+    if module_name == "tools":
+        package_init = source_root / "__init__.py"
+        return package_init if package_init.is_file() else None
+    if not module_name.startswith("tools."):
+        return None
+    relative = Path(*module_name.split(".")[1:])
+    module_file = (source_root / relative).with_suffix(".py")
+    if module_file.is_file():
+        return module_file
+    package_init = source_root / relative / "__init__.py"
+    return package_init if package_init.is_file() else None
 
 
 # ---------------------------------------------------------------------------
@@ -535,3 +685,48 @@ def _run(cmd: list[str], cwd: Path) -> None:
             f"setup command failed: {cmd!r}\n"
             f"stdout: {r.stdout}\nstderr: {r.stderr}"
         )
+
+
+# --- T-5872: fd-number-ceiling fixture ---------------------------------------
+import contextlib  # noqa: E402
+import resource  # noqa: E402
+import unittest  # noqa: E402
+
+FD_SETSIZE = 1024
+
+
+@contextlib.contextmanager
+def fds_above_select_ceiling():
+    """Burn fds so the NEXT fd the process allocates is >= FD_SETSIZE (1024).
+
+    select.select() raises ValueError / misbehaves for such fds; selectors and
+    poll do not. Within the block, os.pipe()/Popen pipes get high fd numbers.
+    Raises the soft RLIMIT_NOFILE to >= 2048 if needed (skips the test with a
+    reason if it cannot). All burned fds are closed on exit.
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = 2048
+    raised = False
+    burned: list[int] = []
+    try:
+        if soft != resource.RLIM_INFINITY and soft < want:
+            if hard != resource.RLIM_INFINITY and hard < want:
+                raise unittest.SkipTest(f"cannot raise RLIMIT_NOFILE to {want} (hard={hard})")
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            raised = True
+        base = os.open(os.devnull, os.O_RDONLY)
+        burned.append(base)
+        while True:
+            nxt = os.dup(base)
+            burned.append(nxt)
+            if nxt >= FD_SETSIZE:
+                break
+        yield
+    finally:
+        for fd in burned:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if raised:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))

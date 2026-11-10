@@ -659,6 +659,33 @@ class PolicyTests(Base):
         self.assertEqual(p, {"threadId": THREAD, "sandbox": "read-only", "approvalPolicy": "never",
                              "model": "gpt-fake", "cwd": "/tmp/seat"})
 
+    def test_resume_waits_longer_than_the_generic_request_timeout(self):
+        # T-6112: resume's response carries initialTurnsPage and scales with the thread; consultant's
+        # 114 MB rollout took 31.5s over the WS transport and the supervisor's 30s timeout made
+        # every restart REFUSED (rc3, seat dark). Resume must not inherit a short generic timeout.
+        from unittest import mock
+
+        c, srv, _ = self.client(resume=False)
+        c.initialize()
+        c.request_timeout = 30
+        with mock.patch.object(c, "request", wraps=c.request) as req:
+            c.resume(THREAD)
+        call = next(x for x in req.call_args_list if x.args[0] == "thread/resume")
+        self.assertGreaterEqual(call.kwargs.get("timeout") or 0, cd.RESUME_TIMEOUT_S)
+        self.assertGreaterEqual(cd.RESUME_TIMEOUT_S, 120)
+        self.assertLessEqual(cd.RESUME_TIMEOUT_S, 300)
+
+    def test_resume_keeps_a_longer_configured_timeout(self):
+        from unittest import mock
+
+        c, srv, _ = self.client(resume=False)
+        c.initialize()
+        c.request_timeout = 900
+        with mock.patch.object(c, "request", wraps=c.request) as req:
+            c.resume(THREAD)
+        call = next(x for x in req.call_args_list if x.args[0] == "thread/resume")
+        self.assertEqual(call.kwargs.get("timeout"), 900)
+
     def test_broader_sandbox_request_refused_before_send(self):
         c, srv, _ = self.client(resume=False)
         c.initialize()
@@ -919,6 +946,55 @@ class StdioTransportTests(Base):
 
 
 class WebSocketTransportTests(Base):
+    def _served_transport(self, payload_after_handshake: bytes):
+        # The REAL constructor + handshake (its buffer initialisation is under test),
+        # then the server streams `payload_after_handshake` and closes.
+        path = os.path.join(self._tmp.name, "big.sock")
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(path)
+        srv.listen(1)
+        self.addCleanup(srv.close)
+
+        def serve():
+            conn, _ = srv.accept()
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += conn.recv(4096)
+            key = re.search(rb"Sec-WebSocket-Key: (\S+)", buf).group(1)
+            accept = base64.b64encode(hashlib.sha1(
+                key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+            conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                         b"Connection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+            for i in range(0, len(payload_after_handshake), 1 << 20):
+                conn.sendall(payload_after_handshake[i:i + (1 << 20)])
+            conn.close()
+        th = threading.Thread(target=serve, daemon=True)
+        th.start()
+        return cd.UnixWebSocketTransport(path), th
+
+    def test_large_frame_is_received_in_linear_time(self):
+        # T-6115 D-6: thread/resume answers with one large frame (initialTurnsPage). With a
+        # `bytes +=` buffer 32 MiB took 12.5s (O(n^2)) and consultant's resume crossed the 30s
+        # timeout over WS while stdio took 6.3s. A linear reader does it in well under 1s.
+        import time as _time
+
+        body = json.dumps({"id": 1, "result": {"x": "a" * (32 * 1024 * 1024)}}).encode()
+        t, th = self._served_transport(bytes([0x81, 127]) + struct.pack(">Q", len(body)) + body)
+        t0 = _time.monotonic()
+        msg = t.recv()
+        dt = _time.monotonic() - t0
+        th.join(10)
+        self.assertEqual(len(msg["result"]["x"]), 32 * 1024 * 1024)
+        self.assertLess(dt, 5.0, f"32 MiB frame took {dt:.1f}s: reader is not linear")
+
+    def test_frames_split_across_reads_and_back_to_back(self):
+        frames = b"".join(bytes([0x81, len(p)]) + p for p in (b'{"id": 1}', b'{"id": 2}'))
+        frag = bytes([0x01, 5]) + b'{"id"' + bytes([0x80, 4]) + b': 3}'
+        t, th = self._served_transport(frames + frag)
+        self.assertEqual([t.recv(), t.recv(), t.recv()], [{"id": 1}, {"id": 2}, {"id": 3}])
+        self.assertIsNone(t.recv())
+        th.join(10)
+
     def test_unix_websocket_round_trip(self):
         path = os.path.join(self._tmp.name, "as.sock")
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

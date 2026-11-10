@@ -1,0 +1,95 @@
+{
+  "codex": [
+    {
+      "note": "OpenAI pool: not part of the weekly Max %",
+      "seat": "consultant",
+      "tokens": {
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 30000,
+        "input_tokens": 7000,
+        "output_tokens": 900
+      },
+      "turns": 1
+    }
+  ],
+  "estimate": true,
+  "generated_at": 1791143600,
+  "reason": null,
+  "schema": "pantheon-fleet-usage-share/v1",
+  "seats": [
+    {
+      "est_pct_points": 10.376,
+      "role": "head_research_orchestrator",
+      "seat": "specialist",
+      "share": 0.345851,
+      "tokens": {
+        "cache_creation_input_tokens": 3100,
+        "cache_read_input_tokens": 58000,
+        "input_tokens": 1700,
+        "output_tokens": 1060
+      },
+      "turns": 3,
+      "units": 14275.0
+    },
+    {
+      "est_pct_points": 19.624,
+      "role": "head_engineering_orchestrator",
+      "seat": "orchestrator",
+      "share": 0.654149,
+      "tokens": {
+        "cache_creation_input_tokens": 8000,
+        "cache_read_input_tokens": 220000,
+        "input_tokens": 3500,
+        "output_tokens": 1500
+      },
+      "turns": 2,
+      "units": 27000.0
+    }
+  ],
+  "skipped": {
+    "bad_file": 1,
+    "bad_line": 1,
+    "bad_row": 1,
+    "duplicate": 1
+  },
+  "status": "ok",
+  "weights": {
+    "default": {
+      "cache_creation": 1.25,
+      "cache_read": 0.1,
+      "input": 1.0,
+      "output": 5.0
+    },
+    "note": "ESTIMATE: token-class price-ratio proxy relative to each model's own input price; NOT Anthropic's quota formula (unpublished); cache writes assumed 5-minute TTL (1.25x); no cross-model scaling",
+    "override": null,
+    "per_model": {
+      "claude-fable-5-1": {
+        "cache_creation": 1.25,
+        "cache_read": 0.025,
+        "input": 1.0,
+        "output": 5.0
+      },
+      "claude-mythos-5-1": {
+        "cache_creation": 1.25,
+        "cache_read": 0.025,
+        "input": 1.0,
+        "output": 5.0
+      },
+      "claude-opus-5-5": {
+        "cache_creation": 1.25,
+        "cache_read": 0.05,
+        "input": 1.0,
+        "output": 5.0
+      }
+    },
+    "source": "claude-api skill (Claude Code 2.1.316): shared/model-migration.md (Opus 5.5 $4/$20, cache write $5, cache read $0.20) + shared/prompt-caching.md Economics (cache ratios); verified 2026-11-02 (T-4536)"
+  },
+  "window": {
+    "end": 1791143600,
+    "reading_seat": "specialist",
+    "reading_ts": 1791140000,
+    "resets_at": 1791738000,
+    "start": 1791133200,
+    "used_percentage": 30
+  }
+}

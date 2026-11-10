@@ -26,7 +26,7 @@ import json
 import os
 import random
 import re
-import select
+import selectors
 import statistics
 import subprocess
 import sys
@@ -201,7 +201,10 @@ class _Child:
         try:
             self.p.stdin.write(json.dumps(payload) + "\n")
             self.p.stdin.flush()
-            r, _, _ = select.select([self.p.stdout], [], [], timeout)
+            # T-5872: selectors, not select.select() (ValueError for fd >= 1024).
+            with selectors.PollSelector() as sel:
+                sel.register(self.p.stdout, selectors.EVENT_READ)
+                r = sel.select(timeout)
             if r:
                 line = self.p.stdout.readline()
                 if line:

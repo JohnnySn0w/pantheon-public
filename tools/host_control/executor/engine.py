@@ -142,7 +142,10 @@ from tools.persona_installer_contracts import (
     _sha256_bytes,
 )
 from tools.persona_installer_activation import (
+    PANE_PROBE_TIMEOUT_SECONDS,
     QUARANTINE_DIR_PREFIX,
+    pane_liveness_states,
+    seat_tmux_socket,
     _QUARANTINE_CLASSES,
     _bootstrap_residue_entries,
     _quarantine_can_rollback,
@@ -270,6 +273,8 @@ DIRECT_FIRE_TIMEOUT_SECONDS: Final = 120.0
 # resolves harness binaries through PATH (shutil.which) and the account
 # home through HOME; it reads no runtime-dir variable, so none is passed.
 DIRECT_FIRE_PATH: Final = "/usr/local/bin:/usr/bin:/bin"
+# T-6375 (gate 39 (d)): the one read-only pane probe runs an ABSOLUTE tmux, never a PATH lookup.
+DEFAULT_TMUX_BINARY: Final = "/usr/bin/tmux"
 DIRECT_FIRE_ENV_KEYS: Final = ("PATH", "HOME", "LANG")
 _PERSONA_NAME: Final = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 _DIRECT_FIRE_HARNESSES: Final = frozenset(("claude", "codex"))
@@ -658,6 +663,7 @@ class ExecutorEngine:
         sleep: Callable[[float], None] = time.sleep,
         run_child: Callable[..., Any] = subprocess.run,
         python: str = sys.executable,
+        tmux: str = DEFAULT_TMUX_BINARY,
         mailbox_probe: MailboxProbe | None = None,
     ) -> None:
         # T-2917 5d.3: built from the root-owned executor config only
@@ -668,6 +674,7 @@ class ExecutorEngine:
         self._sleep = sleep
         self._run_child = run_child
         self._python = python
+        self._tmux = tmux
         self._deadline = 0.0
         # per-run activation state: evidence of earlier operations in THIS
         # run, and the B9 legacy-convergence seeds, both keyed by kind
@@ -1360,6 +1367,27 @@ class ExecutorEngine:
             raise OperationFailed(f"residue quarantine: {exc}") from exc
         return _bootstrap_residue_entries(Path(root), persona)
 
+    _pane_stat = staticmethod(os.stat)  # a class attribute so a test can fake the socket
+
+    def _pane_probe(self, argv: list[str]) -> Any:
+        """T-5612/T-6375: the ONE tmux child, read-only (has-session against the seat's socket). The
+        shared reader's argv is only a request: the child's argv is rebuilt here from the seat uid
+        and the session name (gate 39 (d)), and anything off-shape raises -> unreadable -> refuse.
+        Absolute binary, no shell, no stdin, bounded, explicit env without TMUX*."""
+        socket = seat_tmux_socket(self._identity.uid)
+        if len(argv) != 6 or argv[1:3] != ["-S", socket] or not argv[5].startswith("="):
+            raise OperationFailed("pane probe request is malformed")
+        session = argv[5][1:]
+        return self._run_child(
+            [self._tmux, "-S", socket, "has-session", "-t", f"={session}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=min(PANE_PROBE_TIMEOUT_SECONDS, max(self._time_left(), 1.0)),
+            stdin=subprocess.DEVNULL,
+            env={"PATH": DIRECT_FIRE_PATH, "HOME": str(self._identity.seat_root), "LANG": "C.UTF-8"},
+        )
+
     def _quarantine_check(self, operation: InstallOperation) -> Any:
         """THE installer predicate with the executor's reads injected; every
         port call goes through the kind's declared inspection reads."""
@@ -1383,7 +1411,14 @@ class ExecutorEngine:
                     states[unit] = port.read_unit(unit, ReadPurpose.SERVICE_OBSERVE).active_state
                 except (OperationFailed, _us.UserManagerError):
                     states[unit] = None
-            return states
+            # T-5612: the seat's tmux pane, read against the SEAT's socket. This executor runs AS
+            # the seat (parse_spec pins target.uid == identity.uid), so identity.uid is the seat uid.
+            return states | pane_liveness_states(
+                operation.desired.get("tmux_session", ""),
+                self._identity.uid,
+                run=self._pane_probe,
+                stat=self._pane_stat,
+            )
 
         def entries(root: str, persona: str) -> list[tuple[str, str]]:
             if root_target != f"{root}/{persona}":
@@ -1456,7 +1491,11 @@ class ExecutorEngine:
             for cls, name in entries:
                 for directory in (qdir, f"{qdir}/{cls}"):
                     if directory not in created:
-                        self._files.mkdir(directory, 0o700)
+                        try:
+                            self._files.mkdir(directory, 0o700)
+                        except SeatChangeIncomplete:
+                            created.append(directory)  # T-5635: it WAS created; cleanup removes it
+                            raise
                         created.append(directory)
                 source, destination = paths(cls, name)
                 try:
@@ -1575,19 +1614,32 @@ class ExecutorEngine:
                 done.append((quarantined, original))
         if failure is not None:
             undone = 0
+            undone_pairs: set[tuple[str, str]] = set()
             for quarantined, original in reversed(done):
                 try:
                     self._files.rename_within(original, quarantined)
                     undone += 1
+                    undone_pairs.add((quarantined, original))
                 except SeatChangeIncomplete:
                     undone += 1
+                    undone_pairs.add((quarantined, original))
                 except Exception:
                     pass
             if undone == len(done):
                 raise OperationFailed(
                     f"quarantine restore failed, nothing left half-restored: {_safe_detail(failure)}"
                 )
-            return dataclass_replace(record, after_fingerprint="partially-restored"), self._evidence(
+            # T-5635: name only what is STILL quarantined (as apply does), so a retried
+            # rollback does not refuse as drifted on the paths already back in place
+            listing = json.loads(mutation.before.get("moved", "[]"))
+            stayed_restored = {pair for pair in done if pair not in undone_pairs}
+            subset = [
+                item for item, pair in zip(listing, pairs, strict=True) if pair not in stayed_restored
+            ]
+            still_quarantined = dict(mutation.before, moved=json.dumps(subset, separators=(",", ":")))
+            return dataclass_replace(
+                record, before=still_quarantined, after_fingerprint="partially-restored"
+            ), self._evidence(
                 operation, False,
                 f"quarantine restore failed part-way and could not be undone: {_safe_detail(failure)}",
                 {"action": "rename-back", "restored_from": "receipt-before-snapshot"},
@@ -1789,9 +1841,10 @@ class ExecutorEngine:
             op for op in operations
             if op.kind in ACTIVATION_KINDS or op.kind == "codex-telegram-disabled-first"
         ]
-        # T-5608: a kind with declared inspection reads makes ONLY those calls
-        # (no reachability probe here); an unreachable manager fails its own
-        # reads closed (an unreadable state refuses)
+        # T-5608: a kind with declared inspection reads makes ONLY those calls; this
+        # kind does not itself trigger the reachability probe below (activation kinds
+        # run manager_environment first in every real plan). An unreachable manager
+        # fails its own reads closed (an unreadable state refuses)
         if needs_manager:
             try:
                 self._user_manager.manager_environment()

@@ -15,45 +15,81 @@
 # * install (T-5091 U1, GF2): plan_install in harness-manager.py, an adapter over
 #   the live installer's pure plan (PersonaInstaller.plan with an explicit
 #   desired.source_revision), one seat-scope sub-run per seat. Its kinds are the
-#   installer's own, already typed-op registry kinds (identity mapping; the 24 seat
+#   installer's own, already typed-op registry kinds (identity mapping; the 25 seat
 #   kinds are listed under privilege.seat, the 12 diagnostics.read kinds need no
 #   list). Ops run only through the SIMULATED handlers (HarnessInstallSim plus the
 #   engine's InstallerFileHandler for mkdir / atomic-write). Root needs are U2.
+# * configure sub-op (a), the supervisor cutover (T-5830, T-5091 U4, GF2):
+#   desired.supervisor consume | bespoke (ORG-080 §2 desired_schema) re-states
+#   tools/persona_cutover.sh / persona_rollback.sh (untouched; still the operative
+#   path) as typed ops. UNTESTED-LIVE: ops run only through the SIMULATED
+#   HarnessSupervisorSim. Its six kinds are component-local (harness.supervisor class,
+#   seat privilege; Recovery D15 (T-5830)), listed under privilege.seat. Gate
+#   supervisor-cutover (ORG-080 D-L: each sub-op its own gate).
+# * configure run_state, fleet bringdown/restore (T-5858, T-5091 U5, GF2):
+#   desired.run_state paused | running (HO ruling Q2: a configure desired state, no new
+#   leg or verb) re-states sop/standard/fleet-daemon-bringdown-and-restore.md (untouched;
+#   still the operational surface) §3/§5 as typed ops. UNTESTED-LIVE: ops run only
+#   through the SIMULATED HarnessRunStateSim. Its six kinds are component-local
+#   (harness.run-state class, seat privilege; Recovery D15 (T-5858) with conditions (o)-(u)),
+#   listed under privilege.seat. Gate seat-run-state (operator class, reversible).
+# * remove, the full-seat decommission (T-5859, T-5091 U3, GF2): plan_remove in
+#   harness-manager.py, the inverse of plan_install's bring-up, SEAT HALF ONLY (a
+#   root_half: managed seat refuses root-half-pending; T-5873). Quarantine by
+#   same-filesystem rename into the seat's own home, never delete. UNTESTED-LIVE: ops run
+#   only through the SIMULATED HarnessDecommissionSim. Its four kinds are component-local
+#   (harness.decommission class, seat privilege; Recovery D15 (T-5859) with conditions
+#   (v)-(z)), listed under privilege.seat. Gate decommission, declared verbatim from
+#   ORG-080 §2 (:206); every seat's decommission needs an operator:<ref> anchor (Recovery (v)).
 #
 # STILL DEFERRED in GF2 (T-5091), declared absent so the engine refuses them
-# (leg-not-declared): remove (with decommission), configure sub-op (a)
-# (supervisor cutover, hence no `supervisor` desired key), update, repair, the
-# root privilege list, the necessary external interactions and the other §2 gates.
+# (leg-not-declared): update, repair, the root half of remove (T-5873), the root
+# privilege list, the necessary external interactions and the other §2 gates.
 #
-# The authority-transfer gate is independent-agent class as in ORG-080 §2. Grant
-# consumption is deferred in the engine (seam gap S2), so applying a real swap
-# refuses (grant-required) before any mutation: the swap lands dark.
+# The authority-transfer, supervisor-cutover and decommission gates are independent-agent class
+# as in ORG-080 §2. Grant consumption is deferred in the engine (seam gap S2), so
+# applying a real swap, cutover or decommission refuses (grant-required) before any
+# mutation: all three land dark.
 component:
   id: harness-manager
   steward: orchestrator
   version: 1
   planner_kind: python
-  contract_digest: sha256:800d340660c3f7033b4b64721c6cc2bc9f036365381edd266192d7d398b97343
-  handlers_digest: sha256:5a3b17be7aae0362e1563a8ea812aa104b917f533b7f02bdc0df44f99b2a8ff9
-  depends_on: [host-substrate, mailbox, action-broker, credential-broker]
+  contract_digest: sha256:06342db87558ad6eb4b31c750066da27140f2c4a5981a755020a998d059ec6e4
+  handlers_digest: sha256:bed6e6ab4028c35e7d160cc54f21e05753d0df016ed28e13bc18c906ad2451d9
+  depends_on: [host-substrate, mailbox, credential-broker]
   scopes: [system, seat]
   desired_schema:
     harness: {enum: [claude, codex]}
     source_revision: {}
+    supervisor: {enum: [consume, bespoke]}
+    stamp: {}
+    urgent_env: {enum: ["0", "1"]}
+    break_glass: {enum: ["0", "1"]}
+    run_state: {enum: [running, paused]}
+    keep: {}
+    anchor: {}
   invariant_list_id: org.pantheon.persona-stack/v1
-  invariant_list_digest: sha256:4aee6d6777b7f6dd273ea77fa8f88de1f8e61a2f7d33755f34b27ba8cfabd4e4
+  invariant_list_digest: sha256:ee89ba0e1adfbf73d240a5a78f3e2836ddc004dc2eb5f0f449be776878319855
   privilege:
     seat: [harness.transition-stage, harness.receiver-handoff, harness.runtime-replace, harness.transition-commit,
            atomic-write, claude-mcp-server-registration, codex-standing-instructions-install, codex-telegram-mcp-check,
            codex-telegram-source-check, daemon-reload, direct-fire, mailbox-probe, mailbox-writable-root-check, mkdir,
-           seat-claude-settings-env, seat-claude-workspace-trust, seat-periodic-daemon-reload, seat-periodic-timer-enable,
+           seat-claude-settings-env, seat-claude-workspace-trust, seat-codex-hook-config, seat-periodic-daemon-reload, seat-periodic-timer-enable,
            seat-periodic-timer-observe, seat-periodic-unit-install, seat-runtime-residue-quarantine, seat-service-decommission,
-           seat-service-enable-observe, stale-unit-failure-reset, timer-enable, timer-observe, unit-fire, user-unit-install]
+           seat-service-enable-observe, stale-unit-failure-reset, timer-enable, timer-observe, unit-fire, user-unit-install,
+           harness.supervisor-file, harness.supervisor-unit, harness.companion-unit, harness.control-plane-teardown,
+           harness.consume-retire, harness.supervisor-commit,
+           harness.run-state-manifest, harness.run-state-seat-state, harness.run-state-unit, harness.run-state-drain,
+           harness.run-state-reset-failed, harness.run-state-commit,
+           harness.decommission-record, harness.decommission-unit, harness.decommission-move,
+           harness.decommission-commit]
   legs:
     install: plan_install
     configure: plan_configure
+    remove: plan_remove
     verify:
-      invariant_list_ref: org.pantheon.persona-stack/v1@sha256:4aee6d6777b7f6dd273ea77fa8f88de1f8e61a2f7d33755f34b27ba8cfabd4e4
+      invariant_list_ref: org.pantheon.persona-stack/v1@sha256:ee89ba0e1adfbf73d240a5a78f3e2836ddc004dc2eb5f0f449be776878319855
   gates:
     - id: authority-transfer
       irreversible: true
@@ -62,12 +98,30 @@ component:
         class: independent-agent
         grant_source: action-broker-approval-registry
         binds: [actor, performer, target, operation, plan_digest, scope, policy_revision, expiry]
+    - id: supervisor-cutover
+      irreversible: true
+      rollback: supervisor-restore
+      approval:
+        class: independent-agent
+        grant_source: action-broker-approval-registry
+        binds: [actor, performer, target, operation, plan_digest, scope, policy_revision, expiry]
+    - id: decommission
+      irreversible: true
+      approval:
+        class: independent-agent
+        grant_source: action-broker-approval-registry
+        binds: [actor, performer, target, operation, plan_digest, scope, policy_revision, expiry]
+    - id: seat-run-state
+      irreversible: false
+      rollback: run-state-restore
+      approval:
+        class: operator
   receipts:
     schema: pantheon-receipt/v1
   emitter:
     bus: session
     interface: org.pantheon.PersonaController1
-    invariant_list_ref: org.pantheon.persona-stack/v1@sha256:4aee6d6777b7f6dd273ea77fa8f88de1f8e61a2f7d33755f34b27ba8cfabd4e4
+    invariant_list_ref: org.pantheon.persona-stack/v1@sha256:ee89ba0e1adfbf73d240a5a78f3e2836ddc004dc2eb5f0f449be776878319855
     reports:
       states: [ready, degraded, unhealthy, not_configured, suppressed]
     collector_attachment: required

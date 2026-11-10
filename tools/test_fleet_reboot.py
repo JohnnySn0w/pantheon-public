@@ -31,6 +31,7 @@ class Recorder:
         self.driver_status = driver_status
         self.reboot_called = False
         self.chronicle_called_with = None
+        self.preflight_ok = True
 
     def quiesce_handoff(self, agent, cfg, *, dry_run):
         self.calls.append(("handoff", agent, dry_run))
@@ -49,6 +50,10 @@ class Recorder:
         self.chronicle_called_with = handoff_file
         return True, "archived"
 
+    def reboot_preflight(self, *, dry_run):
+        self.calls.append(("preflight", dry_run))
+        return {"status": "OK" if self.preflight_ok else "FAIL", "detail": "root route probe"}
+
     def reboot(self, *, dry_run):
         self.reboot_called = True
         self.calls.append(("reboot", dry_run))
@@ -56,7 +61,15 @@ class Recorder:
 
 
 def _clean_sweep():
-    return [{"agent": "recovery", "status": "OK", "repo": "/x"}]
+    repos = [
+        {"agent": agent, "status": "OK", "repo": f"/{agent}"}
+        for agent in fr.FLEET
+    ]
+    continuity = [
+        {"agent": agent, "status": "OK", "continuity": f"{agent}:0"}
+        for agent in fr.FLEET
+    ]
+    return repos + continuity
 
 
 def _dirty_sweep():
@@ -72,6 +85,7 @@ def _orchestrate(rec, **kw):
         quiesce_drv=rec.quiesce_drv,
         chronicle_archive=rec.chronicle_archive,
         reboot=rec.reboot,
+        reboot_preflight=rec.reboot_preflight,
         log=_silent,
     )
     defaults.update(kw)
@@ -91,7 +105,10 @@ class TestOrder(unittest.TestCase):
         rec = Recorder()
         _orchestrate(rec)
         agents = {c[1] for c in rec.calls if c[0] in ("handoff", "repo", "driver")}
-        self.assertEqual(agents, {"orchestrator", "specialist", "codex", "recovery"})
+        self.assertEqual(agents, {
+            "orchestrator", "specialist", "codex", "recovery",
+            "archivist", "mason", "artisan", "watchman",
+        })
 
     def test_driver_archives_handoff(self):
         rec = Recorder()
@@ -125,6 +142,16 @@ class TestDryRunVsExecute(unittest.TestCase):
 
 
 class TestPreCheck(unittest.TestCase):
+    def test_strict_import_unavailable_aborts_before_quiesce_or_reboot(self):
+        from unittest.mock import patch
+        rec = Recorder()
+        with patch.object(fr, "reboot_safety", None):
+            report = _orchestrate(rec, strict=True, pre_sweep=None)
+        self.assertEqual(report["exit"], 2)
+        self.assertFalse(report["pre_check"]["clean"])
+        self.assertEqual(rec.calls, [])
+        self.assertFalse(rec.reboot_called)
+
     def test_advisory_dirty_continues(self):
         rec = Recorder()
         report = _orchestrate(rec, pre_sweep=_dirty_sweep, strict=False)
@@ -182,6 +209,26 @@ class TestCodexServices(unittest.TestCase):
 
 
 class TestRegistry(unittest.TestCase):
+    EXPECTED = {
+        "orchestrator", "specialist", "codex", "recovery",
+        "archivist", "mason", "artisan", "watchman",
+    }
+
+    def test_registry_covers_every_current_control_plane_seat(self):
+        self.assertEqual(set(fr.FLEET), self.EXPECTED)
+        self.assertEqual(set(fr.QUIESCE_ORDER), self.EXPECTED)
+
+    def test_quiesce_order_is_exact_and_has_no_duplicates(self):
+        self.assertEqual(fr.QUIESCE_ORDER, [
+            "orchestrator", "specialist", "codex", "archivist", "mason", "artisan",
+            "watchman", "recovery",
+        ])
+        self.assertEqual(len(fr.QUIESCE_ORDER), len(set(fr.QUIESCE_ORDER)))
+
+    def test_post_boot_health_covers_same_fleet(self):
+        self.assertIsNotNone(fr.fleet_health)
+        self.assertEqual(set(fr.fleet_health.FLEET), self.EXPECTED)
+
     def test_quiesce_order_driver_last(self):
         self.assertEqual(fr.QUIESCE_ORDER[-1], fr.DRIVER)
 
@@ -198,8 +245,31 @@ class TestRegistry(unittest.TestCase):
         self.assertFalse(clean)
 
     def test_run_pre_check_warn_is_still_clean(self):
-        clean, _ = fr.run_pre_check(sweep=lambda: [{"agent": "a", "status": "WARN"}])
+        results = _clean_sweep()
+        results[0]["status"] = "WARN"
+        clean, _ = fr.run_pre_check(sweep=lambda: results)
         self.assertTrue(clean)
+
+    def test_missing_seat_result_is_fail_closed(self):
+        incomplete = [
+            {"agent": agent, "status": "OK", "repo": f"/{agent}"}
+            for agent in self.EXPECTED - {"mason"}
+        ] + [
+            {"agent": agent, "status": "OK", "continuity": f"{agent}:0"}
+            for agent in self.EXPECTED
+        ]
+        clean, results = fr.run_pre_check(sweep=lambda: incomplete)
+        self.assertFalse(clean)
+        self.assertTrue(any(r["agent"] == "mason" and r["status"] == fr.FAIL
+                            for r in results))
+
+    def test_missing_continuity_result_is_fail_closed(self):
+        incomplete = [r for r in _clean_sweep()
+                      if not (r["agent"] == "artisan" and "continuity" in r)]
+        clean, results = fr.run_pre_check(sweep=lambda: incomplete)
+        self.assertFalse(clean)
+        self.assertTrue(any(r["agent"] == "artisan" and r["status"] == fr.FAIL
+                            for r in results))
 
 
 class TestHandoffPauseIdentity(unittest.TestCase):
@@ -239,8 +309,86 @@ class TestHandoffPauseIdentity(unittest.TestCase):
         self.assertIn(f"--service {fr.FLEET['orchestrator']['service']}", inner)
         self.assertIn("--supervisor bespoke", inner)
 
+    def test_each_new_seat_uses_its_own_control_plane_identity_and_handoff(self):
+        expected = {
+            "archivist": ("pantheon-persona-consume@archivist.service",
+                           "claude-telegram-bot-exocortex:0", "/home/exocortex/HANDOFF.md"),
+            "mason": ("pantheon-persona-consume@mason.service",
+                      "suborch1-main:0", "/home/suborch1/HANDOFF.md"),
+            "artisan": ("pantheon-persona-consume@artisan.service",
+                      "suborch2-main:0", "/home/suborch2/HANDOFF.md"),
+            "watchman": ("pantheon-persona-consume@watchman.service",
+                         "codex-fallback-main:0", "/home/codex-fallback/HANDOFF.md"),
+        }
+        for agent, (service, pane, handoff) in expected.items():
+            with self.subTest(agent=agent):
+                inner = self._argv(agent, {"service": service, "supervisor": "control-plane"})
+                self.assertIn(f"--service {service}", inner)
+                self.assertIn("--supervisor control-plane", inner)
+                self.assertIn(f"--target-pane {pane}", inner)
+                self.assertIn(f"--handoff-file {handoff}", inner)
+
+
+class TestT6288RootRouteAndSeatPaths(unittest.TestCase):
+    """T-6288: Recovery (the driver) has no root and other seats cannot read Recovery's clone."""
+
+    def _quiesce_inner(self, agent):
+        seen = {}
+        def run(argv, timeout=900):
+            seen["argv"] = argv
+            return 0, ""
+        fr.quiesce_handoff_pause(agent, fr.FLEET[agent], run=run, dry_run=False)
+        return seen["argv"]
+
+    def test_each_seat_runs_its_own_clone_never_the_drivers(self):
+        for agent, cfg in fr.FLEET.items():
+            if cfg["strategy"] != "handoff_pause":
+                continue
+            with self.subTest(agent=agent):
+                argv = self._quiesce_inner(agent)
+                self.assertEqual(argv[:4], ["sudo", "-n", "-u", cfg["user"]])
+                self.assertNotIn("/home/claude-fallback/", argv[-1])
+                self.assertIn("$HOME/pantheon-config/tools/handoff_and_restart.sh", argv[-1])
+
+    def test_reboot_goes_through_pantheon_sudo_on_the_claude_seat(self):
+        seen = {}
+        def run(argv, timeout=900):
+            seen["argv"] = argv
+            return 0, ""
+        fr.trigger_reboot(run=run, dry_run=False)
+        argv = seen["argv"]
+        self.assertNotEqual(argv[:3], ["sudo", "-n", "systemctl"])
+        self.assertEqual(argv[:6], ["sudo", "-n", "-u", "claude", "bash", "-lc"])  # T-6297
+        self.assertIn("pantheon-config/tools/pantheon-sudo systemctl reboot", argv[-1])
+        self.assertIn("</dev/null", argv[-1])  # pantheon-sudo refuses piped stdin (T-5713)
+
+    def test_failed_root_preflight_quiesces_nobody_and_never_reboots(self):
+        rec = Recorder()
+        rec.preflight_ok = False
+        report = _orchestrate(rec, execute=True)
+        self.assertEqual(report["exit"], 3)
+        self.assertEqual([c[0] for c in rec.calls], ["preflight"])
+        self.assertFalse(rec.reboot_called)
+
+    def test_preflight_runs_before_any_quiesce(self):
+        rec = Recorder()
+        _orchestrate(rec, execute=True)
+        self.assertEqual(rec.calls[0][0], "preflight")
+
+    def test_skip_reboot_needs_no_root_preflight(self):
+        rec = Recorder()
+        rec.preflight_ok = False
+        report = _orchestrate(rec, execute=True, skip_reboot=True)
+        self.assertEqual(report["exit"], 0)
+        self.assertNotIn("preflight", [c[0] for c in rec.calls])
+
 
 class TestCLI(unittest.TestCase):
+    def test_cli_strict_import_unavailable_exits_2(self):
+        from unittest.mock import patch
+        with patch.object(fr, "reboot_safety", None):
+            self.assertEqual(fr.main(["--strict"]), 2)
+
     def test_cli_dry_run_default_exit_0(self):
         # Real side-effect funcs but dry_run=True everywhere -> no live ops.
         # Inject a clean sweep via monkeypatching reboot_safety.sweep is overkill;

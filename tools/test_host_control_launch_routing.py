@@ -52,6 +52,7 @@ from tools.host_control.planner import (
     launch_routed_operation_ids,
     partition_installer_plan,
     refuse_launch_before_containment,
+    residue_bucket_counts,
 )
 from tools.host_control.registry import SeatRegistry
 from tools.test_host_control_core import REPO_ROOT, _manifest_dict, _plan_replace
@@ -199,7 +200,9 @@ class PartitionRoutingTest(unittest.TestCase):
                 broker, residue = partition_installer_plan(plan)
                 routed = launch_routed_operation_ids(plan)
                 self.assertLessEqual(
-                    len([op for op in residue if op.operation_id not in routed]), SEAT_LOCAL_RESIDUE_LIMIT
+                    # T-5961 (orchestrator ruling on B8): the general bucket; periodic-timer ops are separate
+                    residue_bucket_counts((op.kind, op.target) for op in residue if op.operation_id not in routed)[0],
+                    SEAT_LOCAL_RESIDUE_LIMIT,
                 )
                 require_routed_launch_bound(op.kind for op in residue if op.operation_id in routed)
 
@@ -304,7 +307,9 @@ class RealInstancePlansTest(unittest.TestCase):
                 _broker, residue = partition_installer_plan(plan)
                 routed = launch_routed_operation_ids(plan)
                 self.assertLessEqual(
-                    len([op for op in residue if op.operation_id not in routed]), SEAT_LOCAL_RESIDUE_LIMIT
+                    # T-5961 (orchestrator ruling on B8): the general bucket; periodic-timer ops are separate
+                    residue_bucket_counts((op.kind, op.target) for op in residue if op.operation_id not in routed)[0],
+                    SEAT_LOCAL_RESIDUE_LIMIT,
                 )
                 require_routed_launch_bound(op.kind for op in residue if op.operation_id in routed)
                 self.assertIsNone(

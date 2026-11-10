@@ -285,6 +285,20 @@ invariant_list:
       applies_to: {roles: [peer-daemon-codex, head-engineering-orchestrator, specialist, head-system-orchestrator, engineering-orchestrator-1, engineering-orchestrator-2]}
       on_fail: unhealthy
       machine_check: defined
+    - id: ORG-099/codex-lifecycle-hooks-trusted
+      source: sop/standard/seat-parity/axes.yaml#codex-lifecycle-hooks-trusted
+      text: "HARD: Codex lifecycle orientation hooks trusted"
+      class: recorded-probe
+      applies_to: {roles: [peer-daemon-codex, head-engineering-orchestrator, specialist, head-system-orchestrator, head-memory-orchestrator, system-orchestrator-1, engineering-orchestrator-1, engineering-orchestrator-2]}
+      on_fail: unhealthy
+      machine_check: defined
+    - id: ORG-099/chronicle-archive-after-last-restart
+      source: sop/standard/seat-parity/axes.yaml#chronicle-archive-after-last-restart
+      text: "HARD: seat's last session end is archived to its Chronicle"
+      class: recorded-probe
+      applies_to: all
+      on_fail: unhealthy
+      machine_check: defined
     - id: ORG-080/hook-symlink-allowlist-parity
       source: architecture/adr/ORG-080-germination-engine.md#6-health-plane-seam
       text: Hook symlink and allowlist parity hold on both verify and emitter surfaces

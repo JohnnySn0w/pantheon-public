@@ -23,6 +23,7 @@ UNKNOWN = "3" * 64
 METADATA_DOWN = "4" * 64
 DENIED_UNKNOWN_CODE = "5" * 64
 AUTHORITY_RECORD = "e" * 64
+PLAN = "e" * 64
 
 _ERRORS = "org.pantheon.HostApproval1.Error"
 
@@ -64,11 +65,13 @@ def serve(bus_address: str, ready_file: str) -> int:
         def ApprovalStatus(self, approval_handle):
             if approval_handle == BOUND:
                 payload = {
-                    "schema": "pantheon-approval-status/v1",
+                    "schema": "pantheon-approval-status/v2",
                     "approval_handle": approval_handle,
                     "state": "bound",
                     "expires_at": "2026-10-10T01:00:00+00:00",
                     "summary": "bounded",
+                    "plan_handle": PLAN,
+                    "plan_owner": "alpha",
                 }
                 return ("bound", json.dumps(payload, sort_keys=True, separators=(",", ":")))
             raise named("UnknownHandle", "unknown handle")

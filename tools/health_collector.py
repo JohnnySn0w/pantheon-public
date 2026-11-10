@@ -64,6 +64,7 @@ if __package__ in (None, ""):
 from tools.health_export import (  # noqa: E402
     SudoReader, _bounded_int, _ident, _seat_owner, atomic_write_json, fleet_personas,
 )
+from tools.health_subscriptions import SubscriptionError, derive  # noqa: E402
 
 SCHEMA = "pantheon-fleet-health/1"
 SCHEMA_VERSION = 1
@@ -78,23 +79,15 @@ HEALTH1_INTERFACE = "org.pantheon.Health1"
 PC_INTERFACE = "org.pantheon.PersonaController1"
 PROPERTIES_INTERFACE = "org.freedesktop.DBus.Properties"
 
-# (component_id, bus name, object path, registry component)
-HOST_SERVICES = (
-    ("host-approval", "org.pantheon.HostApproval1", "/org/pantheon/HostApproval1/Health", "action-broker"),
-    ("host-broker", "org.pantheon.HostBroker1", "/org/pantheon/HostBroker1/Health", "action-broker"),
-)
-PERSONA_REGISTRY_COMPONENT = "harness-manager"
-
 STATUSES = frozenset({"ready", "degraded", "unhealthy", "not_configured", "suppressed"})
 REACHABILITY = frozenset({"ok", "unreachable", "denied", "no_service"})
 HEALTH_LEGS = frozenset({"present", "absent", "unreachable"})
 BUS_CLASSES = frozenset({"system", "session"})
 KINDS = frozenset({"persona_controller", "host_service"})
-REGISTRY_COMPONENTS = frozenset({"harness-manager", "action-broker"})
 VIABILITY = frozenset({"viable", "cooldown-hold", "all-held", "exhausted"})
 MODAL_KINDS = frozenset({"session-limit", "weekly-limit", "opus-limit", "monthly-spend-limit"})
 # ORG-106 L4a (T-5527): seat-state publication.
-SEAT_STATES = frozenset({"active", "paused-intake", "deep-sleep"})
+SEAT_STATES = frozenset({"active", "paused-intake", "deep-sleep", "halted"})  # T-5868
 SEAT_STATE_SOURCES = frozenset({"seat-state", "maintenance", "oom-hold", "autonomy_off"})
 SEAT_REASON_MAX = 200
 _ISO_Z_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")  # used with fullmatch: `$` would pass a trailing newline
@@ -325,26 +318,27 @@ def _read_one(fn, *args) -> tuple[str, dict | None]:
     return ("ok", props) if props is not None else ("unreachable", None)
 
 
-def _host_entry(reader, spec) -> dict:
-    cid, bus_name, path, registry = spec
-    reach, props = _read_one(reader.getall_system, bus_name, path, HEALTH1_INTERFACE)
-    return _entry(cid, "host_service", registry, None, None, "system", reach, props)
+def _host_entry(reader, sub) -> dict:
+    reach, props = _read_one(reader.getall_system, sub.bus_name, sub.object_path, HEALTH1_INTERFACE)
+    return _entry(sub.component_id, "host_service", sub.registry_component, None, None, "system", reach, props)
 
 
-def _persona_entry(reader, persona: str, account: str) -> dict:
-    reach, props = _read_one(reader.getall_session, account, persona, PC_INTERFACE)
-    return _entry(f"persona-controller.{persona}", "persona_controller", PERSONA_REGISTRY_COMPONENT,
-                  persona, account, "session", reach, props)
+def _persona_entry(reader, sub) -> dict:
+    reach, props = _read_one(reader.getall_session, sub.account, sub.persona, PC_INTERFACE)
+    return _entry(sub.component_id, "persona_controller", sub.registry_component,
+                  sub.persona, sub.account, "session", reach, props)
 
 
-def collect(personas, *, reader, now: float, mode: str = "poll") -> dict:
-    """Poll every emitter and return the sanitized aggregate document. Never raises."""
+def collect(personas, *, reader, now: float, mode: str = "poll", subscriptions=None) -> dict:
+    """Poll every subscribed emitter and return the sanitized aggregate document.
+
+    ``subscriptions`` defaults to the set derived from the registry's emitter declarations
+    (tools/health_subscriptions.py, T-5980); a SubscriptionError from that derivation is the
+    caller's to handle (run() turns it into rc 2). Reads never raise."""
+    subs = derive(personas) if subscriptions is None else tuple(subscriptions)
     t0 = time.monotonic()
-    jobs = [lambda s=s: _host_entry(reader, s) for s in HOST_SERVICES]
-    for persona, account, _pane in personas:
-        if _ident(persona) is None or _ident(account) is None:
-            continue
-        jobs.append(lambda p=persona, a=account: _persona_entry(reader, p, a))
+    jobs = [(lambda s=s: _host_entry(reader, s)) if s.kind == "host_service"
+            else (lambda s=s: _persona_entry(reader, s)) for s in subs]
     with ThreadPoolExecutor(max_workers=_POOL) as pool:
         raw = list(pool.map(lambda j: j(), jobs))
     entries = [e for e in (sanitize_entry(r) for r in raw) if e is not None]
@@ -397,7 +391,7 @@ def sanitize_entry(rec: object) -> dict | None:
     return {
         "component_id": cid,
         "kind": _enum_str(rec.get("kind"), KINDS),
-        "registry_component": _enum_str(rec.get("registry_component"), REGISTRY_COMPONENTS),
+        "registry_component": _ident(rec.get("registry_component"), _COMPONENT_RE),
         "persona": _ident(rec.get("persona")),
         "account": _ident(rec.get("account")),
         "bus_class": _enum_str(rec.get("bus_class"), BUS_CLASSES),
@@ -469,8 +463,14 @@ class _OutDirLock:
 
 def run(personas, *, reader, out: Path, now: float | None = None, dry_run: bool = False,
         mode: str = "poll", lock_wait_s: float = 20.0) -> int:
+    try:
+        subscriptions = derive(personas)
+    except SubscriptionError as exc:
+        print(f"health_collector: subscription set: {exc}", file=sys.stderr)
+        return 2
     if dry_run:
-        doc = collect(personas, reader=reader, now=time.time() if now is None else now, mode=mode)
+        doc = collect(personas, reader=reader, now=time.time() if now is None else now, mode=mode,
+                      subscriptions=subscriptions)
         print(json.dumps(doc, indent=2, ensure_ascii=True))
         return 0
     out = Path(out)
@@ -483,7 +483,8 @@ def run(personas, *, reader, out: Path, now: float | None = None, dry_run: bool 
             if not got:
                 return RC_BUSY
             # collect INSIDE the lock so write order == collect order.
-            doc = collect(personas, reader=reader, now=time.time() if now is None else now, mode=mode)
+            doc = collect(personas, reader=reader, now=time.time() if now is None else now, mode=mode,
+                          subscriptions=subscriptions)
             atomic_write_json(out.parent, out.name, doc, mode=FILE_MODE)
     except OSError as exc:
         print(f"health_collector: write failed in {out.parent}: {exc.__class__.__name__}", file=sys.stderr)

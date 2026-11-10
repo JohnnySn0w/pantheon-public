@@ -2,22 +2,29 @@
 # T-2271: WIRED. Measured 0 failed-state transitions in 14 days across 19 start
 # events, so seat restarts (handoff, context-fill) demonstrably do NOT produce a
 # failed state and cannot trigger this. The feared storm — OnFailure firing
-# per-failure under Restart=always (mason) — is bounded here by the existing
-# StartLimitIntervalSec=600 / StartLimitBurst=20: a crash-loop hits the limit and
-# enters a terminal failed state instead of alerting forever.
+# per-failure under Restart=always (mason) — is bounded here by the StartLimit
+# below (T-6352: 3600s / 30 under exponential backoff, was 600 / 20): a crash-loop
+# hits the limit and enters a terminal failed state instead of alerting forever.
 # Recovery has a direct interest in learning that this seat FAILED: it is the one it
 # is the recovery fallback for.
 OnFailure=pantheon-unit-failure-alert@%n.service
 Description=Claude Code Telegram bot bridge (prime)
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=600
-StartLimitBurst=20
+# T-6352: ~52 min of continuous failure (30 starts/h under the [Service] backoff) ends in
+# ONE latched failed state (OnFailure alert where wired; failed_unit_reconcile sees it
+# regardless) instead of an unbounded loop. Recover: reset-failed + start.
+StartLimitIntervalSec=3600
+StartLimitBurst=30
 
 [Service]
 Type=simple
 Restart=always
 RestartSec=5
+# T-6352: exponential restart backoff (5,9,18,34,64,120s). NRestarts is cumulative
+# (resets only on a manual start/restart), so 120s is also the steady per-crash delay.
+RestartSteps=5
+RestartMaxDelaySec=120
 WorkingDirectory=/home/claude
 Environment=PATH=/home/claude/.bun/bin:/home/claude/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=/home/claude

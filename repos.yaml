@@ -59,6 +59,9 @@ always_available:
 # ADDITIVE keys — repo_registry/ticket_lint/provisioning read `grants:` and ignore
 # these (yaml.safe_load + .get); load_manifest() reads them.
 auth_refs:
+  deploy-key:pantheon-vps-backup:
+    # root's GitHub ssh key on the VPS (T-2178 backup push).
+    allowed_hosts: [github.com]
   deploy-key:pantheon-config:
     # GitHub reached via the account's default git ssh key (github.com). Per-repo
     # ssh-alias hardening (the ORG-046 §1 example's github-<repo> alias) is a follow-up.
@@ -68,6 +71,12 @@ auth_refs:
     # pantheon-fleet is a READ collaborator on github-mirror/pantheon-config (T-1998,
     # 2026-09-28). That grant is not a widening: every seat already holds rw on
     # pantheon-config at GitHub (grants below). HTTPS auth-to-pull.
+    allowed_hosts: [git.your-self-hosted-git.example]
+  token:forgejo-vps-backup:
+    # T-5993 (the operator TG 9190): ROOT's push-only write:repository token for the Forgejo
+    # user vps-backup, in root's own git credential store on the VPS (never a seat's).
+    # Scope verified: it cannot see an unrelated private repo (404). Revoke = delete the
+    # named token root-vps-backup (pve2 -> CT200 admin CLI).
     allowed_hosts: [git.your-self-hosted-git.example]
   token:forgejo-pantheon-inventory:
     # Per-seat 'seat-<account>' write token for the pantheon-fleet service user, in each
@@ -113,6 +122,23 @@ repos:
       - role: primary
         url: https://pantheon-fleet@git.your-self-hosted-git.example/pantheon/pantheon-inventory.git
         auth: token:forgejo-pantheon-inventory
+
+  - name: pantheon-vps-backup
+    description: root's nightly VPS state backup (seat memory, HANDOFFs, kino.db); private (T-2178)
+    # No persona grant: only root reads or writes it (tools/vps_state_backup.sh, run as a
+    # root-owned copy). The writable Forgejo mirror is ORG-101's second copy (T-5993,
+    # the operator TG 9190): the EXISTING private reconciler copy github-mirror/pantheon-vps-backup
+    # (main protected), with user vps-backup a write collaborator (2026-11-02). The mirror leg imports this manifest
+    # from the root-owned lib copy under /usr/local/lib/pantheon-vps-backup, pin-verified.
+    grants: {}
+    remotes:
+      - role: primary
+        url: git@github.com:example-org/pantheon-vps-backup.git
+        auth: deploy-key:pantheon-vps-backup
+      - role: mirror
+        url: https://vps-backup@git.your-self-hosted-git.example/github-mirror/pantheon-vps-backup.git
+        auth: token:forgejo-vps-backup
+        writable: true  # T-5993: root push-only token (write collaborator); reconciler-covered like pantheon-config
 
   - name: pantheon-bridge
     description: "RETIRED (dead) — the ORG-004 shared getUpdates poller + SSE fanout is no longer running anywhere; every agent self-polls via the per-agent telegram plugin (T-0719/T-0759 failure class). Repo kept for history; do not revive without a design pass."
@@ -166,6 +192,25 @@ repos:
     grants: { head-engineering-orchestrator: rw }   # ssh alias github-exocortex-skeleton (read-only deploy key not on the repo; HTTPS via PAT for writes)
   - name: pantheon-public
     description: neutralized public-facing mirror of pantheon-config, orphan-root private (initial publish gated on T-1963/T-1970/T-1989)
+    grants: { head-engineering-orchestrator: rw }
+
+  # Added 2026-11-02 (T-5841 -> T-5842, the operator TG 9169 "grant all";
+  # descriptive-of-current-reality: orchestrator-worked clones already present on HO,
+  # surfaced by the T-3314 present-but-undeclared repo-audit dry run):
+  - name: biometrics
+    description: personal health-monitoring and biometrics tracking
+    grants: { head-engineering-orchestrator: rw }
+  - name: sseed-presence
+    description: SSEED rich-presence layer (hardware research, protocol notes, driver code)
+    grants: { head-engineering-orchestrator: rw }
+  - name: tail-vault
+    description: local markdown web app for a git-synced obsidian vault
+    grants: { head-engineering-orchestrator: rw }
+  - name: term-shortcut
+    description: term URL-scheme handler for browser-to-terminal command shortcuts
+    grants: { head-engineering-orchestrator: rw }
+  - name: the-esoteric-and-the-occult-party
+    description: NFC party experiences (Android/iPhone parity, zero visitor setup)
     grants: { head-engineering-orchestrator: rw }
 
 # Repos PRESENT on an agent's box but intentionally NOT sanctioned project repos

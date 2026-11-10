@@ -69,6 +69,9 @@ def _chronicle_root() -> Path:
     return base / "chronicle"
 
 
+# Import-time snapshot, kept exported for back-compat only (T-6118). NO internal code reads it
+# for a default: every default resolves through _chronicle_root() at CALL time, so a later
+# PANTHEON_STATE_DIR / PANTHEON_CHRONICLE_ROOT change (test isolation, conftest) reaches the write.
 CHRONICLE_ROOT = _chronicle_root()
 _INDEX_NAME = "index.md"
 
@@ -164,7 +167,34 @@ def _truncate_file(path: Path, size: int) -> None:
         os.close(fd)
 
 
-def _write_snapshot_required(snap: Path, handoff_text: str) -> Path:
+def archive_group_problem(group: "str | None") -> "str | None":
+    """Why an archive file could not be chowned to ``group``, else None. Checked BEFORE the
+    write: the 11-03 first live run reached the archive, then EPERM'd because the codex
+    account was not in pantheon-shared."""
+    if group is None or os.geteuid() == 0:
+        return None
+    import grp
+    try:
+        gid = grp.getgrnam(group).gr_gid
+    except KeyError:
+        return f"archive group {group!r} does not exist"
+    if gid == os.getegid() or gid in os.getgroups():
+        return None
+    return f"this account is not in archive group {group!r} (the archive chown would EPERM)"
+
+
+def _resolve_gid(group: "str | None") -> "int | None":
+    if not group:
+        return None
+    import grp
+    try:
+        return grp.getgrnam(group).gr_gid
+    except KeyError as exc:
+        raise ChronicleDurabilityError(f"group {group!r} does not exist") from exc
+
+
+def _write_snapshot_required(snap: Path, handoff_text: str, *, mode: "int | None" = None,
+                             gid: "int | None" = None) -> Path:
     fd = -1
     tmp_path: Path | None = None
     try:
@@ -180,6 +210,12 @@ def _write_snapshot_required(snap: Path, handoff_text: str) -> Path:
             fh.write(handoff_text)
             fh.flush()
             os.fsync(fh.fileno())
+            # mode/group on the still-open temp fd, BEFORE the rename: the file is never
+            # visible at its final name with the wrong perms (archivist hardlinks it).
+            if mode is not None:
+                os.fchmod(fh.fileno(), mode)
+            if gid is not None:
+                os.fchown(fh.fileno(), -1, gid)
         os.replace(tmp_path, snap)
         tmp_path = None
         _fsync_dir(snap.parent)
@@ -270,7 +306,7 @@ def archive(agent: str, handoff_text: str, *, jsonl_uuid: str, reason: str, ts: 
     snapshot path, or None on ANY failure (non-fatal: a restart must never block on this).
     """
     try:
-        base = Path(root) if root is not None else CHRONICLE_ROOT
+        base = Path(root) if root is not None else _chronicle_root()
         day = ts[:10]  # YYYY-MM-DD
         agent_dir = base / agent
         day_dir = agent_dir / day
@@ -290,21 +326,23 @@ def archive(agent: str, handoff_text: str, *, jsonl_uuid: str, reason: str, ts: 
 
 
 def archive_required(agent: str, handoff_text: str, *, jsonl_uuid: str, reason: str,
-                     ts: str, root: Path | None = None) -> Path:
+                     ts: str, root: Path | None = None, mode: "int | None" = None,
+                     group: "str | None" = None) -> Path:
     """Strict Chronicle archive for controller-mediated runtime transfer.
 
     Unlike archive(), every durability failure raises ChronicleDurabilityError so
     the caller can fail closed before starting or submitting to a replacement
     harness.
     """
-    base = Path(root) if root is not None else CHRONICLE_ROOT
+    base = Path(root) if root is not None else _chronicle_root()
     day = ts[:10]
     agent_dir = base / agent
     day_dir = agent_dir / day
     snap = day_dir / f"{_fs_safe_ts(ts)}-{jsonl_uuid}.md"
+    gid = _resolve_gid(group)
     try:
         day_dir.mkdir(parents=True, exist_ok=True)
-        snap = _write_snapshot_required(snap, handoff_text)
+        snap = _write_snapshot_required(snap, handoff_text, mode=mode, gid=gid)
         _verify_snapshot_readable(snap, handoff_text)
 
         summary = _one_line_summary(handoff_text)
@@ -403,7 +441,7 @@ def archive_companion(agent: str, source: "str | os.PathLike", *, jsonl_uuid: st
         src = Path(source)
         if not src.is_file() or src.stat().st_size == 0:
             return None  # nothing to archive (no tap armed / empty) — benign
-        base = Path(root) if root is not None else CHRONICLE_ROOT
+        base = Path(root) if root is not None else _chronicle_root()
         day_dir = base / agent / ts[:10]
         day_dir.mkdir(parents=True, exist_ok=True)
         stem = f"{_fs_safe_ts(ts)}-{jsonl_uuid}.{suffix}"
@@ -441,10 +479,94 @@ def archive_companion(agent: str, source: "str | os.PathLike", *, jsonl_uuid: st
         return None
 
 
+NATIVE_TRANSCRIPT_MODE = 0o640
+NATIVE_TRANSCRIPT_GROUP = "pantheon-shared"
+
+
+def archive_native_transcript(agent: str, source: "str | os.PathLike", *, jsonl_uuid: str, ts: str,
+                              suffix: str = "transcript.jsonl", root: Path | None = None,
+                              group: "str | None" = NATIVE_TRANSCRIPT_GROUP,
+                              compresslevel: int = 9) -> dict:
+    """Archive a session's NATIVE transcript raw-but-compressed beside its HANDOFF snapshot.
+
+    T-6115 D-3 / T-6118 contract (the operator TG 12979: "Chronicle is concerned with saving the
+    session transcript"; archivist's seams on T-6118). ``<ts>-<uuid>.<suffix>.gz`` in the
+    agent's day dir, written to a temp sibling, fsynced and renamed (never written in place,
+    never overwritten: an existing name gets a ``.N`` counter), mode 0640 and ``group``
+    (pantheon-shared) from the start, because the memex export hardlinks it. NOT scrubbed:
+    archivist renders and scrubs on ingest. The SOURCE IS KEPT (the caller's rollback needs it).
+
+    Returns the ``native_transcript`` pointer {path, bytes, sha256, source_bytes, source_sha256}
+    (bytes and sha256 of the .gz; source_bytes/source_sha256 of the bytes actually compressed). STRICT: any failure raises ChronicleDurabilityError and leaves no
+    partial file.
+    """
+    import gzip
+    import grp
+    import hashlib
+    import shutil as _shutil
+
+    src = Path(source)
+    try:
+        size = src.stat().st_size
+    except OSError as exc:
+        raise ChronicleDurabilityError(f"native transcript source unreadable: {src}") from exc
+    if size == 0:
+        raise ChronicleDurabilityError(f"native transcript source is empty: {src}")
+    try:
+        gid = grp.getgrnam(group).gr_gid if group else None
+    except KeyError as exc:
+        raise ChronicleDurabilityError(f"group {group!r} does not exist") from exc
+    base = Path(root) if root is not None else _chronicle_root()
+    day_dir = base / agent / ts[:10]
+    tmp: Path | None = None
+    fed_digest = hashlib.sha256()
+    fed = 0
+    try:
+        day_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"{_fs_safe_ts(ts)}-{jsonl_uuid}.{suffix}"
+        dest = day_dir / f"{stem}.gz"
+        n = 2
+        while dest.exists():
+            dest = day_dir / f"{stem}.{n}.gz"
+            n += 1
+        tmp = day_dir / f".{dest.name}.tmp-{os.getpid()}"
+        with open(tmp, "wb") as raw:
+            os.chmod(tmp, NATIVE_TRANSCRIPT_MODE)
+            if gid is not None:
+                os.chown(tmp, -1, gid)
+            # Tee: hash and count the bytes ACTUALLY fed to gzip (T-6118 R3). A resolver that hashed
+            # the source earlier can be stale if the live transcript grew since; the pointer must
+            # describe the bytes inside this .gz.
+            with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0, compresslevel=compresslevel) as gz, src.open("rb") as fin:
+                for block in iter(lambda: fin.read(1 << 20), b""):
+                    fed_digest.update(block)
+                    fed += len(block)
+                    gz.write(block)
+            raw.flush()
+            os.fsync(raw.fileno())
+        digest = hashlib.sha256()
+        with tmp.open("rb") as check:
+            for block in iter(lambda: check.read(1 << 20), b""):
+                digest.update(block)
+        nbytes = tmp.stat().st_size
+        os.replace(tmp, dest)
+        tmp = None
+        _fsync_dir(day_dir)
+    except ChronicleDurabilityError:
+        raise
+    except Exception as exc:
+        raise ChronicleDurabilityError(f"native transcript archive failed for {agent}: {exc!r}") from exc
+    finally:
+        if tmp is not None:
+            _cleanup_file(tmp)
+    return {"path": str(dest), "bytes": nbytes, "sha256": digest.hexdigest(), "source_bytes": fed,
+            "source_sha256": fed_digest.hexdigest()}
+
+
 def entries(agent: str, root: Path | None = None) -> list[dict]:
     """Parse this agent's index into ordered records (oldest first, as written).
     Returns [] if the index is absent/empty. Malformed lines are skipped."""
-    base = Path(root) if root is not None else CHRONICLE_ROOT
+    base = Path(root) if root is not None else _chronicle_root()
     index = base / agent / _INDEX_NAME
     try:
         raw = index.read_text(encoding="utf-8")
@@ -466,7 +588,7 @@ def entries(agent: str, root: Path | None = None) -> list[dict]:
 
 def snapshot_path(agent: str, entry: dict, root: Path | None = None) -> Path | None:
     """Resolve the archived .md path for an index entry (the file archive() wrote)."""
-    base = Path(root) if root is not None else CHRONICLE_ROOT
+    base = Path(root) if root is not None else _chronicle_root()
     ts, uuid = entry.get("ts", ""), entry.get("uuid", "")
     if not ts or not uuid:
         return None
@@ -515,7 +637,8 @@ def agent_dir_name(persona: str) -> str:
 
 
 def write_companion_text(agent: str, text: str, *, jsonl_uuid: str, ts: str,
-                         suffix: str, root: Path | None = None) -> Path:
+                         suffix: str, root: Path | None = None, mode: "int | None" = None,
+                         group: "str | None" = None) -> Path:
     """Write a small TEXT companion (``<ts>-<uuid>.<suffix>``, uncompressed)
     beside a snapshot, durably (write + fsync + rename + dir fsync).
 
@@ -526,6 +649,7 @@ def write_companion_text(agent: str, text: str, *, jsonl_uuid: str, ts: str,
     """
     base = Path(root) if root is not None else _chronicle_root()
     day_dir = base / agent / ts[:10]
+    gid = _resolve_gid(group)
     try:
         day_dir.mkdir(parents=True, exist_ok=True)
         stem = f"{_fs_safe_ts(ts)}-{jsonl_uuid}.{suffix}"
@@ -536,7 +660,7 @@ def write_companion_text(agent: str, text: str, *, jsonl_uuid: str, ts: str,
             n += 1
     except Exception as exc:
         raise ChronicleDurabilityError("companion directory preparation failed") from exc
-    written = _write_snapshot_required(dest, text)
+    written = _write_snapshot_required(dest, text, mode=mode, gid=gid)
     _verify_snapshot_readable(written, text)
     return written
 
@@ -567,7 +691,7 @@ def _cli_archive(args: argparse.Namespace) -> int:
     if not ts:
         from datetime import datetime, timezone
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    root = Path(args.root) if args.root else CHRONICLE_ROOT
+    root = Path(args.root) if args.root else _chronicle_root()
     # Explicit --uuid wins; else best-effort detect from --projects-dir; else "unknown".
     uuid = args.uuid or detect_session_uuid(args.projects_dir)
     snap = archive(agent, text, jsonl_uuid=uuid,
@@ -598,7 +722,7 @@ def _cli_companion(args: argparse.Namespace) -> int:
     if not ts:
         from datetime import datetime, timezone
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    root = Path(args.root) if args.root else CHRONICLE_ROOT
+    root = Path(args.root) if args.root else _chronicle_root()
     uuid = args.uuid or detect_session_uuid(args.projects_dir)
     dest = archive_companion(agent, args.source, jsonl_uuid=uuid,
                              ts=ts, suffix=args.suffix, root=root)

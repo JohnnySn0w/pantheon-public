@@ -280,6 +280,12 @@ class ProviderCompletionAssessment:
     pane_captures_path: str | None = None
     pane_captures_sha256: str | None = None
     pane_captures_error: str | None = None
+    # Subscription-cap metadata, populated when the provider-completion gate
+    # sees a structurally classified limit modal (T-6235).  These mirror the
+    # post-start assessment fields so the controller can retain the provider's
+    # real reset boundary instead of opening only its conservative cooldown.
+    cap_kind: str | None = None
+    reset_at: datetime | None = None
 
 
 @dataclass(frozen=True)

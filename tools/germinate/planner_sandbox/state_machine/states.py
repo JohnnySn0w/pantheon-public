@@ -3,12 +3,12 @@ state machine (ORG-080 §Base engine mechanics + §Parked-resume state
 machine) can hold, as proven reachable/closed by T-3293 (Tranche B).
 
 Reconciled against the ADR's literal 12-member schema-table enum
-(ORG-080 L296) with ONE collapse: `PARKING` is not modeled as a distinct
-member here -- the concrete 7-step parking transaction (ORG-080 L381-389,
+(ORG-080 run-state note §Run-record schema) with ONE collapse: `PARKING` is not modeled as a distinct
+member here -- the concrete 7-step parking transaction (ORG-080 run-state note §Handle-to-record parking transaction,
 "Handle-to-record parking transaction") never writes `state: PARKING`,
 only `PENDING_PARK` then `PARKED`; the schema table's own parenthetical
 step-citations are internally inconsistent (misattributes which
-transaction step writes which value). Per ORG-080 L58-77
+transaction step writes which value). Per ORG-080 C1-C5 (§Architectural-tier scope carve)
 (§Architectural-tier scope carve -- "the reference-implementation is free
 to demonstrate an equally-valid mechanism ... where documentary prose
 conflicts with the reference-implementation, the reference-implementation

@@ -965,6 +965,7 @@ class PrivateBusCase(unittest.TestCase):
 
     REGISTER_SUBJECT = True
     APPROVAL_UID_IS_CALLER = False
+    EXTRA_DRIVER_CONFIG: dict = {}
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -989,6 +990,7 @@ class PrivateBusCase(unittest.TestCase):
             "register_subject": cls.REGISTER_SUBJECT,
             "approval_uid": approval_uid,
         }
+        config.update(cls.EXTRA_DRIVER_CONFIG)
         config_path = os.path.join(cls.bus_dir, "driver.json")
         with open(config_path, "w", encoding="utf-8") as handle:
             json.dump(config, handle)
@@ -1434,6 +1436,84 @@ class UnregisteredUidBusTests(PrivateBusCase):
                 "subject_denied",
                 method,
             )
+
+
+@requires_private_bus
+class ApprovalGetDoesNotBlockTheLoopBusTests(PrivateBusCase):
+    """T-5644: a pending ApprovalGet must not stall the broker's main loop.
+
+    The driver serves a fake approval Consumer on the SAME main loop whose
+    ApprovalStatus reply is held until Release. A broker that blocked the
+    loop on the status call could never be answered, so Capabilities would
+    time out; every synchronisation here is an event (WaitPending), not a
+    sleep."""
+
+    EXTRA_DRIVER_CONFIG = {"slow_consumer": True}
+    HANDLE = "7" * 64
+
+    def _consumer_call(self, method: str, timeout: float):
+        return self.connection.call_blocking(
+            "org.pantheon.HostApproval1",
+            "/org/pantheon/HostApproval1",
+            "org.pantheon.Test.SlowConsumer",
+            method,
+            "",
+            (),
+            timeout=timeout,
+        )
+
+    def test_other_calls_complete_while_approval_get_is_pending(self) -> None:
+        import threading
+
+        import dbus.bus
+
+        outcome: dict = {}
+        approval_connection = dbus.bus.BusConnection(self.bus_address)
+
+        def approval_get() -> None:
+            try:
+                outcome["reply"] = approval_connection.call_blocking(
+                    wire.BUS_NAME,
+                    wire.OBJECT_PATH,
+                    wire.MANAGER_INTERFACE,
+                    "ApprovalGet",
+                    "s",
+                    (self.HANDLE,),
+                    timeout=20,
+                )
+            except Exception as exc:  # reported through the assertion below
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=approval_get, name="approval-get-caller")
+        worker.start()
+        try:
+            # event: the broker has sent ApprovalStatus and the fake holds it
+            self._consumer_call("WaitPending", timeout=10)
+            # the broker answers other callers promptly while it is pending
+            self.assertEqual(len(self._call("Capabilities", "", (), wire.MANAGER_INTERFACE)), 2)
+            self.assertEqual(len(self._call("Capabilities", "", (), wire.MANAGER_INTERFACE)), 2)
+            self.assertNotIn("reply", outcome)
+        finally:
+            self._consumer_call("Release", timeout=10)
+            worker.join(timeout=20)
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn("error", outcome)
+        state, payload = outcome["reply"]
+        self.assertEqual(str(state), "issued")
+        self.assertEqual(json.loads(str(payload))["approval_handle"], self.HANDLE)
+
+    def test_introspected_approval_get_signature_is_unchanged(self) -> None:
+        xml = self._call(
+            "Introspect", "", (), "org.freedesktop.DBus.Introspectable"
+        )
+        root = ElementTree.fromstring(str(xml))
+        manager = next(
+            node for node in root.findall("interface") if node.get("name") == wire.MANAGER_INTERFACE
+        )
+        method = next(node for node in manager.findall("method") if node.get("name") == "ApprovalGet")
+        args = [(a.get("name"), a.get("type"), a.get("direction")) for a in method.findall("arg")]
+        self.assertEqual(args[0], ("approval_handle", "s", "in"))
+        self.assertEqual([a[1:] for a in args], [("s", "in"), ("s", "out"), ("s", "out")])
 
 
 @requires_private_bus

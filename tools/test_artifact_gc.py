@@ -2,6 +2,7 @@
 """Tests for artifact_gc.py (T-1360) — the ticket-scoped evidence janitor."""
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+os.environ.setdefault("PANTHEON_DISABLE_LIVE_MAILBOX", "1")  # never the live hub (T-6370)
 from tools import artifact_gc as gc  # noqa: E402
 
 
@@ -298,6 +300,57 @@ class TestMainCli(unittest.TestCase):
         self.assertTrue(art.exists(), "--only tmp-targets must not sweep screenshots")
 
 
+class TestDigestRouting(unittest.TestCase):
+    """T-6370: the digest goes to the owner's mailbox, never to the operator's Telegram."""
+
+    def setUp(self) -> None:
+        self._tmp = __import__("tempfile").TemporaryDirectory()
+        self.repo = Path(self._tmp.name)
+        from types import SimpleNamespace
+        d = SimpleNamespace(action="remove", reason="ticket done 30d",
+                            workspace=self.repo / "echo-T-0009", size_bytes=2 * 1024 ** 3)
+        self.removed = gc.TmpSweepResult([d], [d], [])
+        self.nothing = gc.TmpSweepResult([], [], [])
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _main(self, tmp_result, *extra):
+        argv = ["--only", "tmp-targets", "--repo-root", str(self.repo),
+                "--tmp-root", str(self.repo), *extra]
+        with patch.object(gc, "sweep_tmp_targets", return_value=tmp_result), \
+                patch("urllib.request.urlopen", side_effect=AssertionError("no Telegram")):
+            return gc.main(argv)
+
+    def test_apply_with_removals_sends_owner_digest_only(self) -> None:
+        with patch.object(gc, "send_owner_digest") as send:
+            rc = self._main(self.removed, "--apply")
+        self.assertEqual(rc, 0)
+        send.assert_called_once()
+        self.assertIn("echo-T-0009", send.call_args.args[0])
+        self.assertEqual(send.call_args.kwargs["sender"], "artifact-gc")
+
+    def test_dry_run_delivers_nothing(self) -> None:
+        with patch.object(gc, "send_owner_digest") as send:
+            rc = self._main(self.removed)
+        self.assertEqual(rc, 0)
+        send.assert_not_called()
+
+    def test_nothing_removed_sends_nothing(self) -> None:
+        with patch.object(gc, "send_owner_digest") as send:
+            self._main(self.nothing, "--apply")
+        send.assert_not_called()
+
+    def test_owner_send_failure_is_loud(self) -> None:
+        with patch.object(gc, "send_owner_digest", side_effect=PermissionError("hub")):
+            rc = self._main(self.removed, "--apply")
+        self.assertEqual(rc, 1)
+
+    def test_no_operator_chat_id_left(self) -> None:
+        self.assertFalse(hasattr(gc, "TELEGRAM_CHAT_ID"))
+        self.assertNotIn("424242424", Path(gc.__file__).read_text())
+
+
 class TestDirSizeBytes(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = __import__("tempfile").TemporaryDirectory()
@@ -367,11 +420,12 @@ class TestFindLiveBuildPids(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def _make_proc(self, pid: str, comm: str, cwd_target: Path) -> None:
+    def _make_proc(self, pid: str, comm: str, cwd_target: Path, argv: list[str] | None = None) -> None:
         d = self.proc_root / pid
         d.mkdir()
         (d / "comm").write_text(f"{comm}\n", encoding="utf-8")
         (d / "cwd").symlink_to(cwd_target)
+        (d / "cmdline").write_bytes(b"\0".join(os.fsencode(a) for a in (argv or [comm])) + b"\0")
 
     def test_cargo_cwd_exactly_workspace_is_busy(self) -> None:
         self._make_proc("111", "cargo", self.workspace)
@@ -388,12 +442,24 @@ class TestFindLiveBuildPids(unittest.TestCase):
         pids = gc.find_live_build_pids(self.workspace, proc_root=self.proc_root)
         self.assertEqual(pids, [])
 
-    def test_cargo_cwd_outside_workspace_is_not_busy(self) -> None:
+    def test_same_owner_cargo_outside_workspace_is_busy_fail_closed(self) -> None:
         other = self.root / "elsewhere"
         other.mkdir()
         self._make_proc("444", "cargo", other)
         pids = gc.find_live_build_pids(self.workspace, proc_root=self.proc_root)
-        self.assertEqual(pids, [])
+        self.assertEqual(pids, [444])
+
+    def test_wrapper_argv_naming_target_is_busy_even_with_unrelated_comm_and_cwd(self) -> None:
+        """T-6206 regression: the real build parent did not expose a useful
+        cwd/fd, but its argv owned the absolute target directory."""
+        other = self.root / "elsewhere"
+        other.mkdir()
+        self._make_proc(
+            "445", "pytest", other,
+            ["pytest", "--cargo-target-dir", str(self.workspace / "target")],
+        )
+        pids = gc.find_live_build_pids(self.workspace, proc_root=self.proc_root)
+        self.assertEqual(pids, [445])
 
     def test_no_procs_is_not_busy(self) -> None:
         pids = gc.find_live_build_pids(self.workspace, proc_root=self.proc_root)
@@ -523,6 +589,7 @@ class TestClassifyTmp(unittest.TestCase):
         (self.proc_root / "999").mkdir()
         (self.proc_root / "999" / "comm").write_text("cargo\n", encoding="utf-8")
         (self.proc_root / "999" / "cwd").symlink_to(c.workspace)
+        (self.proc_root / "999" / "cmdline").write_bytes(b"cargo\0test\0")
         d = gc.classify_tmp(c, self.repo, timedelta(hours=48), NOW, proc_root=self.proc_root)
         self.assertEqual(d.action, "keep")
         self.assertIn("live build process", d.reason)
@@ -595,6 +662,31 @@ class TestSweepTmpTargets(unittest.TestCase):
         self.assertEqual([d.ticket_id for d in res.removed], ["T-0002"])
         self.assertTrue(old1.exists(), "failed removal must be left in place, not orphaned")
         self.assertFalse(old2.exists())
+
+    def test_build_starting_after_classification_blocks_rmtree(self) -> None:
+        """The destructive-boundary rescan catches the classify/size-walk race."""
+        target = self._seed("T-0001", "done", "2026-05-01T00:00:00Z")
+        real_size = gc._dir_size_bytes
+
+        def size_then_start(path: Path) -> int:
+            size = real_size(path)
+            proc = self.proc_root / "777"
+            proc.mkdir()
+            (proc / "comm").write_text("pytest\n", encoding="utf-8")
+            (proc / "cmdline").write_bytes(
+                b"pytest\0--target-dir\0" + os.fsencode(target) + b"\0"
+            )
+            (proc / "cwd").symlink_to(self.repo)
+            return size
+
+        with patch.object(gc, "_dir_size_bytes", side_effect=size_then_start):
+            res = gc.sweep_tmp_targets(
+                self.tmp_root, self.repo, timedelta(hours=48), NOW,
+                proc_root=self.proc_root, dry_run=False,
+            )
+        self.assertTrue(target.exists(), "a build started after classification; target must survive")
+        self.assertEqual(res.removed, [])
+        self.assertIn("delete boundary", res.decisions[0].reason)
 
 
 class TestBuildDigestMerged(unittest.TestCase):

@@ -16,22 +16,35 @@ gated op the engine derives, from the plan it is about to apply:
 
 * ``plan_handle`` / ``operation_handle`` -- sha256 of (plan digest, component,
   op id, gate id, scope), under distinct domain prefixes;
+* ``binding()`` -- the explicit record of what the grant authorizes: component,
+  op id, gate id, scope, op kind, the op's canonical spec digest and the
+  contract digest (T-5233);
 * the metadata tuple the approval side compares against the grant:
   owner = the invoking actor, performer, target = the scope, families = (op
-  kind,), plan digest, ``effect_digest`` = sha256(gate id, op id, scope) and
-  ``manifest_revision`` = the contract digest.
+  kind,), plan digest, ``effect_digest`` = sha256 over the canonical
+  ``binding()`` record (``germinate-effect/v2``) and ``manifest_revision`` =
+  the contract digest.
 
-The mapping to ORG-052's tuple is lossy for ``scope`` and ``gate`` (they ride
-inside ``target`` / ``effect_digest``); an explicit scope field in the grant
-tuple is a follow-up, gated before any live go.
+Scope and gate are bound, not lossy: the approval service binds only on
+``plan_handle`` equality, and the plan handle commits to both, so a grant
+issued for scope X or gate G1 is refused (``plan_mismatch``) for scope Y or gate
+G2. They are explicit in ``effect_digest`` (which also commits to the component
+and op content, so two components can never share one), in the reviewer-facing
+``summary()``, in the ``grant.bound`` transcript event and in each op's
+pantheon-receipt ``authority`` field. ORG-052's ``PlanMetadata`` wire is
+unchanged (``"s" -> "ssssssss"``), so the approval POLICY still sees scope only
+as ``target`` and the gate not at all; a gate-keyed policy needs an ORG-052 §5
+amendment (optional; not built here). A bound grant replays (``bound_replay``)
+for the identical tuple only until its ``expires_at``.
 
 Fail-closed edges (each tested): no consumer wired; a gated op with no handle;
 a malformed handle; any denial (closed reason code); any consumer exception
 (outage, metadata unavailable); a malformed outcome. Handles are validated for
 ALL gated ops before any bind, and binds run last in the gate check, so a
 refusal elsewhere never burns a grant. The operation handle is deterministic, so
-a resumed apply replays the original binding (``bound_replay``) without a
-second grant.
+a resumed apply within the grant's expiry replays the original binding
+(``bound_replay``) without a second grant; after expiry the replay is denied
+(``expired``) and a new grant is needed.
 
 Secrets. Handles are read from a mode-0600 file the invoking uid owns (opened
 ``O_NOFOLLOW``, size-capped); they are never in argv, the transcript, receipts
@@ -41,6 +54,7 @@ or error text. Only ``authority_record_id`` is recorded.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -52,7 +66,8 @@ _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 MAX_GRANT_FILE_BYTES = 65536
 _PLAN_PREFIX = b"germinate-plan/v1\0"
 _OP_PREFIX = b"germinate-op/v1\0"
-_EFFECT_PREFIX = b"germinate-effect/v1\0"
+_EFFECT_PREFIX = b"germinate-effect/v2\0"
+BINDING_SCHEMA = "germinate-grant-binding/v1"
 
 
 class GrantRefused(Exception):
@@ -74,6 +89,16 @@ def _h(prefix: bytes, *parts: str) -> str:
     return hashlib.sha256(prefix + "\0".join(parts).encode("utf-8")).hexdigest()
 
 
+def _canonical(obj: Any) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")
+
+
+def op_spec_digest(op: Any) -> str:
+    """sha256 over the operation's canonical JSON (every execution-affecting field of the op)."""
+
+    return hashlib.sha256(_canonical(op.to_json_obj())).hexdigest()
+
+
 @dataclass(frozen=True)
 class GrantRequest:
     """What one independent-agent gated operation needs a grant for."""
@@ -87,6 +112,7 @@ class GrantRequest:
     contract_digest: str
     actor: str
     performer: str
+    op_spec_digest: str  # 64 hex: op_spec_digest(op)
 
     @property
     def _parts(self) -> tuple[str, ...]:
@@ -100,9 +126,28 @@ class GrantRequest:
     def operation_handle(self) -> str:
         return _h(_OP_PREFIX, *self._parts)
 
+    def binding(self) -> dict[str, str]:
+        """The explicit record this grant authorizes (actor-free: ORG-052 §4 effect digest excludes owner/performer)."""
+
+        return {
+            "schema": BINDING_SCHEMA,
+            "component": self.component,
+            "op_id": self.op_id,
+            "gate_id": self.gate_id,
+            "scope": self.scope,
+            "kind": self.kind,
+            "op_spec_digest": self.op_spec_digest,
+            "contract_digest": self.contract_digest,
+        }
+
     @property
     def effect_digest(self) -> str:
-        return _h(_EFFECT_PREFIX, self.gate_id, self.op_id, self.scope)
+        return hashlib.sha256(_EFFECT_PREFIX + _canonical(self.binding())).hexdigest()
+
+    def summary(self) -> str:
+        """Bounded canonical JSON for the approval ``PlanSummary`` seam: names the gate and scope to the reviewer."""
+
+        return _canonical(dict(self.binding(), plan_digest=self.plan_digest, effect_digest=self.effect_digest)).decode("ascii")
 
     def metadata_fields(self, policy_revision: str) -> dict[str, Any]:
         """The ORG-052 ``PlanMetadata`` fields for this operation (the approval-side seam builds the value)."""
@@ -132,7 +177,10 @@ def derive_requests(merged: Any, contracts: Mapping[str, Any], *, actor: str, pe
             if contract.gates[op.gate].approval_class != "independent-agent":
                 continue
             out.append(
-                GrantRequest(node.component, op.operation_id, op.gate, op.kind, node.scope, digest, contract.digest, actor, performer)
+                GrantRequest(
+                    node.component, op.operation_id, op.gate, op.kind, node.scope, digest, contract.digest, actor, performer,
+                    op_spec_digest(op),
+                )
             )
     return out
 
@@ -180,7 +228,7 @@ def consume(
     handles: Mapping[str, str] | None,
     consumer: GrantConsumer | None,
 ) -> list[dict[str, str]]:
-    """Bind one grant per request, fail closed. Returns ``[{op_id, gate, authority_record_id}]`` (no handles)."""
+    """Bind one grant per request, fail closed. Returns ``[{component, op_id, gate, scope, authority_record_id}]`` (no handles)."""
 
     if not requests:
         return []
@@ -206,5 +254,7 @@ def consume(
             raise GrantRefused("grant-refused", f"{req.op_id}: grant denied ({reason if isinstance(reason, str) else 'unknown'})")
         if not (isinstance(record_id, str) and _HEX64.match(record_id)):
             raise GrantRefused("grant-refused", f"{req.op_id}: the grant source returned no authority record")
-        bound.append({"op_id": req.op_id, "gate": req.gate_id, "authority_record_id": record_id})
+        bound.append(
+            {"component": req.component, "op_id": req.op_id, "gate": req.gate_id, "scope": req.scope, "authority_record_id": record_id}
+        )
     return bound

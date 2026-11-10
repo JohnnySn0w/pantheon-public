@@ -152,5 +152,31 @@ class ToolSchemaBudgetTests(unittest.TestCase):
         json.dumps(payload)
 
 
+class HighFdCeilingTests(unittest.TestCase):
+    """T-5872: _ask_jsonrpc must work when the server pipe fd is >= 1024."""
+
+    def test_ask_jsonrpc_with_pipe_fd_above_1024(self) -> None:
+        import subprocess
+        import sys
+
+        from tools._test_fixtures import fds_above_select_ceiling
+        code = (
+            "import sys,json\n"
+            "m=json.loads(sys.stdin.readline())\n"
+            "print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'ok':1}}),flush=True)\n"
+        )
+        with fds_above_select_ceiling():
+            proc = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+            try:
+                self.assertGreaterEqual(proc.stdout.fileno(), 1024)
+                reply = tsb._ask_jsonrpc(proc, {"jsonrpc": "2.0", "id": 7, "method": "x"}, timeout=10)
+                self.assertEqual(reply["result"], {"ok": 1})
+            finally:
+                proc.stdin.close()
+                proc.stdout.close()
+                proc.wait(timeout=10)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -197,6 +197,9 @@ FRONT_MATTER_FIELD_ORDER = (
     # existing flow-list serializer unchanged — no new frontmatter shape.
     "receipts",
     "labels",
+    # T-5715 / ORG-078 Amendment 1: optional intra-tier ordering. Lower
+    # integers sort first, but only after the label/dependency-derived tier.
+    "tier_rank",
     "stale_after",
     "not_before",
     # T-2833: the mandatory justification for a not_before date gate. Registered
@@ -273,6 +276,7 @@ OPTIONAL_FRONT_MATTER = (
     "no_file_reason",  # T-5014
     "receipts",  # T-2842 / ORG-065 BT2
     "labels",
+    "tier_rank",  # T-5715 / ORG-078 Amendment 1
     "stale_after",
     "not_before",
     "not_before_anchor",  # T-2833
@@ -526,6 +530,14 @@ class AppetiteOverrunNotResolvable(TicketRefusal):
     (D-P)."""
 
 
+class SopStubNotFilled(TicketRefusal):
+    """T-4680: `resolve` refused because the ticket is labelled `sop:<stem>`
+    while sop/standard/<stem>.md is still a STUB that did not change in the
+    ticket's arc (writing-sops-from-first-use.md step 3). Remedy: fill the
+    stub's First-run section, cite the filling commit with --sop-updated, or
+    waive with --sop-no-change '<why>'."""
+
+
 # ---------------------------------------------------------------------------
 # Small utilities
 # ---------------------------------------------------------------------------
@@ -724,6 +736,51 @@ def _check_ratifiable_resolve(entries: list[str]) -> None:
                 f"warning: could not verify ratifiable_files entry {entry!r} "
                 f"(repo {repo!r} not resolvable locally); allowing (T-5014)",
                 file=sys.stderr,
+            )
+
+
+# T-6071 / ORG-015 exclusion list: document classes that MUST NOT be a NEW
+# ratifiable_files target. Enforced ONLY where a target is created or added
+# (cmd_file, cmd_retarget, cmd_attach) via _refuse_excluded_ratifiable_class.
+# _parse_ratifiable_files stays syntax-only and stored values are never
+# re-checked, so the grandfathered tickets still transition; ticket_lint WARNs
+# on them via the same classifier (single source, no drift).
+_ORG015_EXCLUDED_CLASSES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("notes/", re.compile(r"^notes/")),
+    ("ledger (jsonl)", re.compile(r"^ledger/.*\.jsonl$")),
+    ("tickets/", re.compile(r"^tickets/(?:inbox|active|blocked|done)/T-\d+\.md$")),
+    ("incidents/", re.compile(r"^incidents/")),
+    ("bugs/", re.compile(r"^bugs/.+\.md$")),
+    ("lessons/", re.compile(r"^lessons/.+\.md$")),
+    ("knowledge/watch/reports/", re.compile(r"^knowledge/watch/reports/")),
+    ("knowledge/episodic/", re.compile(r"^knowledge/episodic/")),
+    ("README.md", re.compile(r"(?:^|/)README\.md$")),
+    ("source code", re.compile(
+        r"\.(?:py|ts|tsx|js|jsx|mjs|rs|go|sh|java|c|h|cpp|rb)$")),
+)
+
+
+def ratifiable_excluded_class(entry: str) -> str | None:
+    """Return the ORG-015 excluded class name for a ``<repo>:<path>`` entry, or None."""
+    path = entry.split(":", 1)[1] if ":" in entry else entry
+    for name, rx in _ORG015_EXCLUDED_CLASSES:
+        if rx.search(path):
+            return name
+    return None
+
+
+def _refuse_excluded_ratifiable_class(entries: list[str]) -> None:
+    """T-6071: refuse a NEW ratifiable_files target in an ORG-015 excluded class."""
+    for entry in entries:
+        cls = ratifiable_excluded_class(entry)
+        if cls is not None:
+            raise TicketRefusal(
+                f"ratifiable_files entry {entry!r} is in an excluded class "
+                f"({cls}): ORG-015 says this class is not a valid ratification "
+                "target. Fix: promote the content to an allowed class (an ADR "
+                "under architecture/adr/, rulebook/policies/, sop/standard/, "
+                "sop/remediation/, or rulebook principles/directives) and attach "
+                "that path instead (T-6071)"
             )
 
 
@@ -2005,9 +2062,9 @@ def _build_commit_message(verb: str, tid: str, title: str | None, detail: str | 
         if detail:
             short = detail if len(detail) <= 60 else detail[:57] + "..."
             subject = f"tickets: label remove {tid} — {short}"
-    elif verb in ("re-earn", "drop", "adjust-appetite", "reopen"):
-        # T-3440 / ORG-089: the four re-decision verbs. Subject names the verb;
-        # full rationale/reason lands in the body when truncated (see below).
+    elif verb in ("re-earn", "drop", "adjust-appetite", "reopen", "tier-rank"):
+        # Rationale-bearing in-place decisions. Subject names the verb; full
+        # rationale/reason lands in the body when truncated (see below).
         subject = f"tickets: {verb} {tid}"
         if detail:
             short = detail if len(detail) <= 60 else detail[:57] + "..."
@@ -2033,7 +2090,7 @@ def _build_commit_message(verb: str, tid: str, title: str | None, detail: str | 
     # so the audit chain retains the unabbreviated reason / summary.
     if verb in ("block", "resolve", "retarget", "attach", "close-noodle", "close-action",
                 "label-add", "label-remove",
-                "re-earn", "drop", "adjust-appetite", "reopen") \
+                "re-earn", "drop", "adjust-appetite", "reopen", "tier-rank") \
             and detail and len(detail) > 60:
         body_parts.append(detail)
     if verb in ("clear-operator-intent", "security-accept", "security-reject") and detail:
@@ -3408,6 +3465,7 @@ def cmd_file(args: argparse.Namespace) -> int:
     _pre_files = _parse_ratifiable_files(
         [e.strip() for e in (getattr(args, "ratifiable_file", None) or [])]
     )
+    _refuse_excluded_ratifiable_class(_pre_files)  # T-6071 / ORG-015
     no_file_reason = _operator_attachment_gate(
         target, _pre_files, getattr(args, "no_file", None),
         fix_prefix="ticket.py file",
@@ -4405,8 +4463,7 @@ def _do_transition(
             if verb == "resolve":
                 ratify_intent = fields.get("intent") == "ratify"
                 ratifiable_files_list = fields.get("ratifiable_files") or []
-                summary_str = (detail or "").lstrip()
-                is_reject = summary_str.startswith("Rejected:")
+                is_reject = _is_reject_note(detail)
                 if ratify_intent and ratifiable_files_list and not is_reject:
                     lift_warnings: list[str] = []
                     lift_paths = _apply_ratify_lift(
@@ -5217,6 +5274,244 @@ def _refuse_resolve_if_overrun(tid: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# T-4680: first-use SOP capture gate (writing-sops-from-first-use.md step 3).
+# A ticket labelled `sop:<stem>` performs an operation whose SOP may still be a
+# STUB. Resolve is refused while sop/standard/<stem>.md is a STUB that did not
+# change in the ticket's arc, unless --sop-updated <sha> names a landed commit
+# that touched it or --sop-no-change '<why>' waives it (recorded in the note).
+# ---------------------------------------------------------------------------
+
+SOP_LABEL_PREFIX = "sop:"
+SOP_STEM_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+# `**Status:** X` or `**Status**: X` in the body; `status: X` in YAML frontmatter.
+SOP_STATUS_RE = re.compile(r"^\*\*Status(?::\*\*|\*\*:)\s*(.*)$", re.IGNORECASE)
+SOP_FM_STATUS_RE = re.compile(r"^status:\s*(.*)$", re.IGNORECASE)
+SOP_STUB_VALUE_RE = re.compile(r"^[\s*]*stub\b", re.IGNORECASE)
+SOP_FIRST_RUN_PREFIX = "## First run"
+REJECT_NOTE_PREFIX = "Rejected:"
+
+
+def _is_reject_note(detail: str | None) -> bool:
+    """T-0641: a resolve note starting with "Rejected:" is pantheon-pwa's
+    /reject route (artifact rejection), not a completed piece of work. Shared
+    by the ratify-lift carve-out and the T-4680 SOP gate exemption."""
+    return (detail or "").lstrip().startswith(REJECT_NOTE_PREFIX)
+
+
+def _sop_git(*args: str) -> "subprocess.CompletedProcess | None":
+    """Run a read-only git query in REPO_ROOT. None on OSError/timeout, so a
+    git failure reads as "no evidence" (the gate then refuses, fail-closed,
+    with the waiver as the way out)."""
+    import subprocess
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=str(REPO_ROOT),
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _sop_labels(fields: dict) -> list[str]:
+    labels = fields.get("labels") or []
+    if isinstance(labels, str):
+        labels = [x.strip() for x in labels.split(",")]
+    out = []
+    for lab in labels:
+        lab = str(lab).strip()
+        if lab.startswith(SOP_LABEL_PREFIX):
+            out.append(lab[len(SOP_LABEL_PREFIX):].strip())
+    return out
+
+
+def _sop_stub_status(text: str) -> tuple[bool, int | None]:
+    """(is_stub, first_run_line).
+
+    The FIRST status line outside ``` code fences wins: a YAML frontmatter
+    `status: X`, or a body `**Status:** X` / `**Status**: X`. It is a STUB
+    when X starts with the word STUB, case-insensitively, after optional
+    `*`/whitespace (step 4: "the status line starts with STUB"); a mid-line
+    STUB (a partly-stubbed ratified SOP) does not count, and a file with no
+    status line is not a STUB. first_run is the line of the first
+    `## First run` heading outside fences, or None."""
+    lines = text.splitlines()
+    status: str | None = None
+    first_run = None
+    in_fence = False
+    in_fm = bool(lines) and lines[0].strip() == "---"
+    for n, line in enumerate(lines, start=1):
+        if in_fm:
+            if n > 1 and line.strip() in ("---", "..."):
+                in_fm = False
+                continue
+            m = SOP_FM_STATUS_RE.match(line.strip())
+            if status is None and m:
+                status = m.group(1).strip().strip("'\"")
+            continue
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if status is None:
+            m = SOP_STATUS_RE.match(line.strip())
+            if m:
+                status = m.group(1)
+        if first_run is None and line.startswith(SOP_FIRST_RUN_PREFIX):
+            first_run = n
+    is_stub = status is not None and SOP_STUB_VALUE_RE.match(status) is not None
+    return is_stub, first_run
+
+
+def _ticket_id_in(tid: str, message: str) -> bool:
+    return re.search(rf"(?<![\w-]){re.escape(tid)}(?![\w-])", message) is not None
+
+
+def _sop_changed_in_arc(tid: str, rel: str) -> bool:
+    """True when a commit that MODIFIED `rel` (--diff-filter=M: the commit
+    that creates the stub is not a fill, review MED-1) names `tid` as a whole
+    token in its message (subject OR body: a squash merge may carry the id
+    only in its PR body)."""
+    res = _sop_git("log", "--diff-filter=M", "--format=%H%x00%B%x1e", "--", rel)
+    if res is None or res.returncode != 0:
+        return False
+    for rec in res.stdout.split("\x1e"):
+        _, _, msg = rec.partition("\x00")
+        if _ticket_id_in(tid, msg):
+            return True
+    return False
+
+
+def _check_sop_updated_sha(tid: str, sha: str, rel: str) -> str:
+    """Validate --sop-updated: a real commit, on HEAD, that MODIFIED `rel`
+    (a commit that only adds it is the stub's creation, not a fill).
+    Returns the short sha; raises SopStubNotFilled otherwise."""
+    res = _sop_git("rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}")
+    if res is None or res.returncode != 0 or not res.stdout.strip():
+        raise SopStubNotFilled(
+            f"resolve refused: {tid} --sop-updated {sha!r} is not a commit in this "
+            f"repo (T-4680)."
+        )
+    full = res.stdout.strip()
+    anc = _sop_git("merge-base", "--is-ancestor", full, "HEAD")
+    if anc is None or anc.returncode != 0:
+        raise SopStubNotFilled(
+            f"resolve refused: {tid} --sop-updated {sha} is not on HEAD, so the SOP "
+            f"fill has not landed. Resolve after the merge lands; the squash sha is "
+            f"the one to cite (T-4680)."
+        )
+    res = _sop_git("diff-tree", "--root", "--no-commit-id", "--name-status", "-r", full)
+    rows = res.stdout.splitlines() if res is not None and res.returncode == 0 else []
+    if not rows:
+        raise SopStubNotFilled(
+            f"resolve refused: {tid} --sop-updated {sha} lists no changed files (a "
+            f"merge commit?). Cite the squash commit, or the underlying commit that "
+            f"filled {rel} (T-4680)."
+        )
+    statuses = {parts[-1]: parts[0] for parts in (r.split("\t") for r in rows) if len(parts) >= 2}
+    st = statuses.get(rel)
+    if st is None:
+        raise SopStubNotFilled(
+            f"resolve refused: {tid} --sop-updated {sha} does not touch {rel}. Cite "
+            f"the commit that filled the SOP's First-run section (T-4680)."
+        )
+    if not st.startswith("M"):
+        raise SopStubNotFilled(
+            f"resolve refused: {tid} --sop-updated {sha} only adds {rel} (status "
+            f"{st}): that is the stub's creation, not a fill. Cite the commit that "
+            f"filled its First-run section (T-4680)."
+        )
+    return full[:10]
+
+
+def _refuse_resolve_if_sop_stub(
+    tid: str, sop_updated: str | None, sop_no_change: str | None,
+    detail: str | None = None,
+) -> list[str]:
+    """T-4680 gate. Returns resolve-note fragments to append to --with
+    (waivers and cited shas); raises SopStubNotFilled on refusal.
+
+    Fail-fast BEFORE the lock/git-mv, like _refuse_resolve_if_overrun. Cost on
+    a ticket with no `sop:` label: one extra ticket read, and no git or
+    subprocess call (pinned by test). An unreadable ticket is let through (not
+    this gate's job, same posture as the overrun guard). A "Rejected:" resolve
+    (T-0641, the pantheon-pwa /reject route) is exempt: a rejected run is not a
+    completed first run with a procedure to record (review MED-2)."""
+    waiver = None
+    if sop_no_change is not None:
+        waiver = sop_no_change.strip()
+        if not waiver:
+            raise SopStubNotFilled(
+                f"resolve refused: {tid} --sop-no-change needs a non-empty reason "
+                f"(say why the run taught nothing new; T-4680)."
+            )
+    if _is_reject_note(detail):
+        return []
+    try:
+        fields = parse_ticket(_find_ticket(tid)).fields
+    except Exception:
+        return []
+    stems = _sop_labels(fields)
+    if not stems:
+        return []
+
+    notes: list[str] = []
+    for stem in stems:
+        if not SOP_STEM_RE.match(stem):
+            raise SopStubNotFilled(
+                f"resolve refused: {tid} label sop:{stem} is not a valid SOP file "
+                f"stem (lowercase letters, digits, '.', '_', '-'). Fix the label "
+                f"(T-4680)."
+            )
+        rel = f"sop/standard/{stem}.md"
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            if waiver is not None:
+                notes.append(f"sop-no-change({stem}): {waiver}")
+                continue
+            raise SopStubNotFilled(
+                f"resolve refused: {tid} is labelled sop:{stem} but {rel} does not "
+                f"exist. Fix the label, or pass --sop-no-change '<why>' "
+                f"(writing-sops-from-first-use.md step 2; T-4680)."
+            )
+        try:
+            is_stub, first_run = _sop_stub_status(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError) as exc:
+            # Fail-closed (review LOW-3): an unreadable SOP cannot be shown to
+            # be filled. The waiver stays the way out, as for a missing file.
+            if waiver is not None:
+                notes.append(f"sop-no-change({stem}): {waiver}")
+                continue
+            raise SopStubNotFilled(
+                f"resolve refused: {tid} is labelled sop:{stem} but {rel} could not "
+                f"be read as UTF-8 text ({type(exc).__name__}). Fix the file, or "
+                f"pass --sop-no-change '<why>' (T-4680)."
+            ) from exc
+        if not is_stub:
+            continue
+        if sop_updated is not None:
+            short = _check_sop_updated_sha(tid, sop_updated, rel)
+            notes.append(f"sop-updated({stem}): {short}")
+            continue
+        if _sop_changed_in_arc(tid, rel):
+            continue
+        if waiver is not None:
+            notes.append(f"sop-no-change({stem}): {waiver}")
+            continue
+        where = f"{rel}:{first_run}" if first_run else rel
+        raise SopStubNotFilled(
+            f"resolve refused: {tid} is labelled sop:{stem} but {rel} is still a "
+            f"STUB and did not change in this ticket's arc (no commit mentioning "
+            f"{tid} modifies it). Fill its \"{SOP_FIRST_RUN_PREFIX}\" section "
+            f"({where}) with the steps actually taken, then resolve; or pass "
+            f"--sop-updated <sha> for the landed commit that filled it, or "
+            f"--sop-no-change '<why>' if the run taught nothing new "
+            f"(writing-sops-from-first-use.md step 3; T-4680)."
+        )
+    return notes
+
+
 def _resolve_field_updates_for_awaiting_merge(tid: str) -> dict | None:
     """T-4119: when resolving a ticket in `substate: awaiting-merge`, strip both
     the substate and its `awaiting_merge_ref` pointer in the SAME atomic write
@@ -5345,6 +5640,16 @@ def cmd_resolve(args: argparse.Namespace) -> int:
     _warn_unmet_deps(args.ticket, "resolving")
     # T-3440 / ORG-089 §Decision.4: refuse resolve on appetite-overrun (typed).
     _refuse_resolve_if_overrun(args.ticket)
+    # T-4680: first-use SOP capture gate. Waivers / cited shas ride the
+    # resolve note (appended, so a leading "Rejected:" is preserved).
+    sop_notes = _refuse_resolve_if_sop_stub(
+        args.ticket,
+        getattr(args, "sop_updated", None),
+        getattr(args, "sop_no_change", None),
+        detail,
+    )
+    if sop_notes:
+        detail = "; ".join([detail] + sop_notes) if detail else "; ".join(sop_notes)
     # T-2842 / ORG-065 BT2: validate --receipt entries fail-fast, BEFORE
     # _do_transition (same "abort before touching the lock/git-mv" posture
     # as every other file-time/transition-time shape check).
@@ -5552,6 +5857,70 @@ def cmd_adjust_appetite(args: argparse.Namespace) -> int:
         no_push=getattr(args, "no_push", False),
         require_overrun=False, clear_overrun=True,
     )
+
+
+def cmd_tier_rank(args: argparse.Namespace) -> int:
+    """Set or clear a ticket's optional intra-tier ordering rank (T-5715)."""
+    reason = (getattr(args, "reason", None) or "").strip()
+    if not reason:
+        raise TicketRefusal("tier-rank requires a non-empty --reason")
+
+    clear = bool(getattr(args, "clear", False))
+    raw_rank = getattr(args, "rank", None)
+    if clear == (raw_rank is not None):
+        raise TicketRefusal("tier-rank requires exactly one of --rank INT or --clear")
+    rank: int | None = None
+    if raw_rank is not None:
+        raw_text = str(raw_rank)
+        if re.fullmatch(r"-?[0-9]+", raw_text) is None:
+            raise TicketRefusal("tier-rank --rank must be an integer")
+        rank = int(raw_text)
+
+    pre = _find_ticket(args.ticket)
+    if pre.parent.name == "done":
+        raise TicketRefusal(
+            f"tier-rank refused: {args.ticket} is in done/ (terminal); "
+            "ordering only applies to open work"
+        )
+
+    with git_mutation_lock(label=f"tier-rank {args.ticket}"):
+        _pull_if_needed(getattr(args, "no_push", False))
+        path = _find_ticket(args.ticket)
+        if path.parent.name == "done":
+            raise TicketRefusal(
+                f"tier-rank refused: {args.ticket} moved to done/ before the lock; "
+                "nothing changed"
+            )
+        fields, body = parse_front_matter(path.read_text(encoding="utf-8"))
+        old_fields = _fm_snapshot(fields)
+        old_rank = _tier_rank(fields)
+
+        if clear:
+            if "tier_rank" not in fields:
+                print(f"tier-rank {args.ticket}: already absent; no change")
+                return 0
+            fields.pop("tier_rank", None)
+            old_rank_text = str(old_rank) if old_rank is not None else "invalid"
+            detail = f"tier_rank {old_rank_text} removed; reason: {reason}"
+            log_verb = "tier-rank-cleared"
+        else:
+            fields["tier_rank"] = rank
+            detail = f"tier_rank -> {rank}; reason: {reason}"
+            log_verb = "tier-ranked"
+
+        body = append_transition(body, _actor(), log_verb, detail)
+        path.write_text(
+            _build_ticket_text(fields, body, old_fields=old_fields), encoding="utf-8"
+        )
+        commit_message = _build_commit_message(
+            "tier-rank", args.ticket, None, detail
+        )
+        _commit_and_push(
+            [path], commit_message, no_push=getattr(args, "no_push", False)
+        )
+
+    print(f"tier-rank {args.ticket}: {detail}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -6004,7 +6373,12 @@ def _preflight_child_ticket(
     _spawn_child_ticket will write, built by the same _child_ticket_fields.
     `parent_fields` is the parent as read now: the fields the child inherits
     (project_id, serves) are not changed by the parent's own transition.
-    The real spawn still runs the check (belt and braces)."""
+    The real spawn still runs the check (belt and braces).
+
+    T-4762 (T-4760 r1 NIT-1): only refuse mode can block, so this is a no-op
+    otherwise; warn-mode findings print once, from the real spawn's build."""
+    if _fm_registry is None or _fm_registry.get_mode() != "refuse":
+        return
     _check_frontmatter_registry(
         _child_ticket_fields(
             tid=f"{parent_tid}-child", parent_tid=parent_tid,
@@ -7182,6 +7556,7 @@ def cmd_retarget(args: argparse.Namespace) -> int:
     _rt_new_files = _parse_ratifiable_files(
         [e.strip() for e in (getattr(args, "ratifiable_file", None) or [])]
     )
+    _refuse_excluded_ratifiable_class(_rt_new_files)  # T-6071 / ORG-015
     _rt_no_file = _operator_attachment_gate(
         new_target, _rt_new_files, getattr(args, "no_file", None),
         fix_prefix=f"ticket.py retarget {args.ticket} --to operator",
@@ -7392,6 +7767,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
     new_files = _parse_ratifiable_files(
         [e.strip() for e in (getattr(args, "ratifiable_file", None) or [])]
     )
+    _refuse_excluded_ratifiable_class(new_files)  # T-6071 / ORG-015
     raw_reason = getattr(args, "no_file", None)
     has_reason_arg = isinstance(raw_reason, str) and bool(raw_reason.strip())
     if not new_files and not has_reason_arg:
@@ -7796,8 +8172,12 @@ def cmd_lint_frontmatter(args: argparse.Namespace) -> int:
     keys, out-of-enum values, legacy-field use — with counts + example ids.
 
     Scans tickets/{inbox,active,done}/T-*.md; files without frontmatter are
-    skipped. Exit 0 always (it is a report); --strict exits 1 on any finding
-    or when the registry is unavailable (the S2 gate shape).
+    skipped. Exit 0 always (it is a report); --strict exits 1 on an
+    unknown-field, a bad-value, or an unavailable registry (the S2 CI gate).
+    T-4762: legacy-field use on stored tickets is printed as info and never
+    fails --strict (old tickets are immutable history). A hand-added legacy
+    field is therefore NOT caught by this lint, only at write time (refuse
+    mode via ticket.py).
 
     T-4760 (e): any UNEXPECTED error from the registry module is caught and
     handled like an unavailable registry (one WARN + exit 0; --strict: exit 1
@@ -7860,7 +8240,7 @@ def _lint_frontmatter_impl(args: argparse.Namespace) -> int:
             print(f"  {label}: {by_kind[kind]}")
     for (kind, fname, value), ids in sorted(
             groups.items(), key=lambda kv: (kv[0][0], -len(kv[1]), kv[0][1])):
-        label = "legacy-field use" if kind == "legacy-write" else kind
+        label = "legacy-field use (info)" if kind == "legacy-write" else kind
         what = f"{fname}: {value}" if value is not None else fname
         ex = ", ".join(ids[:_LINT_FRONTMATTER_EXAMPLES])
         more = f" (+{len(ids) - _LINT_FRONTMATTER_EXAMPLES} more)" if len(ids) > _LINT_FRONTMATTER_EXAMPLES else ""
@@ -7868,7 +8248,7 @@ def _lint_frontmatter_impl(args: argparse.Namespace) -> int:
     if unparseable:
         ex = ", ".join(unparseable[:_LINT_FRONTMATTER_EXAMPLES])
         print(f"  unparseable frontmatter (skipped): {len(unparseable)}: {ex}")
-    if args.strict and total:
+    if args.strict and (by_kind.get("unknown-field") or by_kind.get("bad-value")):
         return 1
     return 0
 
@@ -8650,13 +9030,16 @@ class _PriorityInfo:
     this ticket))`. `elevated_by` — the direct-dependent ticket id that
     supplied `effective_rank`, set ONLY on a STRICT improvement
     (`effective_rank < own_rank`); None otherwise (own rank stands even on a
-    tie — a tie doesn't need to borrow credit from a dependent).
+    tie — a tie doesn't need to borrow credit from a dependent). `tier_rank`
+    is the optional per-ticket intra-tier key; it is never inherited and never
+    participates before `effective_rank`.
     """
 
     own_rank: float
     matched_label: str | None
     effective_rank: float
     elevated_by: str | None
+    tier_rank: int | None
 
 
 def _own_priority_rank(
@@ -8685,6 +9068,23 @@ def _effective_queue_ts(fields: dict) -> str:
     (`%Y-%m-%dT%H:%M:%SZ`), so plain string comparison sorts correctly with
     no datetime parsing needed."""
     return str(fields.get("retargeted_at") or fields.get("created") or "")
+
+
+def _tier_rank(fields: dict) -> int | None:
+    """Return a valid optional intra-tier rank; malformed legacy data is inert."""
+    raw = fields.get("tier_rank")
+    if isinstance(raw, bool) or raw is None:
+        return None
+    text = str(raw)
+    if re.fullmatch(r"-?[0-9]+", text) is None:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        # Python bounds decimal-string conversion to protect against hostile
+        # input. Optional rank metadata beyond that limit is malformed and
+        # must stay inert rather than taking down a read-only queue listing.
+        return None
 
 
 def _build_depends_on_graph(tickets_root: Path) -> dict[str, list[str]]:
@@ -8742,11 +9142,13 @@ def _compute_priority_info(
     """
     own_rank: dict[str, float] = {}
     matched_label: dict[str, str | None] = {}
+    tier_rank: dict[str, int | None] = {}
     for t in tickets:
         tid = t.fields.get("id") or t.path.stem
         rank, label = _own_priority_rank(t.fields.get("labels"), rank_map)
         own_rank[tid] = rank
         matched_label[tid] = label
+        tier_rank[tid] = _tier_rank(t.fields)
 
     # dependents_of[Y] = [X, ...] where X's depends_on contains Y (X depends
     # on Y). in_degree[Y] = len(dependents_of[Y]) = count of Y's not-yet-
@@ -8797,6 +9199,7 @@ def _compute_priority_info(
             matched_label=matched_label[tid],
             effective_rank=effective_rank[tid],
             elevated_by=elevated_by[tid],
+            tier_rank=tier_rank[tid],
         )
         for tid in own_rank
     }
@@ -8979,6 +9382,10 @@ def _priority_list_semantic_drift(
         hist_tickets = per_label_hist[label]
         recent_tickets = per_label_recent[label]
         historical_arcs = {_parent_chain_root(t, by_id) for t in hist_tickets}
+        if not historical_arcs:
+            # Young label (T-6239): no history to drift from, so every recent
+            # ticket would trivially count as "novel". Not a drift signal.
+            continue
         if len(historical_arcs) > arc_threshold:
             continue
         novel_ids: list[str] = []
@@ -9026,6 +9433,14 @@ def _priority_list_validate_report() -> tuple[int, list[str]]:
     except priority_list_parse.PriorityListParseError as exc:
         return 1, [str(exc)]
 
+    try:
+        expected_broad = priority_list_parse.parse_file_expected_broad()
+    except priority_list_parse.PriorityListParseError as exc:
+        return 1, [str(exc)]
+    # Labels broad by design (T-6239) skip the high-volume + semantic-drift
+    # heuristics only; dead-label still sees the full rank_map.
+    checked_map = {k: v for k, v in rank_map.items() if k not in expected_broad}
+
     tickets = _iter_all_tickets()
     warnings: list[str] = []
 
@@ -9036,11 +9451,18 @@ def _priority_list_validate_report() -> tuple[int, list[str]]:
         for label in _priority_list_dead_labels(rank_map, tickets)
     )
     warnings.extend(
+        f"label {label!r} is listed under expected-broad in "
+        "rulebook/priority-list.md but is not in any priority tier "
+        "(stale exemption)"
+        for label in sorted(expected_broad)
+        if label not in rank_map
+    )
+    warnings.extend(
         f"label {label!r} is carried by {count} tickets across "
         "tickets/{inbox,active,done}/, above the "
         f"{PRIORITY_LIST_HIGH_VOLUME_THRESHOLD}-ticket high-volume "
         "threshold (may be over-broad)"
-        for label, count in _priority_list_high_volume_labels(rank_map, tickets)
+        for label, count in _priority_list_high_volume_labels(checked_map, tickets)
     )
     warnings.extend(
         f"label {label!r} has a narrow historical arc-set "
@@ -9049,7 +9471,7 @@ def _priority_list_validate_report() -> tuple[int, list[str]]:
         f"to novel arc(s): {', '.join(novel_ids)} (semantic-drift — label may "
         "have shifted meaning; confirm it still attaches to the intended arc)"
         for label, historical_arcs, novel_ids in _priority_list_semantic_drift(
-            rank_map, tickets
+            checked_map, tickets
         )
     )
 
@@ -9146,7 +9568,11 @@ def _explain_priority_report(
             f"source {source} own_rank {_fmt_rank(source_rank)})"
         )
     lines.append(
-        "  sort keys: (effective_rank, effective_queue_ts, ticket_id) ASC — "
+        f"  tier_rank: {info.tier_rank if info.tier_rank is not None else 'absent'} "
+        "(intra-tier only; absent falls through to FIFO)"
+    )
+    lines.append(
+        "  sort keys: (effective_rank, tier_rank, effective_queue_ts, ticket_id) ASC — "
         "ties broken by ticket_id (ORG-078 §3)"
     )
     return "\n".join(lines)
@@ -9296,7 +9722,8 @@ def cmd_list(args: argparse.Namespace) -> int:
         def _priority_key(t: "Ticket"):
             info = priority_info.get(_tid(t))
             rank = info.effective_rank if info else math.inf
-            return (rank, _effective_queue_ts(t.fields), _tid(t))
+            tier_rank = info.tier_rank if info and info.tier_rank is not None else math.inf
+            return (rank, tier_rank, _effective_queue_ts(t.fields), _tid(t))
 
         tickets = sorted(tickets, key=_priority_key)
     elif sort_mode == "retargeted":
@@ -10177,6 +10604,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_register_args(r)
     _add_successor_arg(r)
+    sop_grp = r.add_mutually_exclusive_group()
+    sop_grp.add_argument(
+        "--sop-updated", dest="sop_updated", default=None, metavar="SHA",
+        help="T-4680: for a sop:<stem> ticket whose SOP is still a STUB, the "
+             "landed commit (on HEAD; after a squash merge, the squash sha) that "
+             "filled sop/standard/<stem>.md. Recorded in the resolve note.",
+    )
+    sop_grp.add_argument(
+        "--sop-no-change", dest="sop_no_change", default=None, metavar="REASON",
+        help="T-4680: waive the first-use SOP gate for a sop:<stem> ticket "
+             "(the run taught nothing new). Non-empty; recorded in the resolve note.",
+    )
     r.set_defaults(func=cmd_resolve)
 
     # T-4119: hold a WIP slot open for a work-complete ticket awaiting an
@@ -10236,6 +10675,30 @@ def _build_parser() -> argparse.ArgumentParser:
     adj.add_argument("--no-push", dest="no_push", action="store_true", default=False,
                      help="commit locally but skip git push")
     adj.set_defaults(func=cmd_adjust_appetite)
+
+    tr = sub.add_parser(
+        "tier-rank",
+        help="T-5715: set or clear optional intra-tier queue ordering",
+    )
+    tr.add_argument("ticket")
+    tr_mode = tr.add_mutually_exclusive_group(required=True)
+    tr_mode.add_argument(
+        "--rank", type=int, metavar="INT",
+        help="intra-tier rank (lower sorts first; cannot cross label tiers)",
+    )
+    tr_mode.add_argument(
+        "--clear", action="store_true", default=False,
+        help="remove tier_rank and return the ticket to FIFO among unranked peers",
+    )
+    tr.add_argument(
+        "--reason", required=True,
+        help="why this ticket is being reordered (recorded in its transition log)",
+    )
+    tr.add_argument(
+        "--no-push", dest="no_push", action="store_true", default=False,
+        help="commit locally but skip git push",
+    )
+    tr.set_defaults(func=cmd_tier_rank)
 
     dr = sub.add_parser(
         "drop",
@@ -10460,8 +10923,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     lfm.add_argument(
         "--strict", action="store_true", default=False,
-        help="exit 1 on any finding or an unavailable registry (S2 gate shape); "
-             "default exits 0 — it is a report",
+        help="exit 1 on an unknown-field, a bad-value or an unavailable registry "
+             "(S2 CI gate); legacy-field use is info only (a hand-added legacy field "
+             "is caught at write time, not here); default exits 0 — it is a report",
     )
     # T-4760 (f): read-only, and S2's CI runs `--strict` on PR branches, so it
     # is exempt from the run-from-main guard (see main()).
@@ -10485,7 +10949,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--sort", choices=("priority", "created", "retargeted"), default="priority",
         help="ORG-078 §4: 'priority' (default) applies ceiling priority-rank "
              "+ dependency-inheritance (§Priority-inversion) over "
-             "(effective_rank, effective_queue_ts, ticket_id). 'created'/"
+             "(effective_rank, tier_rank, effective_queue_ts, ticket_id). 'created'/"
              "'retargeted' are pure-FIFO bypass views that skip the "
              "priority-list parse entirely.",
     )

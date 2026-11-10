@@ -92,6 +92,13 @@ EXECUTOR_KIND_CLASSES: Final[Mapping[str, str]] = MappingProxyType(
 #: next to EXECUTOR_KIND_CLASSES, so changing a declared read changes it.
 INSPECTION_PORT_METHODS: Final[frozenset[str]] = frozenset(("unit_file_enablement", "read_unit"))
 INSPECTION_UNIT_ROLES: Final[frozenset[str]] = frozenset(("timer", "consume", "controller"))
+#: The accepted read-purpose values ("" for a method that takes none). A copy of
+#: ``tools.user_systemd.ReadPurpose`` values, because the op registry (in the
+#: broker's pinned import closure) must not import that module; a test pins equality.
+INSPECTION_READ_PURPOSES: Final[frozenset[str]] = frozenset(
+    ("", "stale-reset", "unit-file-active", "unit-fire-poll", "service-settle", "service-observe",
+     "timer-elapse", "receiver-active", "reload-state", "service-bringup-observe")
+)
 KIND_INSPECTION_READS: Final[Mapping[str, tuple[tuple[str, str, str], ...]]] = MappingProxyType(
     {
         "seat-runtime-residue-quarantine": (
@@ -129,6 +136,8 @@ OUT_OF_ENVELOPE_KINDS: Final[frozenset[str]] = frozenset(
         "seat-service-decommission",
         # T-5454: shell-box containment wiring in the seat's own settings.json.
         "seat-claude-settings-env",
+        # T-5480: shell-box PreToolUse hook + trust in the seat's ~/.codex/config.toml, seat-local too.
+        "seat-codex-hook-config",
         # T-5474: first-launch workspace trust. (T-5473's residue quarantine
         # is admitted above since T-5608.)
         "seat-claude-workspace-trust",
@@ -168,8 +177,9 @@ MUST_RUN_BEFORE_LAUNCH_KINDS: Final[frozenset[str]] = frozenset(
     )
 )
 
-#: Rule (b), claude seats only (codex containment is T-5480): a claude plan
-#: that launches must carry the shell-box containment op.
+#: Rule (b), claude seats only: a claude plan that launches must carry the shell-box
+#: containment op. T-5480: the codex hook op (seat-codex-hook-config) is deliberately NOT a
+#: must-run-before-launch kind, so T-5608's broker-launch routing for codex plans is unchanged.
 CLAUDE_REQUIRED_BEFORE_LAUNCH_KIND: Final = "seat-claude-settings-env"
 
 # Kinds whose effect changes a harness permission posture (e.g. Codex tool

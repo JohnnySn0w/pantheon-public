@@ -1623,6 +1623,19 @@ class ApprovalService:
                 and grant.plan_digest == expected_digest
                 and grant.consuming_operation_handle == operation_handle
             ):
+                if self._is_past(grant.expires_at, now):
+                    # T-5233 (gate 16 lists expiry among the refusing
+                    # fields): the identical-tuple replay honours the
+                    # grant's expiry, so a deterministic operation handle
+                    # (germination) cannot re-use a bound grant
+                    # indefinitely. Zero writes: BOUND is terminal and
+                    # stays BOUND. Consequence on the broker path:
+                    # OperationService.recover() re-authorizes a PREPARED
+                    # operation through this method, so a PREPARED op
+                    # recovered after its grant's expiry is REFUSED with
+                    # nothing dispatched (fail closed; a new review is
+                    # needed) instead of resuming on the old binding.
+                    return self._deny("expired")
                 # identical tuple: return the ORIGINAL binding, zero writes
                 return BindOutcome(
                     "bound", grant.authority_record_id, "bound_replay"
@@ -1823,6 +1836,8 @@ class ApprovalService:
             state=grant.state,
             expires_at=grant.expires_at,
             summary=summary,
+            plan_handle=grant.plan_handle,
+            plan_owner=grant.plan_owner,
         )
 
     def _require_consumer(self, authenticated_uid: int) -> None:

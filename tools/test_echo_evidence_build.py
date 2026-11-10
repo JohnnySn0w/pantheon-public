@@ -943,3 +943,30 @@ def test_gc_dry_run_reports_and_deletes_nothing(repo, root, cap, capsys, wt_pare
     assert "2 dir(s)" in err and "nothing deleted" in err
     assert eeb.main(["--gc", "--older-than-days", "0"]) == 0
     assert not nm.exists() and not orphan.exists()
+
+
+# ---------------------------------------------------------------- PATH (T-6035)
+
+def test_cargo_bin_prepended_for_non_login_shell(repo, root, cap, monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    (home / ".cargo" / "bin").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CARGO_HOME", raising=False)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    assert eeb.main(["--worktree", str(repo), "--", "cargo", "check"]) == 0
+    assert cap.env["PATH"].split(os.pathsep) == [str(home / ".cargo" / "bin"), "/usr/bin", "/bin"]
+
+
+def test_cargo_bin_not_duplicated_or_invented(repo, root, cap, monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    cb = home / ".cargo" / "bin"
+    cb.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("CARGO_HOME", raising=False)
+    monkeypatch.setenv("PATH", f"/usr/bin{os.pathsep}{cb}")
+    assert eeb.main(["--worktree", str(repo), "--", "cargo", "check"]) == 0
+    assert cap.env["PATH"] == f"/usr/bin{os.pathsep}{cb}"
+    monkeypatch.setenv("HOME", str(tmp_path / "nohome"))  # no ~/.cargo/bin at all
+    monkeypatch.setenv("PATH", "/usr/bin")
+    assert eeb.main(["--worktree", str(repo), "--", "cargo", "check"]) == 0
+    assert cap.env["PATH"] == "/usr/bin"

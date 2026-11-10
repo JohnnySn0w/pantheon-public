@@ -35,7 +35,7 @@ from tools import repo_reconciler as RR
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 COMPONENTS = REPO_ROOT / "tools" / "germinate" / "components"
-FILES = ("pantheon-config.yaml", "pantheon-config.py", "pantheon-config_handlers.py")
+FILES = ("pantheon-config.yaml", "pantheon-config.py", "pantheon-config_handlers.py", "pantheon-config.invariants.yaml")
 CID = "pantheon-config"
 CK = "pantheon-config-test"
 SIM_URL = "sim://pantheon-config"
@@ -406,8 +406,9 @@ def test_sandbox_root_vetting_reuses_guard_sim_root(world, tmp_path):
 def test_registered_handlers_stay_simulated_only():
     regs = {r.component: r for r in discover(REPO_ROOT, REPO_ROOT / "registry" / "systems.yaml")}
     names = [type(h).__name__ for h in regs[CID].handlers]
-    assert names == ["PantheonConfigRepoSim"]
-    assert frozenset(regs[CID].op_kinds) == PG.KINDS == regs[CID].handlers[0].kinds
+    assert names == ["PantheonConfigRepoSim", "PantheonConfigLocalSim"]
+    assert frozenset(regs[CID].op_kinds) == PG.KINDS | {"repo.hooks-activate", "pantheon-config.adopt-attest", "pantheon-config.manifest-attest"}
+    assert regs[CID].handlers[0].kinds == PG.KINDS
 
 
 def test_nothing_outside_tests_imports_the_real_handler():
@@ -659,11 +660,24 @@ def _repo(tmp_path: Path, target: str) -> Path:
     return repo
 
 
+def _seed_hooks(eng):
+    """TEST HELPER: healthy simulated hooks and a valid instance.yaml for the hand clone (identity None: no engine install record)."""
+
+    handler = eng.backend.handler("repo.hooks-activate")
+    manifest = "role_membership_projection:\n  source: membership.yaml\n  expected_revision: 1\n  expected_digest: abc\n"
+    hooks = {"hooks_path": ".githooks", "modes": {n: "exec" for n in ("pre-commit", "commit-msg", "pre-push")}, "engine": False, "identity": None}
+    handler.load_state({"hooks": {CK: hooks}, "manifests": {CK: {"text": manifest, "identity": None}}})
+    eng.backend.save()
+
+
 def _real_engine(tmp_path: Path, repo: Path, handler, name="real-host"):
     regs = discover(repo, repo / "registry" / "systems.yaml")
-    backend = SimulatedHostBackend(tmp_path / name, op_registry=load_op_registry(merged_kinds(regs)), handlers=(handler,))
+    [reg] = [r for r in regs if r.component == CID]
+    local = reg.handlers[1]  # the simulated local sibling (hooks, attestation), viewing the REAL handler
+    local.bind_observation(lambda: handler.observe(CID, "system"))
+    backend = SimulatedHostBackend(tmp_path / name, op_registry=load_op_registry(merged_kinds(regs)), handlers=(handler, local))
     backend.simulate_postboot()
-    return H.engine(tmp_path, repo, backend=backend)
+    return H.engine(tmp_path, repo, backend=backend, verify_hooks={CID: reg.verify})  # the component's own VERIFY, as the CLI wires it
 
 
 def _sim_engine(tmp_path: Path, repo: Path, state):
@@ -709,8 +723,16 @@ def test_parity_sim_and_real_observe_plan_and_verify_agree(tmp_path):
     assert [_op_view(p.nodes[0].operations[0]) for p in plans] == [_op_view(plans[1].nodes[0].operations[0])] * 2
     outcomes = [eng.apply("update", "system", CID, plan_digest=p.digest, source_revs=(w.A, B))[0] for eng, p in zip((real, sim), plans)]
     assert [o.state for o in outcomes] == ["SATISFIED", "SATISFIED"]
-    verdicts = [eng.verify("system", CID)[0]["ok"] for eng in (real, sim)]
-    assert verdicts == [True, True] and w.head() == B
+    for eng in (real, sim):
+        _seed_hooks(eng)  # the simulated local sibling: healthy hooks (a hand clone has no engine record)
+    results = [eng.verify("system", CID)[0] for eng in (real, sim)]
+    assert [all(c["ok"] for c in r["checks"]) for r in results] == [True, True] and w.head() == B
+    real_inv, sim_inv = (r["invariants"] for r in results)
+    assert sim_inv["ok"] and results[1]["ok"]  # the simulated handler observes the branch: every invariant passes
+    # the dark git handler does not observe branch/tracking yet (live branch observation is T-6098): PC-4 is the only residual (degraded)
+    residual = [r for r in real_inv["results"] if r["status"] != "pass"]
+    assert [(r["id"], r["detail"]) for r in residual] == [("PC-4-currency", f"{CK}: branch not observed (could not evaluate)")]
+    assert not results[0]["ok"] and real_inv["state"] == "degraded"
     assert [eng.plan("remove", "system", CID).nodes[0].operations for eng in (real, sim)] == [(), ()]  # hand clone: never reaped
 
 
@@ -727,8 +749,8 @@ def test_engine_end_to_end_install_update_halt_rollback_reapply_remove(tmp_path)
     eng = _real_engine(tmp_path, repo, w.handler)
 
     plan = eng.plan("install", "system", CID)
-    [op] = plan.nodes[0].operations
-    assert (op.kind, op.desired["head"]) == ("repo.clone", w.A)
+    [op, hooks] = plan.nodes[0].operations  # install types the bringup too: clone, then the simulated hooks activation
+    assert (op.kind, op.desired["head"], hooks.kind) == ("repo.clone", w.A, "repo.hooks-activate")
     assert eng.apply("install", "system", CID, plan_digest=plan.digest)[0].state == "SATISFIED"
     assert w.head() == w.A
 
@@ -745,7 +767,16 @@ def test_engine_end_to_end_install_update_halt_rollback_reapply_remove(tmp_path)
     bad.clear()
     plan = eng.plan("update", "system", CID, source_revs=(w.A, B))
     assert eng.apply("update", "system", CID, plan_digest=plan.digest, source_revs=(w.A, B))[0].state == "SATISFIED"
-    assert w.head() == B and eng.verify("system", CID)[0]["ok"]
+    assert w.head() == B  # the install leg's hooks-activate left healthy simulated hooks
+    local = eng.backend.handler("repo.hooks-activate")  # TEST HELPER: the engine never writes instance.yaml; seed a valid one
+    state = local.dump_state()
+    state["manifests"][CK] = {"text": "role_membership_projection:\n  source: membership.yaml\n  expected_revision: 1\n  expected_digest: abc\n", "identity": state["hooks"][CK]["identity"]}
+    local.load_state(state)
+    eng.backend.save()
+    [result] = eng.verify("system", CID)
+    assert all(c["ok"] for c in result["checks"])  # the per-op checks hold
+    assert [r["id"] for r in result["invariants"]["results"] if r["status"] != "pass"] == ["PC-4-currency"]  # T-6098: branch not observed
+    assert not result["ok"]
 
     with pytest.raises(EngineRefusal, match="refusing to reap"):  # installed at A, now at B: not pristine
         eng.plan("remove", "system", CID)
@@ -787,3 +818,35 @@ def test_engine_kill_then_reconcile_then_rollback_restores_head(tmp_path, point)
 
 def test_kill_points_cover_the_tested_subset():
     assert {"after-intent", "after-execute", "after-receipt"} <= set(KILL_POINTS)
+
+
+# --- T-5502: option-injection hygiene on the resolver-sourced remote ---------
+
+
+def _bare_handler(resolved):
+    handler = object.__new__(PG.PantheonConfigRepoGit)
+    handler._timeout = 1
+    handler._resolver = lambda _repo: resolved
+    return handler
+
+
+@pytest.mark.parametrize("bad", ["-evil", "--upload-pack=x", "", "a\0b"])
+def test_dash_or_empty_remote_is_refused_and_git_never_invoked(monkeypatch, bad):
+    calls = []
+    monkeypatch.setattr(PG.subprocess, "run", lambda *a, **k: calls.append(a) or pytest.fail("git invoked"))
+    entry = SimpleNamespace(logical_repo="pantheon-config")
+    assert _bare_handler(bad)._url(entry) == ""
+    assert _bare_handler(bad)._remote_tips(bad) is None
+    assert calls == []
+
+
+def test_remote_tips_delimits_the_url_with_double_dash(monkeypatch):
+    seen = []
+
+    def fake(argv, **_kw):
+        seen.append(list(argv))
+        return SimpleNamespace(returncode=0, stdout="abc\trefs/heads/main\n")
+
+    monkeypatch.setattr(PG.subprocess, "run", fake)
+    assert _bare_handler("/tmp/x.git")._remote_tips("/tmp/x.git") == {"abc"}
+    assert seen == [["git", "ls-remote", "--", "/tmp/x.git"]]

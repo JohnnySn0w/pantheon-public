@@ -381,7 +381,7 @@ class HandleTest(_StateDir):
         self.assertIsNone(mr.handle(payload(channel("zorblax")), runner=run))
 
     def test_threshold_constant(self):
-        self.assertEqual(mr.KEYWORD_BM25_MIN, 12.0)
+        self.assertEqual(mr.KEYWORD_BM25_MIN, 25.0)
 
     def test_empty_text_no_search(self):
         run = FakeRunner(ok([hit(1)]))

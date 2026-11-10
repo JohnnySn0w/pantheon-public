@@ -8,7 +8,8 @@ reboot_safety.py before (is everyone's work committed/pushed?) and fleet_health.
 after (did everyone come back?).
 
 This maps onto the EXISTING per-agent mechanism rather than reinventing it:
-  * Per claude agent (orchestrator/specialist/recovery): `handoff_and_restart.sh --no-restart`
+  * Per interactive control-plane agent (orchestrator/specialist/archivist/mason/artisan/
+    watchman/recovery): `handoff_and_restart.sh --no-restart`
     (T-1049 pause mode) — prompt the agent to finish + write its HANDOFF, wait for
     the mtime ack, archive it to the Chronicle, then STOP (no restart). The
     machine reboot is what cycles it; the agent's SessionStart hook resumes it
@@ -36,7 +37,8 @@ orchestration logic is fully unit-tested.
     python3 tools/fleet_reboot.py --strict        # make the pre-check a HARD gate (default: advisory)
 
 Exit: 0 = plan/quiesce completed (and reboot issued under --execute); 1 = a
-quiesce step failed (reboot withheld); 2 = strict pre-check gate failed; 64 = usage.
+quiesce step failed (reboot withheld); 2 = strict pre-check gate failed; 3 = the root
+route (claude seat's pantheon-sudo) failed its preflight, nothing quiesced; 64 = usage.
 """
 from __future__ import annotations
 
@@ -59,10 +61,20 @@ try:
 except Exception:  # noqa: BLE001
     agent_role_map = None
 
-# Repo root (this file lives in <repo>/tools/). handoff_and_restart.sh is its sibling.
+# This file lives in <repo>/tools/ (session_chronicle.py is its sibling).
 import os
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
-_HANDOFF_SCRIPT = os.path.join(_TOOLS_DIR, "handoff_and_restart.sh")
+# T-6288: a quiesced seat runs ITS OWN clone's script, expanded by the seat's login
+# shell. The driver's clone (/home/claude-fallback, mode 700) is unreadable to them.
+_SEAT_HANDOFF_SCRIPT = "$HOME/pantheon-config/tools/handoff_and_restart.sh"
+# T-6288: the driver (Recovery) has no root. Root goes through the claude seat's
+# pantheon-sudo (T-5331), whose stdin must not be a pipe or file (T-5713).
+_ROOT_ROUTE_USER = "claude"
+
+
+def _root_route_argv(command: str) -> list[str]:
+    return ["sudo", "-n", "-u", _ROOT_ROUTE_USER, "bash", "-lc",
+            f"~/pantheon-config/tools/pantheon-sudo {command} </dev/null"]
 
 # --------------------------------------------------------------------------- #
 # Fleet registry — quiesce order + per-agent strategy.                        #
@@ -103,6 +115,38 @@ FLEET = {
         "services": ["codex-daemon.service", "codex-telegram-poller.service"],
         "mode": "user",
     },
+    "archivist": {
+        "strategy": "handoff_pause",
+        "user": "exocortex",
+        "service": "pantheon-persona-consume@archivist.service",
+        "mode": "user",
+        "pane": "claude-telegram-bot-exocortex:0",
+        "handoff_file": "/home/exocortex/HANDOFF.md",
+    },
+    "mason": {
+        "strategy": "handoff_pause",
+        "user": "suborch1",
+        "service": "pantheon-persona-consume@mason.service",
+        "mode": "user",
+        "pane": "suborch1-main:0",
+        "handoff_file": "/home/suborch1/HANDOFF.md",
+    },
+    "artisan": {
+        "strategy": "handoff_pause",
+        "user": "suborch2",
+        "service": "pantheon-persona-consume@artisan.service",
+        "mode": "user",
+        "pane": "suborch2-main:0",
+        "handoff_file": "/home/suborch2/HANDOFF.md",
+    },
+    "watchman": {
+        "strategy": "handoff_pause",
+        "user": "codex-fallback",
+        "service": "pantheon-persona-consume@watchman.service",
+        "mode": "user",
+        "pane": "codex-fallback-main:0",
+        "handoff_file": "/home/codex-fallback/HANDOFF.md",
+    },
     "recovery": {
         "strategy": "driver",
         "user": "claude-fallback",
@@ -111,7 +155,10 @@ FLEET = {
 }
 
 # Non-driver-first, driver last.
-QUIESCE_ORDER = ["orchestrator", "specialist", "codex", "recovery"]
+QUIESCE_ORDER = [
+    "orchestrator", "specialist", "codex", "archivist", "mason", "artisan", "watchman",
+    "recovery",
+]
 
 OK, WARN, FAIL = "OK", "WARN", "FAIL"
 
@@ -149,7 +196,7 @@ def quiesce_handoff_pause(agent: str, cfg: dict, *, run=_run, dry_run: bool) -> 
     """Cross-account `handoff_and_restart.sh --no-restart` for a claude agent."""
     service, supervisor = _restart_identity(agent, cfg)
     inner = (
-        f"XDG_RUNTIME_DIR=/run/user/$(id -u) {_HANDOFF_SCRIPT} "
+        f"XDG_RUNTIME_DIR=/run/user/$(id -u) {_SEAT_HANDOFF_SCRIPT} "
         f"--service {service} --mode {cfg['mode']} "
         f"--target-pane {cfg['pane']} --handoff-file {cfg['handoff_file']} "
         f"--supervisor {supervisor} --no-restart"
@@ -218,12 +265,22 @@ def chronicle_archive_handoff(handoff_file: str, *, run=_run) -> tuple[bool, str
 
 def trigger_reboot(*, run=_run, dry_run: bool) -> dict:
     """Issue the machine reboot. Gated by the caller (only on --execute)."""
-    argv = ["sudo", "-n", "systemctl", "reboot"]
+    argv = _root_route_argv("systemctl reboot")
     if dry_run:
         return {"status": OK, "action": "DRY-RUN would run: " + " ".join(argv)}
     rc, out = run(argv)
     # A successful reboot usually kills us before we read rc; treat any return as best-effort.
     return {"status": OK if rc in (0, None) else FAIL, "rc": rc, "detail": out.strip()[-300:]}
+
+
+def preflight_reboot_privilege(*, run=_run, dry_run: bool) -> dict:
+    """T-6288: prove the root route works BEFORE quiescing anyone, so --execute can
+    never leave the fleet paused and then fail to reboot."""
+    argv = _root_route_argv("true")
+    if dry_run:
+        return {"status": OK, "action": "DRY-RUN would run: " + " ".join(argv)}
+    rc, out = run(argv, timeout=60)
+    return {"status": OK if rc == 0 else FAIL, "rc": rc, "detail": out.strip()[-300:]}
 
 
 # --------------------------------------------------------------------------- #
@@ -235,10 +292,19 @@ def run_pre_check(*, sweep=None) -> tuple[bool, list[dict]]:
     clean == no FAIL (DIRTY) repo. WARN (ahead/unpushed) does not flip clean."""
     if sweep is None:
         if reboot_safety is None:
-            return True, [{"agent": "?", "status": WARN,
-                           "detail": "reboot_safety unavailable; pre-check skipped"}]
+            return False, [{"agent": "fleet", "status": FAIL,
+                            "detail": "reboot_safety unavailable; every seat is unchecked"}]
         sweep = reboot_safety.sweep
     results = sweep()
+    for agent in FLEET:
+        seat_results = [r for r in results if r.get("agent") == agent]
+        for evidence_key in ("repo", "continuity"):
+            if not any(evidence_key in r for r in seat_results):
+                results.append({
+                    "agent": agent,
+                    "status": FAIL,
+                    "detail": f"seat omitted from reboot-safety {evidence_key} sweep; unchecked",
+                })
     clean = not any(r.get("status") == FAIL for r in results)
     return clean, results
 
@@ -255,6 +321,7 @@ def orchestrate(*, execute: bool, strict: bool, skip_reboot: bool,
                 quiesce_drv=quiesce_driver,
                 chronicle_archive=chronicle_archive_handoff,
                 reboot=trigger_reboot,
+                reboot_preflight=preflight_reboot_privilege,
                 log=print) -> dict:
     """Run the full sequence. Returns a structured report; the CLI maps it to an
     exit code. dry_run is the inverse of `execute`."""
@@ -265,17 +332,29 @@ def orchestrate(*, execute: bool, strict: bool, skip_reboot: bool,
     # --- Phase 1: advisory pre-check -------------------------------------------
     clean, pre_results = run_pre_check(sweep=pre_sweep)
     report["pre_check"] = {"clean": clean, "results": pre_results}
-    log(f"[pre-check] reboot_safety: {'CLEAN' if clean else 'DIRTY (uncommitted work in the air)'}")
+    log(f"[pre-check] reboot_safety: {'CLEAN' if clean else 'UNSAFE (work or continuity unchecked)'}")
     for r in pre_results:
         if r.get("status") != OK:
             log(f"  [{r.get('status')}] {r.get('agent')}: {r.get('repo', r.get('detail', ''))}")
     if not clean:
         if strict:
-            log("[pre-check] STRICT gate: dirty repos present — ABORTING (no quiesce, no reboot).")
+            log("[pre-check] STRICT gate: unsafe preflight — ABORTING (no quiesce, no reboot).")
             report["exit"] = 2
             return report
-        log("[pre-check] ADVISORY: dirty repos noted; continuing (the operator: advisory, not a gate). "
-            "Commit-first if the in-air work matters.")
+        log("[pre-check] ADVISORY: unsafe work/continuity noted; continuing the plan "
+            "(the operator: advisory, not a gate). A live quiesce still fails closed if a "
+            "fresh handoff cannot be recorded.")
+
+    # --- Phase 1b: root route preflight (only when a reboot will follow) -------
+    if not skip_reboot:
+        pre = reboot_preflight(dry_run=dry_run)
+        report["reboot_preflight"] = pre
+        log(f"[preflight] root route ({_ROOT_ROUTE_USER} pantheon-sudo): [{pre.get('status')}] "
+            f"{pre.get('action', pre.get('detail', ''))}")
+        if pre.get("status") != OK:
+            log("[preflight] root route unavailable — ABORTING before quiesce (no seat paused).")
+            report["exit"] = 3
+            return report
 
     # --- Phase 2: quiesce each agent (driver last) -----------------------------
     for agent in QUIESCE_ORDER:

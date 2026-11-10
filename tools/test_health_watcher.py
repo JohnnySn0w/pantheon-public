@@ -244,21 +244,50 @@ class TokenReaderTests(unittest.TestCase):
         out, _ = self._pump(b"x" * (hw.MAX_TOKEN_LINE - 1) + b"\nS\n" + b"y" * hw.MAX_TOKEN_LINE + b"\nS\n")
         self.assertEqual(out, [("t", "signal"), ("t", "signal")])
 
+    def test_overlong_prefix_then_signal_token_is_still_discarded(self):
+        # T-5415: exactly-cap bytes without a newline, then `S\n`, is the TAIL of one long line.
+        out, _ = self._pump(b"x" * hw.MAX_TOKEN_LINE + b"S\n")
+        self.assertEqual(out, [])
+        out, _ = self._pump(b"x" * hw.MAX_TOKEN_LINE + b"S\nS\n")       # next whole line counts
+        self.assertEqual(out, [("t", "signal")])
+
     def test_overlong_without_newline_then_eof_is_inert(self):
         out, _ = self._pump(b"S" * 10_000)
         self.assertEqual(out, [])
 
     def test_watcher_not_stalled_by_overlong_line_from_real_subprocess(self):
-        prog = ("import sys,time\nsys.stdout.write('R\\n'); sys.stdout.flush()\n"
-                "sys.stdout.write('z'*300000+'\\n'); sys.stdout.write('S\\n'); sys.stdout.flush()\n"
-                "sys.stdin.read()\n")
+        prog = ("import sys\n"
+                "out = sys.stdout.buffer\n"
+                "out.write(b'R\\n'); out.flush()\n"
+                "if sys.stdin.buffer.read(1) == b'G':\n"
+                "    out.write(b'z'*300000 + b'\\nS\\n'); out.flush()\n"
+                "sys.stdin.buffer.read()\n")
+        taps = []
+
+        def factory(spec, events):
+            tap = hw.ProcessTap(spec, events, SudoReader(),
+                                argv=[sys.executable, "-I", "-c", prog])
+            taps.append(tap)
+            return tap
+
         h = WatcherHarness(labels=("system",))
-        h.w.tap_factory = lambda spec, ev: hw.ProcessTap(spec, ev, SudoReader(),
-                                                         argv=["python3", "-I", "-c", prog])
+        h.w.tap_factory = factory
         h.truth["v"] = 0
         with h:
-            self.assertTrue(_wait(lambda: h.out["mode"] == "startup", 30))
-            self.assertTrue(_wait(lambda: "signal" in h.calls, 30), h.calls)    # valid token acted on
+            self.assertTrue(_wait(
+                lambda: h.out["mode"] == "startup" and h.w.collects >= 1, 30))
+            self.assertEqual(len(taps), 1)
+            tap = taps[0]
+            proc = tap.proc
+            self.assertIsNotNone(proc)
+            proc.stdin.write(b"G")
+            proc.stdin.flush()
+            self.assertTrue(_wait(lambda: "signal" in h.calls, 30), h.calls)
+
+        self.assertEqual(proc.poll(), 0)
+        self.assertTrue(proc.stdin.closed)
+        self.assertTrue(proc.stdout.closed)
+        self.assertFalse(tap._pump_thread.is_alive())
 
 
 class ProcessTapLifecycleTests(unittest.TestCase):
@@ -706,6 +735,109 @@ class ScratchBusTests(unittest.TestCase):
         for p in procs:
             self.assertIsNotNone(p)
             self.assertTrue(_wait(lambda: p.poll() is not None, 15), "tap leaked")
+
+
+
+class RespawnBackoffCapTests(unittest.TestCase):
+    """T-5415 (a): a REAL tap subprocess that exits at once is respawned by the Watcher with
+    exponential backoff that reaches BACKOFF_MAX and never exceeds it.
+
+    Timing seam: Watcher(backoff_start/backoff_max) are constructor args, so the cap is
+    scaled to 0.2s (production 300s). Assertions are load-insensitive: the backoff values
+    are read from the watcher's own state at each respawn (exact), and the wall-clock check
+    is a LOWER bound only (a spawn can be late under load, never early)."""
+
+    START, CAP = 0.05, 0.2
+
+    def test_real_respawning_tap_backoff_reaches_cap_and_holds(self):
+        spawns = []                                     # (monotonic, backoff snapshot) per tap start
+        holder = {}
+
+        def factory(spec, events):
+            spawns.append((time.monotonic(), dict(holder["w"]._backoff)))
+            return hw.ProcessTap(spec, events, SudoReader(),
+                                 argv=[sys.executable, "-I", "-c", "pass"])   # exits immediately
+
+        w = hw.Watcher([hw.TapSpec("system", "system", "i")], collect_fn=lambda mode: 0,
+                       tap_factory=factory, min_interval=0.05, idle_tick=0.02,
+                       backoff_start=self.START, backoff_max=self.CAP, log=lambda m: None)
+        holder["w"] = w
+        t = threading.Thread(target=w.run, daemon=True)
+        t.start()
+        try:
+            self.assertTrue(_wait(lambda: len(spawns) >= 7, 60), f"only {len(spawns)} spawns")
+        finally:
+            w.stop_event.set()
+            t.join(timeout=15)
+        self.assertFalse(t.is_alive())
+        # Snapshot at spawn k reflects the k-1 exits so far: 0.05, 0.1, 0.2, then pinned at the cap.
+        seen = [snap.get("system") for _ts, snap in spawns[1:7]]
+        self.assertEqual(seen, [0.05, 0.1, 0.2, 0.2, 0.2, 0.2])
+        self.assertLessEqual(max(v for v in seen), self.CAP)
+        self.assertLessEqual(w._backoff.get("system", 0), self.CAP)
+        # A respawn is never EARLIER than its backoff (lower bound only; lateness is load).
+        for k in range(1, 7):
+            gap = spawns[k][0] - spawns[k - 1][0]
+            self.assertGreaterEqual(gap, seen[k - 1] - 0.01, (k, gap, seen[k - 1]))
+        self.assertGreaterEqual(w.refused["system"], 6)
+
+
+class MultiAccountSudoArgvTests(unittest.TestCase):
+    """T-5415 (b): the exact sudo argv for every fleet_personas() account."""
+
+    def _expected(self, acct, uid):
+        return ["sudo", "-n", "-u", acct, "env",
+                f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+                f"XDG_RUNTIME_DIR=/run/user/{uid}",
+                "python3", "-I", "-c", hw._TAP_SRC,
+                "session", "org.pantheon.PersonaController1", "/org/pantheon"]
+
+    def _check(self, personas):
+        specs = [s for s in hw.build_specs(personas) if s.kind == "session"]
+        self.assertTrue(specs)
+        uids = {s.account: 3000 + i for i, s in enumerate(specs)}
+        with mock.patch.object(hc.pwd, "getpwuid") as g:
+            g.return_value.pw_name = "sudo-test-self"      # not any fleet account
+            reader = SudoReader()
+        with mock.patch.object(hw.pwd, "getpwnam", side_effect=lambda a: mock.Mock(pw_uid=uids[a])):
+            for s in specs:
+                with self.subTest(account=s.account):
+                    self.assertEqual(hw.tap_argv(s, reader), self._expected(s.account, uids[s.account]))
+        return specs
+
+    def test_fixed_accounts_exact_argv(self):
+        specs = self._check([("p1", "acct-one", None), ("p2", "acct-two", None), ("p3", "acct-one", None)])
+        self.assertEqual([s.account for s in specs], ["acct-one", "acct-two"])
+
+    def test_every_real_fleet_personas_account_exact_argv(self):
+        personas = hw.fleet_personas()
+        self.assertTrue(personas, "fleet_personas() is empty")
+        specs = self._check(personas)
+        self.assertEqual({s.account for s in specs}, {a for _p, a, _t in personas})
+
+    def test_system_tap_never_uses_sudo(self):
+        with mock.patch.object(hc.pwd, "getpwuid") as g:
+            g.return_value.pw_name = "sudo-test-self"
+            reader = SudoReader()
+        argv = hw.tap_argv(hw.build_specs([])[0], reader)
+        self.assertEqual(argv[0], "python3")
+
+
+class TestCollectRcNote(unittest.TestCase):
+    """T-6041: the collector exits 2 for three causes (subscription set, unwritable out dir,
+    write failure) and prints the real cause itself; the watcher's note must not name one."""
+
+    def test_rc2_note_defers_to_the_collectors_stderr_cause(self) -> None:
+        note = hw._collect_rc_note(2)
+        self.assertIsNotNone(note)
+        self.assertIn("exited 2", note)
+        self.assertIn("health_collector", note)
+        self.assertNotIn("not writable", note)
+
+    def test_other_rcs_get_no_note(self) -> None:
+        for rc in (0, hc.RC_BUSY, 1):
+            with self.subTest(rc=rc):
+                self.assertIsNone(hw._collect_rc_note(rc))
 
 
 if __name__ == "__main__":

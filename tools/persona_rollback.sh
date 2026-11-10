@@ -266,8 +266,13 @@ if [[ $EXECUTE != 1 ]]; then
   echo "  rm -f ${DROPIN_FILE}                                   # shape-1 inverse; no-op if never installed"
   echo "  systemctl --user daemon-reload"
   if [[ -n "$PCX_COMPANION_UNITS" ]]; then
+    _snap="$(companion_snapshot_path "$PCX_HOME" "$PERSONA" "$STAMP")"
     for tok in $PCX_COMPANION_UNITS; do
-      echo "  systemctl --user start ${tok%%=*}   # T-2648: restore companion unit possibly stopped by the aborted cutover"
+      if companion_should_restore "$_snap" "${tok%%=*}"; then
+        echo "  systemctl --user start ${tok%%=*}   # T-2648: restore companion unit possibly stopped by the aborted cutover"
+      else
+        echo "  (leave ${tok%%=*} stopped: recorded inactive before cutover in ${_snap}, T-5956)"
+      fi
     done
   fi
   echo "All backups present. Dry-run OK — pass --execute to perform the restore."
@@ -379,8 +384,17 @@ echo "shape-1 inverse: consume units proven dead, urgent dropin removed (if pres
 # above: if the fire aborted BEFORE ever reaching the companion-stop step
 # (e.g. the install-done precondition failed), the unit is already running
 # and `start` on an already-active unit is a no-op success.
+# T-5956: only companions the cutover recorded as active (or with no record:
+# a pre-T-5956 cutover) are restored; a recorded-inactive one stays stopped.
+COMPANION_SNAPSHOT="$(companion_snapshot_path "$PCX_HOME" "$PERSONA" "$STAMP")"
+[[ -z "$PCX_COMPANION_UNITS" || -r "$COMPANION_SNAPSHOT" ]] || \
+  echo "WARN: no companion pre-state snapshot at $COMPANION_SNAPSHOT (pre-T-5956 cutover?); restoring every declared companion"
 for tok in $PCX_COMPANION_UNITS; do
   companion_unit="${tok%%=*}"
+  if ! companion_should_restore "$COMPANION_SNAPSHOT" "$companion_unit"; then
+    echo "left stopped companion unit: $companion_unit (recorded inactive before cutover)"
+    continue
+  fi
   systemctl --user start "$companion_unit"
   echo "restored companion unit: $companion_unit"
 done
@@ -432,6 +446,10 @@ fi
 # T-2648: every companion unit restored above must be active.
 for tok in $PCX_COMPANION_UNITS; do
   companion_unit="${tok%%=*}"
+  if ! companion_should_restore "$COMPANION_SNAPSHOT" "$companion_unit"; then
+    echo "verify: companion unit ${companion_unit} skipped (recorded inactive before cutover, T-5956)"
+    continue
+  fi
   if systemctl --user is-active --quiet "$companion_unit"; then
     echo "verify: companion unit ${companion_unit} active OK"
   else

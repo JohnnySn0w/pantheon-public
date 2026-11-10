@@ -116,6 +116,10 @@ class _Backend:
         self.calls.append(("liveness", persona))
         return dict(self.states)
 
+    def _quarantine_liveness(self, operation, persona):
+        # T-5612: the pane signal has its own tests; this matrix pins the unit-state half
+        return self._runtime_liveness(persona)
+
 
 class PredicateIdentityTests(unittest.TestCase):
     def test_every_moved_name_is_one_object(self) -> None:

@@ -19,6 +19,11 @@ OnFailure=pantheon-unit-failure-alert@%n.service
 # SUPERVISED HO+the operator pilot flip has a ready-to-install unit — installing,
 # enabling, or starting this unit is a separate cross-account step, not part of
 # the T-1633 Unit 2 build.
+# T-6352: ~52 min of continuous failure (30 starts/h under the [Service] backoff) ends in
+# ONE latched failed state (OnFailure alert where wired; failed_unit_reconcile sees it
+# regardless) instead of an unbounded loop. Recover: reset-failed + start.
+StartLimitIntervalSec=3600
+StartLimitBurst=30
 
 [Service]
 # Supervised wrapper (NOT Type=oneshot), mirrors the claude-telegram supervised wrapper:
@@ -43,6 +48,10 @@ ExecStart=%h/pantheon-config/tools/acp-bridge-supervise.sh
 ExecStopPost=-/usr/bin/tmux kill-session -t acp-bridge-%i
 Restart=always
 RestartSec=5
+# T-6352: exponential restart backoff (5,9,18,34,64,120s). NRestarts is cumulative
+# (resets only on a manual start/restart), so 120s is also the steady per-crash delay.
+RestartSteps=5
+RestartMaxDelaySec=120
 # T-2543: a `systemctl stop/restart` sends SIGTERM to the supervise script while
 # it blocks in `sleep` (its poll loop); under `set -euo pipefail` the interrupted
 # sleep propagates as exit 143 (journal: `code=exited, status=143`). Without this

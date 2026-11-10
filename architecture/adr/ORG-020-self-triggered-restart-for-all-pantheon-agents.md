@@ -1,13 +1,13 @@
 ---
 aliases: [ORG-020]
 title: Self-triggered restart mechanism for all Pantheon agents
-status: Ratified 2026-05-20
+status: "Ratified 2026-05-20; Phase 2 (operator /restart) built 2026-05-20 (T-0468, pantheon-bridge b34f858), then its host retired 2026-06-04 (bridge decommissioned under ORG-004, T-0767)"
 date: 2026-05-20
 build_disposition: built
 ---
 # ORG-020 — Self-triggered restart mechanism for all Pantheon agents
 
-**Status:** **Ratified 2026-05-20 by the operator (Telegram msg_1739 + msg_1740, via T-0467).** Drafted 2026-05-19 by Orchestrator (Orchestrator).
+**Status:** **Ratified 2026-05-20 by the operator (Telegram msg_1739 + msg_1740, via T-0467).** Phase 2 (operator /restart) built 2026-05-20 (T-0468, pantheon-bridge b34f858), then its host retired 2026-06-04 (bridge decommissioned under ORG-004, T-0767). Drafted 2026-05-19 by Orchestrator (Orchestrator).
 
 **Date authored:** 2026-05-19
 
@@ -23,12 +23,14 @@ The operator msg_1225 (2026-05-13): context elevation required him to run `syste
 
 **What already works (T-0309 body sketch undervalues this):**
 
-`tools/context_fill_monitor.py` (per T-0184 + T-0189, ratified 2026-04-30) runs as a 5-min systemd-user timer on Recovery (`claude-fallback`). It polls each named agent's session JSONL transcript, computes context-fill %, and fires `tools/handoff_and_restart.sh` against that agent when the 60% threshold crosses. Cross-account access via NOPASSWD-sudo. `AGENT_CONFIG` dict at module top covers `orchestrator` + `specialist`. **Phase 2 ("Orchestrator/Specialist self-restart") is structurally already shipped** for the context-fill trigger.
+`tools/context_fill_monitor.py` (per T-0184 + T-0189, ratified 2026-04-30) runs as a 5-min systemd-user timer on Recovery (`claude-fallback`). It polls each named agent's session JSONL transcript, computes context-fill %, and fires `tools/handoff_and_restart.sh` against that agent when the context-fill threshold crosses. Cross-account access via NOPASSWD-sudo. `AGENT_CONFIG` dict at module top covers `orchestrator` + `specialist`. **Phase 2 ("Orchestrator/Specialist self-restart") is structurally already shipped** for the context-fill trigger.
+
+> Numerics relocated: the build-tier numbers (thresholds, cadences, size estimates) this ADR carried now sit, verbatim and matched to the current code, in `notes/2026-11-03-org-020-numerics-relocated.md` (T-6063).
 
 **Two gaps remain:**
 
 1. **Recovery self-restart.** Recovery isn't in `AGENT_CONFIG` because Recovery is the process running the monitor. A circular-trigger isn't viable (Recovery firing its own systemctl restart from within itself would interrupt the running monitor before the restart fires). Recovery needs a different mechanism: an out-of-process tombstone drained by a peer account or a root timer.
-2. **Operator-trigger surface for any agent.** `context_fill_monitor.py` only fires on the 60% threshold; it doesn't expose a "the operator says restart Recovery now" surface. Today msg_1225's "operator wants to fire restart" lacks an operator-friendly path — the operator's option is `ssh swarm && systemctl --user restart ...` with the XDG_RUNTIME_DIR footgun, OR ask HO to do it on his behalf.
+2. **Operator-trigger surface for any agent.** `context_fill_monitor.py` only fires on the context-fill threshold; it doesn't expose a "the operator says restart Recovery now" surface. Today msg_1225's "operator wants to fire restart" lacks an operator-friendly path — the operator's option is `ssh swarm && systemctl --user restart ...` with the XDG_RUNTIME_DIR footgun, OR ask HO to do it on his behalf.
 
 This ADR covers both gaps + the bus-error footgun fix.
 
@@ -90,8 +92,8 @@ Independent quick-win, lands with Phase 1:
 ### New code
 
 - `tools/context_fill_monitor.py`: extend `AGENT_CONFIG` with `"recovery"` entry; replace the in-process `handoff_and_restart.sh` invocation with a tombstone write when `agent == "recovery"`.
-- `tools/restart_request.py`: new ~30 LoC CLI that writes the tombstone with explicit `reason: operator|context_fill_threshold|other`.
-- `tools/restart_drain.py`: new ~60 LoC drain script. Reads its own account's tombstones from `~/.local/state/pantheon/restart_requested_*.json`, fires `handoff_and_restart.sh --service <its-own-service>` locally per tombstone, removes tombstone on success. No cross-account sudo step in the drain path.
+- `tools/restart_request.py`: new CLI that writes the tombstone with explicit `reason: operator|context_fill_threshold|other`.
+- `tools/restart_drain.py`: new drain script. Reads its own account's tombstones from `~/.local/state/pantheon/restart_requested_*.json`, fires `handoff_and_restart.sh --service <its-own-service>` locally per tombstone, removes tombstone on success. No cross-account sudo step in the drain path.
 - `tools/systemd/pantheon-restart-drain.{service,timer}`: new systemd-user unit installed independently on EACH agent's account (Recovery, Orchestrator, Specialist), ~30s cadence. The drain unit is distinct from each agent's main service unit (so the restart fire-and-forget survives).
 
 ### Tests
@@ -133,7 +135,7 @@ Phase 1 lands behind a feature flag (`PANTHEON_RESTART_DRAIN_ENABLED=1`). First 
 1. Sweep `sop/standard/auto-resume-operator-runbook.md` + Recovery's HANDOFF.md template + any operator-facing systemctl recommendations.
 2. Add `XDG_RUNTIME_DIR=/run/user/$(id -u)` to every documented systemctl invocation.
 
-Phase 3 can land alongside Phase 1 (~10 LoC of docs sweep).
+Phase 3 can land alongside Phase 1 (a docs sweep).
 
 ## Cross-references
 

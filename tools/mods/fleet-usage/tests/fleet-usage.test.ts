@@ -171,23 +171,31 @@ describe('configuration', () => {
     expect(w.runs[1]).toEqual(['mv', '-f', w.writes[0]!.path, '/x/fleet/specialist.json'])
   })
 
-  test('seat: PANTHEON_FLEET_USAGE_SEAT wins, then USER, then LOGNAME', async ($, on) => {
+  test('seat: PANTHEON_FLEET_USAGE_SEAT names the seat, never the unix user', async ($, on) => {
     const a = world(on, { PANTHEON_FLEET_USAGE_SEAT: 'mason', USER: 'suborch1' })
     await $.session.measure(measure(LIVE))
     expect(JSON.parse(a.writes[0]!.text).seat).toBe('mason')
   })
 
-  test('seat falls back to the unix user', async ($, on) => {
+  // T-4643 step (0): a managed enabledPlugins enables the mod for EVERY host account, and the
+  // gate reads the freshest seat file, so an unset seat must write nothing (no USER fallback).
+  test('no PANTHEON_FLEET_USAGE_SEAT: nothing is written, even with USER set', async ($, on) => {
     const w = world(on, { USER: 'claude-fallback' })
     await $.session.measure(measure(LIVE))
-    expect(JSON.parse(w.writes[0]!.text).seat).toBe('claude-fallback')
-    expect(w.runs[1]![3]).toBe(`${DIR}/claude-fallback.json`)
+    expect(w.writes).toEqual([])
+    expect(w.runs).toEqual([])
   })
 
-  test('seat falls back to LOGNAME when USER is unset', async ($, on) => {
+  test('no PANTHEON_FLEET_USAGE_SEAT: nothing is written, even with LOGNAME set', async ($, on) => {
     const w = world(on, { LOGNAME: 'suborch2' })
     await $.session.measure(measure(LIVE))
-    expect(JSON.parse(w.writes[0]!.text).seat).toBe('suborch2')
+    expect(w.writes).toEqual([])
+  })
+
+  test('an unusable PANTHEON_FLEET_USAGE_SEAT never falls back to a valid USER', async ($, on) => {
+    const w = world(on, { PANTHEON_FLEET_USAGE_SEAT: '../x', USER: 'claude-fallback' })
+    await $.session.measure(measure(LIVE))
+    expect(w.writes).toEqual([])
   })
 })
 
@@ -258,6 +266,7 @@ describe('observes only', () => {
       return { catch: () => undefined }
     }) as unknown as On
     register(spy, {})
-    expect(seen).toEqual(['session.measure'])
+    // T-4536 adds the observe-only turn.complete ledger hook; still nothing on the prompt.
+    expect(seen).toEqual(['session.measure', 'turn.complete'])
   })
 })

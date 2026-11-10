@@ -167,8 +167,13 @@ def build_spine_fixture(root: Path) -> None:
     w("adr/ORG-001-alpha.md", """
         ---
         title: Alpha ADR title for testing
-        status: Ratified
+        status: |-
+          Ratified by the operator.
+          Amendment landed.
         date: 2026-04-01
+        no_registry_row_waiver: |-
+          Decision-only ADR; it registers no component.
+          Existing registry rows are unchanged.
         ---
 
         # ORG-001 — Alpha ADR
@@ -178,7 +183,9 @@ def build_spine_fixture(root: Path) -> None:
     w("adr/ORG-002-beta.md", """
         ---
         title: Beta ADR title for testing
-        status: Autonomous
+        status: >-
+          Autonomous below goal.
+          No ratification needed.
         date: 2026-05-01
         ---
 
@@ -602,11 +609,23 @@ class TestAdrHandler(_SpineFixtureTestCase):
         alpha = [r for r in rows if "ORG-001-alpha.md" in r]
         self.assertEqual(len(alpha), 1)
         self.assertIn("Alpha ADR title for testing", alpha[0])
-        self.assertIn("Ratified", alpha[0])
+        self.assertIn("Ratified by the operator.<br>Amendment landed.", alpha[0])
+        self.assertNotIn("|-", alpha[0])
+        self.assertEqual(len(alpha[0].splitlines()), 1)
+        self.assertEqual(alpha[0].count("|"), 5)
         self.assertIn("2026-04-01", alpha[0])
+        alpha_frontmatter = sig._parse_frontmatter(
+            self.fixtures / "adr" / "ORG-001-alpha.md"
+        )
+        self.assertEqual(
+            alpha_frontmatter["no_registry_row_waiver"],
+            "Decision-only ADR; it registers no component.\n"
+            "Existing registry rows are unchanged.",
+        )
         beta = [r for r in rows if "ORG-002-beta.md" in r]
         self.assertEqual(len(beta), 1)
-        self.assertIn("Autonomous", beta[0])
+        self.assertIn("Autonomous below goal. No ratification needed.", beta[0])
+        self.assertNotIn(">-", beta[0])
 
 
 class TestLedgerHandler(_SpineFixtureTestCase):

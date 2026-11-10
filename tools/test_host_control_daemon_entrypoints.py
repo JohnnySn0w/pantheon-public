@@ -16,7 +16,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -246,6 +248,123 @@ class BrokerEntrypointTests(_TreeCase):
         )
         self.addCleanup(stack.close)
         return stack
+
+    def _run_with_fake_bus(self, *, status_close=None):
+        """Drive ``entry.run`` (run_loop=False) past start-up with the bus
+        objects faked, recording how the T-5644 status client is wired and the
+        order of the shutdown calls. Returns (record, connect, rc)."""
+
+        from unittest import mock
+
+        from tools.host_control import __main__ as entry
+        from tools.host_control import dbus_service, health_dbus
+
+        record: dict = {"order": [], "built": [], "service_kwargs": None}
+        client = object()
+
+        class _StatusConnection:
+            def close(self) -> None:
+                record["order"].append("status_connection.close")
+                if status_close is not None:
+                    raise status_close
+
+        real_build_broker = entry.build_broker
+
+        def build_broker(*args, **kwargs):
+            stack = real_build_broker(*args, **kwargs)
+            record["stack"] = stack
+            return stack
+
+        def build_status_client(connect_arg, ownership):
+            record["built"].append((connect_arg, ownership))
+            return client, _StatusConnection()
+
+        class _Service:
+            def __init__(self, connection, **kwargs) -> None:
+                record["service_kwargs"] = kwargs
+
+            def close(self) -> None:
+                record["order"].append("service_object.close")
+
+        class _Health:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+        real_stack_close = entry.BrokerStack.close
+
+        def stack_close(stack) -> None:
+            record["order"].append("stack.close")
+            real_stack_close(stack)
+
+        # run() imports dbus / gi at function level, and the service classes
+        # exist only when dbus imports. Fake all of it (modules and classes) so
+        # this wiring test runs on a runner with NO dbus-python too; the real
+        # service modules are imported BEFORE the fakes go in.
+        fake_modules = {}
+        for name in (
+            "dbus",
+            "dbus.exceptions",
+            "dbus.mainloop",
+            "dbus.mainloop.glib",
+            "dbus.service",
+            "gi",
+            "gi.repository",
+        ):
+            fake_modules[name] = types.ModuleType(name)
+        fake_modules["dbus"].exceptions = fake_modules["dbus.exceptions"]
+        fake_modules["dbus"].mainloop = fake_modules["dbus.mainloop"]
+        fake_modules["dbus"].service = fake_modules["dbus.service"]
+        fake_modules["dbus.mainloop"].glib = fake_modules["dbus.mainloop.glib"]
+        fake_modules["dbus.exceptions"].DBusException = type("DBusException", (Exception,), {})
+        fake_modules["dbus.mainloop.glib"].DBusGMainLoop = lambda **kwargs: None
+        fake_modules["dbus.mainloop.glib"].threads_init = lambda: None
+        fake_modules["dbus.service"].BusName = lambda *args, **kwargs: object()
+        fake_modules["gi.repository"].GLib = object()
+        fake_modules["gi"].repository = fake_modules["gi.repository"]
+
+        tree = self._tree()
+        connect = _Spy(inner=lambda main_loop: object())
+        with mock.patch.object(entry, "build_broker", build_broker), mock.patch.object(
+            entry, "build_status_client", build_status_client
+        ), mock.patch.object(entry.BrokerStack, "close", stack_close), mock.patch.object(
+            dbus_service, "HostBroker1Object", _Service, create=True
+        ), mock.patch.object(health_dbus, "Health1Object", _Health, create=True), mock.patch.dict(
+            sys.modules, fake_modules
+        ):
+            try:
+                code = entry.run(
+                    config_path=Path(tree["config_path"]),
+                    open_loader=_loader,
+                    connect=connect,
+                    run_loop=False,
+                    log=lambda _m: None,
+                )
+            except RuntimeError as exc:
+                code = exc
+        record["client"] = client
+        return record, connect, code
+
+    def test_run_wires_the_status_client_and_closes_in_order(self) -> None:
+        """T-5644 r2: pin ``run``'s wiring, where the r1 bug lived (a
+        blocking-only status connection never fires call_async replies)."""
+
+        record, connect, code = self._run_with_fake_bus()
+        self.assertEqual(code, 0)
+        # (a) the real connect (identity, no wrapper) and the live journal
+        self.assertEqual(len(record["built"]), 1)
+        built_connect, built_ownership = record["built"][0]
+        self.assertIs(built_connect, connect)
+        self.assertIs(built_ownership, record["stack"].journal)
+        # (b) exactly the object the status builder returned is what the
+        # service gets as its approval_status
+        self.assertIs(record["service_kwargs"]["approval_status"], record["client"])
+        # (c) shutdown order: service, then the status connection, then stack
+        self.assertEqual(record["order"], ["service_object.close", "status_connection.close", "stack.close"])
+
+    def test_a_failing_status_connection_close_still_closes_the_stack(self) -> None:
+        record, _connect, code = self._run_with_fake_bus(status_close=RuntimeError("close failed"))
+        self.assertIsInstance(code, RuntimeError)
+        self.assertEqual(record["order"], ["service_object.close", "status_connection.close", "stack.close"])
 
     def test_euid_zero_is_refused_before_any_file_is_read(self) -> None:
         from tools.host_control import __main__ as entry

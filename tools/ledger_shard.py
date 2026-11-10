@@ -187,10 +187,17 @@ def existing_entry_ids(ledger_dir: Path) -> set[str]:
 
 
 # ORG-001 per-entry rules (amended 2026-10-08, the operator TG 11474; T-4734).
-# WARN-only until T-4739 flips ENFORCE: a rule failure is reported on stderr
-# and the entry is still written. With ENFORCE, a failure raises ValueError
-# before the file is opened.
-ENFORCE = False
+# T-4739 flipped ENFORCE on: a rule failure raises ValueError before the file
+# is opened. With ENFORCE off a failure is only reported on stderr and the
+# entry is still written.
+ENFORCE = True
+
+# When the ORG-100 role vocabulary cannot be loaded, the `agent` rule cannot be
+# checked. True (orchestrator's lean, P4 over P1): under ENFORCE report that on stderr
+# as a loud WARN and let the entry through (every other rule still applies).
+# False: treat it as a rule failure and refuse the entry (fail closed).
+VOCAB_LOAD_FAIL_OPEN = True
+_VOCAB_LOAD_PROBLEM = "cannot load the ORG-100 role vocabulary"
 
 REQUIRED_FIELDS: tuple[str, ...] = (
     "id",
@@ -280,7 +287,7 @@ def validate_entry(entry: dict, now: datetime | None = None) -> list[str]:
         try:
             allowed, shared = _role_vocabulary()
         except Exception as exc:  # noqa: BLE001 - the vocabulary is advisory here
-            problems.append(f"cannot load the ORG-100 role vocabulary: {exc}")
+            problems.append(f"{_VOCAB_LOAD_PROBLEM}: {exc}")
         else:
             if agent not in allowed:
                 problems.append(
@@ -295,6 +302,18 @@ def validate_entry(entry: dict, now: datetime | None = None) -> list[str]:
     return problems
 
 
+def split_fail_open_problems(problems: list[str]) -> tuple[list[str], list[str]]:
+    """(blocking, warn-only) split of `validate_entry` problems under ENFORCE.
+
+    A vocabulary-load failure is warn-only while `VOCAB_LOAD_FAIL_OPEN` is on
+    (orchestrator ruling, T-4739); every other problem blocks. Shared by the write
+    path (`check_new_entry`) and the pre-commit lint so the two cannot differ."""
+    if not VOCAB_LOAD_FAIL_OPEN:
+        return list(problems), []
+    soft = [p for p in problems if p.startswith(_VOCAB_LOAD_PROBLEM)]
+    return [p for p in problems if p not in soft], soft
+
+
 def check_new_entry(entry: dict, now: datetime | None = None) -> None:
     """Report (WARN) or refuse (ENFORCE) an entry that breaks ORG-001's rules.
 
@@ -306,12 +325,22 @@ def check_new_entry(entry: dict, now: datetime | None = None) -> None:
         return
     label = entry.get("id") or "<no id>"
     if ENFORCE:
-        raise ValueError(f"ledger entry {label} breaks ORG-001: " + "; ".join(problems))
+        problems, soft = split_fail_open_problems(problems)
+        if soft:
+            for problem in soft:
+                print(
+                    f"ledger: WARN ORG-001 {label}: {problem}; the agent rule was "
+                    "NOT checked (VOCAB_LOAD_FAIL_OPEN)",
+                    file=sys.stderr,
+                )
+        if problems:
+            raise ValueError(f"ledger entry {label} breaks ORG-001: " + "; ".join(problems))
+        return
     for problem in problems:
         print(f"ledger: WARN ORG-001 {label}: {problem}", file=sys.stderr)
 
 
-def append_entry(ledger_dir: Path, entry: dict) -> Path:
+def append_entry(ledger_dir: Path, entry: dict, now: datetime | None = None) -> Path:
     """Append a ledger entry to the shard its OWN timestamp belongs in (T-2077).
 
     Correct-by-construction hand-append path: the shard is chosen via
@@ -345,10 +374,15 @@ def append_entry(ledger_dir: Path, entry: dict) -> Path:
     ledger byte-identical.
 
     T-4734: every entry is first checked against ORG-001's rules for new
-    entries (`check_new_entry`): reported on stderr while `ENFORCE` is off,
-    refused before the file is opened once it is on.
+    entries (`check_new_entry`): refused before the file is opened while
+    `ENFORCE` is on (T-4739), reported on stderr only if it is turned off.
+
+    `now` is the clock the ts-skew rule measures against (default: the wall
+    clock). A caller that stamped the entry earlier and appends it later (the
+    harness's delayed or spooled landing) passes the entry's own ts, so skew is
+    not re-applied; every other rule is unaffected.
     """
-    check_new_entry(entry)
+    check_new_entry(entry, now)
     legacy = ledger_dir / LEGACY_LEDGER_FILENAME
     entry_id = entry.get("id")
     if isinstance(entry_id, str) and entry_id:

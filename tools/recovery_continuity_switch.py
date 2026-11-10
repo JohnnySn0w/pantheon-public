@@ -45,11 +45,27 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools import continuity_switch_coordinator as csc  # noqa: E402
 from tools import persona_continuity as pc  # noqa: E402
+from tools import harness_state as hs  # noqa: E402
 
-DEFAULT_HOME = Path("/home/claude-fallback")
-DEFAULT_CONTINUITY_ROOT = DEFAULT_HOME / ".local/state/pantheon/personas/recovery/continuity"
-DEFAULT_STATE_ROOT = DEFAULT_HOME / ".local/state/pantheon/personas"
 DEFAULT_REPO_ROOT = REPO_ROOT
+RECOVERY_HOME = Path("/home/claude-fallback")
+
+
+def _default_home() -> Path:
+    """Recovery's identity-source home, even when another account drives the fire."""
+    return RECOVERY_HOME
+
+
+def _default_state_root() -> Path:
+    """The personas dir, resolved exactly as the runtime planes resolve it (T-6285):
+    PANTHEON_PERSONA_STATE_DIR, else $PANTHEON_STATE_DIR/personas, else Recovery's home
+    default; a disagreeing pair is refused (HarnessStateError), not guessed."""
+    return hs.state_root_from_env(default=_default_home() / ".local/state/pantheon") / "personas"
+
+
+def _default_continuity_root() -> Path:
+    return _default_state_root() / "recovery/continuity"
+
 
 # The coordinator actor authority Recovery's continuity switch runs under.
 ACTOR_PURPOSES = (
@@ -135,12 +151,14 @@ def enforce_live_gate(args) -> dict:
 
 def build_config(
     *,
-    continuity_root: Path = DEFAULT_CONTINUITY_ROOT,
+    continuity_root: Path | None = None,
     repo_root: Path = DEFAULT_REPO_ROOT,
-    state_root: Path = DEFAULT_STATE_ROOT,
+    state_root: Path | None = None,
     switch_state_root: Path | None = None,
 ) -> csc.CoordinatorConfig:
     """Reconstruct the CoordinatorConfig from the pinned continuity paths."""
+    continuity_root = continuity_root or _default_continuity_root()
+    state_root = state_root or _default_state_root()
     descriptor_root = continuity_root / "descriptor"
     return csc.CoordinatorConfig(
         persona_id="recovery",
@@ -334,9 +352,9 @@ def cmd_rollback(args) -> int:
 
 
 def _add_common(sub: argparse.ArgumentParser) -> None:
-    sub.add_argument("--continuity-root", default=str(DEFAULT_CONTINUITY_ROOT))
+    sub.add_argument("--continuity-root", default=str(_default_continuity_root()))
     sub.add_argument("--repo-root", default=str(DEFAULT_REPO_ROOT))
-    sub.add_argument("--state-root", default=str(DEFAULT_STATE_ROOT))
+    sub.add_argument("--state-root", default=str(_default_state_root()))
     sub.add_argument("--live", action="store_true",
                      help="use REAL ports + real switch root (fire only; default is dry-run)")
     sub.add_argument("--confirm-fire", default=None,

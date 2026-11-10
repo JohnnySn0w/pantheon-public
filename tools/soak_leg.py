@@ -28,7 +28,13 @@ Steps:
      is removed (only if it is exactly the configured path and holds pyvenv.cfg and the
      runner's own .soak-owned marker, so a venv you pass with --venv is never deleted) and
      rebuilt. The first run needs network for pip.
-  3. Suite: `python -m pytest tools/` with CI's flags (-q, -o faulthandler_timeout=600,
+  3. Suite, two legs (T-5915). Leg A runs inside its own PID namespace (bwrap --dev-bind / /
+     --proc /proc --unshare-pid --die-with-parent, so a mocked pid reaching kill(-1, SIGKILL)
+     cannot leave it; T-5031) with `-m "not nested_namespace"`. Leg B runs ONLY
+     `-m nested_namespace` (tests that build their own user/pid namespaces and fail inside an
+     outer one), un-namespaced, over the same paths; its log, report and basetemp carry
+     -nested. bwrap missing or unable to start is a setup error (exit 2): no fallback. GREEN
+     needs both legs green. Each leg is `python -m pytest tools/` with CI's flags (-q, -o faulthandler_timeout=600,
      -o junit_family=xunit1, --junitxml and --basetemp under the leg's out dir), with
      PANTHEON_DISABLE_LIVE_TELEGRAM=1, seat-only env stripped (PYTEST_ADDOPTS, PYTHONPATH,
      VIRTUAL_ENV, TMUX, the repo-redirect GIT_* variables, ...), niced, cwd = the soaked
@@ -43,7 +49,7 @@ Steps:
      per-(classname, name) counting CI uses). CI's executed_min/skipped_max floor is NOT
      enforced: seat counts legitimately differ, so they are reported instead.
   5. One summary line, `SOAK LEG: sha=<soaked commit> py=X.Y executed=N skipped=S failed=F
-     pytest_rc=R shell_outcomes_rc=Q -> GREEN|RED`, then the failing test ids when RED.
+     pytest_rc=R nested_rc=B shell_outcomes_rc=Q -> GREEN|RED` (counts sum both legs), then the failing test ids when RED.
 
 GREEN = pytest exit 0, shell outcomes exit 0, a readable report with at least one executed
 test, and no failed/errored testcase in it. A missing or unreadable report, or one where
@@ -105,6 +111,15 @@ _INSTALL_FLAGS = frozenset({"--upgrade", "-U", "pip"})
 # (Recovery's T-5031 note). PANTHEON_DISABLE_LIVE_TELEGRAM=1 is set after the strip.
 STRIPPED_ENV = ("PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "TMUX")
 SIGTERM_EXIT = 143
+# T-5915: pytest runs in its own PID namespace, so a mocked pid that reaches kill(-1, SIGKILL)
+# (T-5031 took down a user manager that way) can only hit the namespace. `--proc /proc` is
+# required: without it ~29 tests that read procfs / flock holder pids / pdeathsig fail.
+BWRAP_NAMESPACE_ARGS = ("--dev-bind", "/", "/", "--proc", "/proc", "--unshare-pid",
+                        "--die-with-parent")
+# Tests that build their own user/pid namespaces fail inside any outer one; they carry this
+# marker (registered in tools/conftest.py) and run in leg B, un-namespaced, instead.
+NESTED_MARKER = "nested_namespace"
+NOTHING_COLLECTED_RC = 5  # pytest's "no tests collected"
 
 Runner = Callable[..., "subprocess.CompletedProcess"]
 
@@ -313,16 +328,56 @@ def _ensure_venv(venv_dir: Path, pins: Sequence[str], *, runner: Runner,
 # ---------------------------------------------------------------------------
 
 
-def junit_path(out_dir: Path) -> Path:
-    return Path(out_dir) / "pytest-tools.xml"
+def junit_path(out_dir: Path, nested: bool = False) -> Path:
+    return Path(out_dir) / ("pytest-tools-nested.xml" if nested else "pytest-tools.xml")
+
+
+def log_name(nested: bool = False) -> str:
+    return "pytest-nested.log" if nested else "pytest.log"
+
+
+def require_bwrap(*, which: Callable[[str], str | None] = shutil.which) -> str:
+    """The bwrap path, or SetupError: no silent fallback to an un-namespaced run."""
+    path = which("bwrap")
+    if not path:
+        raise SetupError("bwrap not found on PATH: the leg runs pytest in its own PID namespace "
+                         "(T-5915) and will not fall back to an un-namespaced run; install "
+                         "bubblewrap")
+    return path
+
+
+def namespaced(argv: Sequence[str], bwrap: str) -> list[str]:
+    """argv wrapped to run in a fresh PID namespace (see BWRAP_NAMESPACE_ARGS)."""
+    return [bwrap, *BWRAP_NAMESPACE_ARGS, "--", *argv]
+
+
+def preflight_bwrap(bwrap: str, *, runner: Runner = subprocess.run) -> None:
+    """Run `true` in the namespace: a host with unprivileged user namespaces disabled gets a
+    clear SetupError here instead of a RED leg with an empty report."""
+    try:
+        r = runner(namespaced(["true"], bwrap), capture_output=True, text=True)
+    except OSError as exc:
+        raise SetupError(f"bwrap preflight failed to run: {exc}") from exc
+    if r.returncode != 0:
+        raise SetupError(f"bwrap cannot create the PID namespace (rc {r.returncode}): "
+                         f"{(r.stderr or '').strip()}")
 
 
 def build_pytest_argv(python: Path, out_dir: Path, workers: int,
-                      paths: Sequence[str] = DEFAULT_PATHS) -> list[str]:
+                      paths: Sequence[str] = DEFAULT_PATHS, *,
+                      nested: bool | None = None) -> list[str]:
+    """CI's pytest argv. nested=None: no marker selection (the pre-T-5915 shape); False: leg A,
+    `-m "not nested_namespace"`; True: leg B, `-m nested_namespace`, with its own report and
+    basetemp so the two legs never share files."""
     out_dir = Path(out_dir)
-    return ["nice", "-n", "10", str(python), "-m", "pytest", *paths, "-q",
+    tag = "-nested" if nested else ""
+    argv = ["nice", "-n", "10", str(python), "-m", "pytest", *paths, "-q",
             "-n", str(workers), *CI_PYTEST_OPTIONS,
-            f"--junitxml={junit_path(out_dir)}", f"--basetemp={out_dir / 'pytest-basetemp'}"]
+            f"--junitxml={junit_path(out_dir, bool(nested))}",
+            f"--basetemp={out_dir / ('pytest-basetemp' + tag)}"]
+    if nested is not None:
+        argv += ["-m", NESTED_MARKER if nested else f"not {NESTED_MARKER}"]
+    return argv
 
 
 def repo_redirect_env(*, runner: Runner = subprocess.run) -> frozenset[str]:
@@ -370,8 +425,9 @@ def default_branch(*, runner: Runner = subprocess.run) -> str | None:
 
 
 def run_pytest(argv: Sequence[str], out_dir: Path, *, runner: Runner = subprocess.run,
-               repo_root: Path = REPO_ROOT, env: dict | None = None) -> int:
-    log = Path(out_dir) / "pytest.log"
+               repo_root: Path = REPO_ROOT, env: dict | None = None,
+               log_file: str = "pytest.log") -> int:
+    log = Path(out_dir) / log_file
     with log.open("w", encoding="utf-8") as fh:
         r = runner(list(argv), cwd=str(repo_root), env=build_pytest_env() if env is None else env,
                    stdout=fh, stderr=subprocess.STDOUT)
@@ -439,28 +495,53 @@ def head_sha(root: Path, *, runner: Runner = subprocess.run) -> str:
 
 def evaluate(xml: Path, pytest_rc: int, shell_rc: int | None, *, subset: bool = False,
              sha: str = "?", py: str | None = None,
-             defbranch: str | None = "main") -> tuple[bool, list[str]]:
+             defbranch: str | None = "main", nested_xml: Path | None = None,
+             nested_rc: int | None = None) -> tuple[bool, list[str]]:
     """(green, lines): the summary line first, then the failing ids / reason when RED.
     shell_rc None means the shell-outcomes check was skipped (a --paths subset); sha is the
     soaked commit, py the venv's interpreter, defbranch the seat's account-wide
     init.defaultBranch (None = unset; shown only when it is not CI's main, and it never
     decides the verdict). Zero executed tests is RED: a report of only
-    skips proves nothing ran."""
-    try:
-        c = count(xml)
-        counts = f"executed={c['executed']} skipped={c['skipped']} failed={len(c['failed'])}"
-        failed, reason = c["failed"], None
-        if c["executed"] == 0:
+    skips proves nothing ran.
+
+    nested_rc not None means a two-leg run (T-5915): leg A (xml, pytest_rc) and leg B
+    (nested_xml, nested_rc) are summed, the line gains ` nested_rc=N` after pytest_rc, and
+    GREEN needs both rcs 0. In a subset run only, a leg that collected nothing (rc 5, no
+    report) is tolerated; the other leg must still execute something."""
+    two_leg = nested_rc is not None
+    legs = [(xml, pytest_rc)] + ([(nested_xml, nested_rc)] if two_leg else [])
+    executed = skipped = 0
+    failed: list[str] = []
+    reason = None
+    for leg_xml, leg_rc in legs:
+        try:
+            c = count(leg_xml)
+        except InputError as exc:
+            if two_leg and subset and leg_rc == NOTHING_COLLECTED_RC:
+                continue
+            reason = f"junit report unusable: {exc}"
+            break
+        executed += c["executed"]
+        skipped += c["skipped"]
+        failed += c["failed"]
+    if reason:
+        counts, failed = "executed=? skipped=? failed=?", []
+    else:
+        counts = f"executed={executed} skipped={skipped} failed={len(failed)}"
+        if executed == 0:
             reason = "no test executed (every testcase skipped): nothing was soaked"
-    except InputError as exc:
-        counts = "executed=? skipped=? failed=?"
-        failed, reason = [], f"junit report unusable: {exc}"
+
+    def rc_ok(rc: int) -> bool:
+        return rc == 0 or (two_leg and subset and rc == NOTHING_COLLECTED_RC)
+
     shell = "skipped" if shell_rc is None else str(shell_rc)
-    green = reason is None and not failed and pytest_rc == 0 and shell_rc in (0, None)
+    green = (reason is None and not failed and all(rc_ok(rc) for _, rc in legs)
+             and shell_rc in (0, None))
     scope = " scope=subset" if subset else ""
     branch = "" if defbranch == "main" else f" defbranch={defbranch or 'unset'}"
-    lines = [f"SOAK LEG: sha={sha} py={py or python_tag()}{branch} {counts} pytest_rc={pytest_rc} "
-             f"shell_outcomes_rc={shell}{scope} -> {'GREEN' if green else 'RED'}"]
+    nested = f" nested_rc={nested_rc}" if two_leg else ""
+    lines = [f"SOAK LEG: sha={sha} py={py or python_tag()}{branch} {counts} pytest_rc={pytest_rc}"
+             f"{nested} shell_outcomes_rc={shell}{scope} -> {'GREEN' if green else 'RED'}"]
     if reason:
         lines.append(f"  {reason}")
     for tid in failed[:_NAMED_FAILURES]:
@@ -506,9 +587,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _soak(args: argparse.Namespace, root: Path, out_dir: Path, venv_dir: Path,
-          paths: tuple[str, ...], runner: Runner) -> int:
+          paths: tuple[str, ...], runner: Runner, which: Callable = shutil.which) -> int:
     subset = paths != DEFAULT_PATHS
     try:
+        bwrap = require_bwrap(which=which)
+        preflight_bwrap(bwrap, runner=runner)
         pins = load_ci_pins(args.ci_workflow or root / ".github" / "workflows" / "ci.yml")
         action = ensure_venv(venv_dir, pins, runner=runner)
         env = build_pytest_env(redirect=repo_redirect_env(runner=runner))
@@ -523,15 +606,26 @@ def _soak(args: argparse.Namespace, root: Path, out_dir: Path, venv_dir: Path,
     sha = head_sha(root, runner=runner)
     xml = junit_path(out_dir)
     print(f"soak_leg: running pytest {' '.join(paths)} -n {args.workers} in {root} (sha {sha}); "
-          f"log {out_dir / 'pytest.log'}", flush=True)
-    pytest_rc = run_pytest(build_pytest_argv(venv_python(venv_dir), out_dir, args.workers, paths),
+          f"leg A in a PID namespace, leg B ({NESTED_MARKER}) bare; log {out_dir / log_name()}",
+          flush=True)
+    python = venv_python(venv_dir)
+    # Leg A: everything except the self-sandboxing tests, inside the PID namespace.
+    pytest_rc = run_pytest(namespaced(build_pytest_argv(python, out_dir, args.workers, paths,
+                                                        nested=False), bwrap),
                            out_dir, runner=runner, repo_root=root, env=env)
+    # Leg B: ONLY the tests that build their own namespaces, deliberately NOT namespaced (they
+    # fail inside an outer one). The kill(-1) exposure is limited to these self-sandboxing tests.
+    nested_rc = run_pytest(build_pytest_argv(python, out_dir, args.workers, paths, nested=True),
+                           out_dir, runner=runner, repo_root=root, env=env,
+                           log_file=log_name(True))
     shell_rc = None if subset else run_shell_outcomes(xml, out_dir, runner=runner, repo_root=root)
-    green, lines = evaluate(xml, pytest_rc, shell_rc, subset=subset, sha=sha, defbranch=defbranch)
+    green, lines = evaluate(xml, pytest_rc, shell_rc, subset=subset, sha=sha, defbranch=defbranch,
+                           nested_xml=junit_path(out_dir, True), nested_rc=nested_rc)
     if green:
         # A full run's tmp_path dirs are large and only useful for diagnosing red; the
         # report and logs stay. Seats share one disk.
         shutil.rmtree(out_dir / "pytest-basetemp", ignore_errors=True)
+        shutil.rmtree(out_dir / "pytest-basetemp-nested", ignore_errors=True)
     print("\n".join(lines))
     return 0 if green else 1
 
@@ -547,7 +641,7 @@ def install_sigterm_handler() -> None:
 
 
 def main(argv: list[str] | None = None, *, runner: Runner = subprocess.run,
-         repo_root: Path = REPO_ROOT) -> int:
+         repo_root: Path = REPO_ROOT, which: Callable = shutil.which) -> int:
     args = parse_args(argv)
     install_sigterm_handler()
     # Absolute: git -C, pytest's cwd and the venv interpreter each resolve from a different dir.
@@ -569,9 +663,9 @@ def main(argv: list[str] | None = None, *, runner: Runner = subprocess.run,
         print(f"soak_leg: {exc}", file=sys.stderr)
         return 2
     if wt is None:
-        return _soak(args, repo_root, out_dir, venv_dir, paths, runner)
+        return _soak(args, repo_root, out_dir, venv_dir, paths, runner, which)
     try:
-        return _soak(args, wt, out_dir, venv_dir, paths, runner)
+        return _soak(args, wt, out_dir, venv_dir, paths, runner, which)
     finally:
         if remove_worktree(repo_root, wt, runner=runner) == 0:
             print(f"soak_leg: removed worktree {wt}")

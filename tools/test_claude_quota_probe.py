@@ -13,6 +13,7 @@ from tools.claude_quota_probe import (
     _cap_sentinel,
     _fresh_statusline,
     _ready_for_submission,
+    _structured_cap,
     probe_session_id,
     run_probe,
 )
@@ -66,6 +67,24 @@ class ClaudeQuotaProbeTest(unittest.TestCase):
         self.assertEqual(
             _cap_sentinel("You've hit your Opus limit · resets 5:10pm"),
             "You've hit your Opus limit · resets 5:10pm",
+        )
+
+    def test_only_full_structured_weekly_usage_is_negative_authority(self) -> None:
+        self.assertEqual(
+            _structured_cap(
+                {"rate_limits": {"seven_day": {"used_percentage": 100}}}
+            ),
+            "structured quota reports seven_day.used_percentage=100",
+        )
+        self.assertIsNone(
+            _structured_cap(
+                {"rate_limits": {"seven_day": {"used_percentage": 99.9}}}
+            )
+        )
+        self.assertIsNone(
+            _structured_cap(
+                {"rate_limits": {"seven_day": {"used_percentage": "100"}}}
+            )
         )
 
     def test_fresh_statusline_requires_post_submit_rate_limits(self) -> None:
@@ -348,6 +367,57 @@ class ClaudeQuotaProbeTest(unittest.TestCase):
         self.assertIsNone(result.statusline_sha256)
         self.assertFalse(result.pong_observed)
         self.assertFalse(any(call[0].endswith("send_keys_submit.sh") for call in calls))
+
+    def test_probe_accepts_fresh_full_structured_quota_without_pong_as_capped(self) -> None:
+        clock = _Clock()
+        calls: list[tuple[str, ...]] = []
+
+        def runner(argv, **kwargs):
+            command = tuple(argv)
+            calls.append(command)
+            if command[:2] == ("tmux", "capture-pane"):
+                return subprocess.CompletedProcess(command, 0, "Claude ready\n❯ \n", "")
+            if command[0].endswith("send_keys_submit.sh"):
+                quota = self.state_root / "recovery" / "quota" / "claude-statusline.json"
+                quota.parent.mkdir(parents=True, exist_ok=True)
+                quota.write_text(
+                    json.dumps(
+                        {
+                            "schema": STATUSLINE_SCHEMA,
+                            "observed_at": "2026-08-04T01:00:01Z",
+                            "session_id": probe_session_id(
+                                "fixture", "recovery", "20260804T010008Z"
+                            ),
+                            "rate_limits": {
+                                "seven_day": {"used_percentage": 100.0}
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        result = run_probe(
+            account="fixture",
+            persona="recovery",
+            executable=self.executable,
+            repo_root=self.repo,
+            state_root=self.state_root,
+            run_id="20260804T010008Z",
+            timeout_seconds=10.0,
+            runner=runner,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            now=clock.now,
+            enforce_identity=False,
+        )
+        self.assertEqual(result.status, "capped")
+        self.assertEqual(
+            result.cap_sentinel,
+            "structured quota reports seven_day.used_percentage=100.0",
+        )
+        self.assertFalse(result.pong_observed)
+        self.assertIsNone(result.statusline_sha256)
 
     def test_probe_refuses_pre_submit_pong_scrollback(self) -> None:
         clock = _Clock()

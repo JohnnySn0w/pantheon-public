@@ -26,6 +26,12 @@ Documentation=file:adr/ORG-052-harness-neutral-host-capability-broker.md
 Requires=dbus.service
 After=dbus.service network-online.target
 Wants=network-online.target
+# T-6352: ~52 min of continuous failure (30 starts/h under the Service-section backoff) ends in
+# ONE latched failed state instead of an unbounded loop. Recover: reset-failed + start.
+# NOTE: system unit with no OnFailure. failed_unit_reconcile's system-scope pass
+# (T-6364) reports a latched failure here as SILENT and pages Recovery on its next sweep.
+StartLimitIntervalSec=3600
+StartLimitBurst=30
 
 [Service]
 Type=dbus
@@ -35,6 +41,10 @@ User=pantheon-hostapproval-ingress
 Group=pantheon-hostapproval-ingress
 Restart=on-failure
 RestartSec=10
+# T-6352: exponential restart backoff (10,16,27,44,73,120s). NRestarts is cumulative
+# (resets only on a manual start/restart), so 120s is also the steady per-crash delay.
+RestartSteps=5
+RestartMaxDelaySec=120
 
 NoNewPrivileges=yes
 CapabilityBoundingSet=

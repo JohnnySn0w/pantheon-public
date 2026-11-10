@@ -29,6 +29,13 @@ try:  # dual-identity-safe (run-as-package vs bare run with cwd=tools/)
     from tools.seat_exec import seat_argv
 except ImportError:  # pragma: no cover
     from seat_exec import seat_argv  # type: ignore
+try:  # T-5655: the exporter's own out-dir constant (never hard-coded here)
+    from tools.health_export import DEFAULT_OUT_DIR as HEALTH_DIR
+except Exception:  # pragma: no cover - fail open: no dir -> every seat counted as today
+    try:
+        from health_export import DEFAULT_OUT_DIR as HEALTH_DIR  # type: ignore
+    except Exception:
+        HEALTH_DIR = None
 
 SCHEMA = "pantheon-metrics/1"
 NCPU = os.cpu_count() or 1
@@ -183,6 +190,52 @@ def _svc_show(account, service, prop):
     return out.stdout.strip()
 
 
+# T-5655: ORG-106 decision 6 -- an expected deep-sleep is calm, not an incident.
+# Source of truth for "asleep" = health_export's per-persona record
+# (<HEALTH_DIR>/<persona>.json, rewritten every 60s on THIS account), the same field kino's
+# "asleep" glance keys on. No sudo, no second reader of the seat-state record. The
+# per-persona `exported_at` is authoritative (health_export stamps each record with its
+# own run time); the _exporter.json heartbeat adds nothing a fresh record lacks.
+HEALTH_RECORD_MAX_AGE_SEC = 180  # 3 exporter cycles; age > this = stale = ignored
+
+
+def _expected_down(persona, health_dir=None, now=None):
+    """True ONLY for a fresh (age <= HEALTH_RECORD_MAX_AGE_SEC), well-formed health record
+    whose `expected_down` is exactly True. FAIL-OPEN: a missing, stale, future-dated,
+    unreadable, malformed or wrongly-typed record is False, so the seat is counted exactly
+    as before and an outage can never read as calm."""
+    try:
+        base = HEALTH_DIR if health_dir is None else health_dir
+        if base is None:
+            return False
+        with open(os.path.join(str(base), f"{persona}.json"), "r", encoding="ascii") as f:
+            doc = json.loads(f.read(65536))
+        exported_at = doc.get("exported_at")
+        if isinstance(exported_at, bool) or not isinstance(exported_at, (int, float)):
+            return False
+        age = (time.time() if now is None else now) - exported_at
+        if age < 0 or age > HEALTH_RECORD_MAX_AGE_SEC:
+            return False
+        return doc.get("expected_down") is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def count_cluster(entries):
+    """(up, total) from [(state, asleep)] per roster row. A row is dropped from the TOTAL
+    only when it is a confirmed "down" AND expected-down (asleep); it is never counted up.
+    A live asleep-flagged seat and an "unknown" probe stay in the total (T-4070 principle:
+    unknown is not a negative). So 0 <= up <= total always holds."""
+    up = total = 0
+    for state, asleep in entries:
+        if state == "down" and asleep:
+            continue
+        total += 1
+        if state not in ("down", "unknown"):
+            up += 1
+    return up, total
+
+
 def _host_up(entry):
     """Coarse reachability for one UPLINK host. local -> True (the collector runs
     on it). ssh -> up unless ssh reports a transport/connect failure (exit 255)
@@ -219,7 +272,7 @@ def collect(roster, sample_sec=1.0):
     dtot = max(tot1 - tot0, 1)
     cap_ns = sample_sec * 1e9 * NCPU  # total CPU-ns capacity over the interval
 
-    members, up = [], 0
+    members, entries = [], []
     for m in roster:
         lbl, kind = m["label"], m["kind"]
         c = ctx[lbl]
@@ -246,18 +299,28 @@ def collect(roster, sample_sec=1.0):
             mem = round((int(memc) / memtotal * 100.0), 1) if memc.isdigit() and memtotal else 0.0
             active = _svc_show(m["acct"], m["service"], "ActiveState")
             state = "unknown" if active is None else ("idle" if active == "active" else "down")
+        # T-5655: asked only for a probe-CONFIRMED down, before the legacy unknown->down
+        # remap below (a failed probe must never be excluded as "asleep"). Persona == label
+        # for every seat row; the echo service has no seat record.
+        asleep = (state == "down" and kind in ("agent", "codex") and _expected_down(lbl))
+        if asleep:
+            print(f"[pantheon_metrics_gen] {lbl}: expected-down (ORG-106 deep-sleep); "
+                  f"excluded from agents_total, state stays 'down' (T-5655)", file=sys.stderr)
         if state == "unknown" and not EMIT_UNKNOWN:
             print(f"[pantheon_metrics_gen] {lbl}: probe FAILED; rendering the legacy 'down' "
                   f"until the site accepts 'unknown' (T-4070)", file=sys.stderr)
             state = "down"
-        if state not in ("down", "unknown"):
-            up += 1
+        entries.append((state, asleep))
         members.append({"label": lbl, "cpu_pct": cpu, "mem_pct": mem, "state": state})
 
     with open("/proc/loadavg") as f:
         load1 = float(f.read().split()[0])
+    # agents_total = seats EXPECTED to be running (T-5655): a confirmed expected-down
+    # (ORG-106 deep-sleep) seat is omitted from it, so it can be < len(agents); that seat
+    # still appears in `agents` with state "down". No new key or state (public schema).
+    up, total = count_cluster(entries)
     cluster = {"load_pct": round(min(load1 / NCPU * 100.0, 100.0), 1),
-               "agents_up": up, "agents_total": len(roster)}
+               "agents_up": up, "agents_total": total}
     hosts = [{"label": h["label"], "up": _host_up(h)} for h in HOSTS_ROSTER]
     return {"schema": SCHEMA,
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

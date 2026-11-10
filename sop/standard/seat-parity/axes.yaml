@@ -20,7 +20,7 @@
 # Version bump on any axis addition/retirement/tier-shift.
 
 schema_version: 1
-manifest_version: 6  # T-4160: codex-worker-guard-hook-trusted widened to the five Claude seats with a codex fallback. v5 = T-4155: HARD axis codex-worker-guard-hook-trusted (codex seat only). v4 = T-3766 tranche 5: domain-scope-declared applies_to narrowed to domain-scoped seats only (orch tier excluded per the operator's 2026-09-07 no-domain-scoping ratification)
+manifest_version: 7  # T-4990: codex-lifecycle-hooks-trusted added for every Codex runtime. v6 = T-4160: worker-guard axis widened to Claude seats with a fallback.
 
 axes:
 
@@ -188,17 +188,18 @@ axes:
     # returned rc=2 → UNMEASURABLE for 7/8 seats (recovery=P was the self-case
     # where cwd happened to be right). Absolute path is deterministic across
     # sudo-wrap boundaries.
-    check_ref: "python3 /home/<account>/pantheon-config/tools/delivery_reachability.py --json --dry-run | python3 -c 'import json,sys; d=json.load(sys.stdin); items=d if isinstance(d,list) else d.get(\"results\",[]); r=[x for x in items if x.get(\"agent\")==\"<persona>\"]; print(\"true\" if r and r[0].get(\"state\")==\"READY\" else \"false\")'"
+    check_ref: "python3 /home/<account>/pantheon-config/tools/delivery_reachability.py --json --dry-run | python3 -c 'import json,sys; d=json.load(sys.stdin); items=d if isinstance(d,list) else d.get(\"results\",[]); r=[x for x in items if x.get(\"agent\")==\"<persona>\"]; print(\"true\" if r and r[0].get(\"state\") in (\"READY\",\"ASLEEP\") else \"false\")'"
     gap_history: [T-2232, T-3766]
 
   - axis_id: codex-worker-guard-hook-trusted
     tier: HARD
-    description: "Codex's worker-guard PreToolUse hook (T-4144) is wired AND trusted, its matcher covers Bash + apply_patch, and no other trusted hook is undeclared by the codex-config snippet. Codex silently SKIPS an untrusted hook (T-3244), so losing the entry or its trusted_hash leaves codex subagents unguarded with no error."
+    description: "Codex's worker-guard PreToolUse hook (T-4144) is wired AND trusted, its matcher covers Bash + apply_patch, and no other trusted hook is undeclared by the canonical harness/codex snippet. Codex silently SKIPS an untrusted hook (T-3244), so losing the entry or its trusted_hash leaves codex subagents unguarded with no error."
     # T-4160: widened from [peer-daemon-codex] to every seat with a codex runtime.
     # The five Claude seats below carry codex as a FALLBACK (harness_runtime.roles.
     # <role>.fallbacks), and codex 0.147 ships multi_agent default-on, so a failover
-    # could spawn unguarded codex subagents. Those seats have no codex-config clone:
-    # the check then declares no other hook (the guard must be the only one).
+    # could spawn unguarded codex subagents. Every seat reads the canonical snippet
+    # from its own pantheon-config/harness/codex tree; the check declares no other
+    # hook for Claude-primary seats (the guard must be the only one).
     applies_to: [peer-daemon-codex, head-engineering-orchestrator, specialist, head-system-orchestrator, engineering-orchestrator-1, engineering-orchestrator-2]
     source_of_truth: pantheon-config/tools/codex_hook_trust_check.py
     check_method: file_grep
@@ -213,11 +214,20 @@ axes:
     # missing hook. --timeout 20 sits under PROBE_TIMEOUT (30) so a hung app-server
     # reports its own UNMEASURABLE reason instead of a bare runner timeout.
     # T-4160: the second gate refuses a seat-clone copy older than CHECK_CONTRACT 2.
-    # The contract-1 tool (T-4155) reads a Claude seat's missing codex-config snippet
-    # as unreadable, and its errno text trips file_grep's FAIL branch, which would
-    # page orchestrator over a stale clone instead of a missing guard.
+    # The contract-1 tool (T-4155) read a Claude seat's missing standalone snippet
+    # as unreadable. Its errno text tripped file_grep's FAIL branch and paged orchestrator
+    # over a stale clone instead of a missing guard; contract 2 uses the in-repo path.
     check_ref: 'f=/home/<account>/pantheon-config/tools/codex_hook_trust_check.py; test -r "$f" || { echo "codex_hook_trust_check.py missing from the seat clone; see fleet_clone_currency_check" >&2; exit 3; }; grep -Eq "^CHECK_CONTRACT = [2-9]$" "$f" || { echo "seat-clone codex_hook_trust_check.py predates CHECK_CONTRACT 2; see fleet_clone_currency_check" >&2; exit 3; }; python3 "$f" --timeout 20'
     gap_history: [T-4144, T-4155, T-4160]
+
+  - axis_id: codex-lifecycle-hooks-trusted
+    tier: HARD
+    description: "Codex SessionStart orientation and Stop continuation hooks are present, enabled, trusted, and carry the canonical matcher/timeouts. Missing hooks silently remove Pantheon orientation on a Codex failover."
+    applies_to: [peer-daemon-codex, head-engineering-orchestrator, specialist, head-system-orchestrator, head-memory-orchestrator, system-orchestrator-1, engineering-orchestrator-1, engineering-orchestrator-2]
+    source_of_truth: pantheon-config/tools/harness_adapter/codex.py
+    check_method: file_grep
+    check_ref: 'f=/home/<account>/pantheon-config/tools/codex_hook_trust_check.py; test -r "$f" || { echo "codex_hook_trust_check.py missing from the seat clone; see fleet_clone_currency_check" >&2; exit 3; }; grep -q "^CHECK_CONTRACT = 3$" "$f" || { echo "seat-clone codex_hook_trust_check.py predates lifecycle contract 3; see fleet_clone_currency_check" >&2; exit 3; }; python3 "$f" --timeout 20 --lifecycle-only'
+    gap_history: [T-4990]
 
   # ==================== SOFT (§3.2) ====================
 
@@ -357,12 +367,9 @@ axes:
     gap_history: [T-3722]
 
   - axis_id: chronicle-archive-after-last-restart
-    tier: SOFT
+    tier: HARD
     description: "Seat's last session end is archived to its Chronicle (T-5016; the operator TG 11829/11830: every seat must have session history). Boolean via session_chronicle coverage --bool."
-    # T-5016 (2026-10-15): lands SOFT, not HARD. coverage prints false while a
-    # seat's last restart is not yet knowable (no archive since the controller
-    # hooks shipped), so HARD would page orchestrator for every seat until each one
-    # restarts on the new code. Promote to HARD once the fleet has cycled.
+    # Promoted SOFT->HARD 2026-11-05 once session_chronicle coverage --bool read true on every seat (T-5019).
     # Absolute seat-clone path + test -r guard: same reasons as
     # delivery-mode-substrate-match and codex-worker-guard-hook-trusted (a stale
     # clone reports UNMEASURABLE, not FAIL).
@@ -371,6 +378,20 @@ axes:
     check_method: canary
     check_ref: 'f=/home/<account>/pantheon-config/tools/session_chronicle.py; test -r "$f" || { echo "session_chronicle.py missing from the seat clone; see fleet_clone_currency_check" >&2; exit 3; }; python3 "$f" coverage --persona <persona> --bool'
     gap_history: [T-3561, T-5016]
+
+  - axis_id: transcript-coverage-7d
+    tier: SOFT
+    description: "At least 90% of the seat's non-hollow session ends in the last 7 days have a transcript, archived or receipted by the memex ingester (T-6118 PR-4). Boolean via session_chronicle transcript-coverage --bool."
+    # T-6118 (2026-11-04): lands SOFT because the 7-day window still holds
+    # pre-PR-2 records (no transcript .gz) until 2026-11-11, so it reads false
+    # fleet-wide for the first week. Promote once the window has rolled over.
+    # Absolute seat-clone path + test -r guard: same reasons as
+    # chronicle-archive-after-last-restart.
+    applies_to: all-seats
+    source_of_truth: pantheon-config/tools/session_chronicle.py
+    check_method: canary
+    check_ref: 'f=/home/<account>/pantheon-config/tools/session_chronicle.py; test -r "$f" || { echo "session_chronicle.py missing from the seat clone; see fleet_clone_currency_check" >&2; exit 3; }; python3 "$f" transcript-coverage --persona <persona> --days 7 --bool'
+    gap_history: [T-6118]
 
   # ==================== BILLING (§3.3) ====================
 

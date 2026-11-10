@@ -87,11 +87,18 @@ target-uid executor; nothing here installs, enables, or dispatches anything.
   deferred here from T-2913 by its OQ6 disposition.
   - It transcribes the approval package's wire names rather than importing
     them (gate 18), and tests pin the transcription.
-  - `ApprovalGet` answers only for an approval handle that one of the
-    caller's own operations carries. This is NOT full subject binding: a
-    caller already holding a handle can attach it to its own throwaway
-    Apply and then read the grant's state (not consume it). Full binding
-    needs the approval service to report the owner (follow-up, 5a review S1).
+  - `ApprovalGet` is bound to the caller's own plan (ORG-052 section 4,
+    gate 15; T-4875). The approval service's `ApprovalStatus` payload
+    (schema `pantheon-approval-status/v2`) carries the grant's
+    `plan_handle` and `plan_owner`. The broker answers only if one of the
+    caller's own operations carries the handle, the payload's `plan_owner`
+    is the caller's seat, and one of the caller's operations carries the
+    handle on that `plan_handle`. Otherwise it answers
+    `UnknownHandle("unknown approval handle")`, the same as for a
+    nonexistent handle. Attaching someone else's handle to a throwaway
+    Apply no longer discloses its state. A v1 or unbound payload fails
+    closed. A granted handle that no operation carries yet still reads as
+    unknown (the pre-Apply gap).
 - *Per-uid rate limiting* (`ratelimit.py`). In-memory buckets keyed by the
   bus-derived uid, with separate mutating and read budgets. The check order
   is identity, then budget, then domain.

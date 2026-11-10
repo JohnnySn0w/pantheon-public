@@ -25,6 +25,10 @@ It never moves, edits or deletes a message. Exit 0 clean, 1 anomalies found,
 
 Run with the mailbox group (hub reads need it):
     sg pantheon-mailbox -c 'python3 tools/mailbox_integrity_audit.py [--days 7] [--json]'
+The hub root is traverse-only (0710). A seat that can sudo as the hub owner (recovery) lists
+it that way. Any other mailbox-group seat (watchman) audits the registry-known inboxes,
+which is accepted only when the hub's subdirectory count proves they are all of them;
+otherwise it exits 2 (T-6142).
 """
 from __future__ import annotations
 
@@ -134,22 +138,67 @@ def audit_file(path: Path, report: Report, *, persona_accounts: dict[str, str],
         flag("owner-mismatch", f"sender {sender} expects {acct}, file owned by {owner}")
 
 
-def list_inboxes(hub: Path, *, run=subprocess.run) -> list[str]:
+# Inboxes that are not a persona (T-6142; mail_staleness_monitor's CANDIDATE_INBOXES
+# lesson: a list of names cannot contain the box nobody named, so st_nlink checks it).
+NON_PERSONA_INBOXES = ("specialist-a2a",)
+
+
+def candidate_inboxes() -> list[str]:
+    """Every inbox name we know without listing the hub: each registry persona plus the
+    non-persona boxes."""
+    from tools import agent_role_map as arm
+    return sorted(set(arm.account_persona_map().values()) | set(NON_PERSONA_INBOXES))
+
+
+def list_inboxes(hub: Path, *, run=subprocess.run, candidates=None) -> list[str]:
     """Inbox names under the hub. The hub root is traverse-only for the mailbox group
     (mode 710), so when a direct listing is refused, list it AS the hub owner
-    (seat_exec.seat_argv, the mailbox_traffic_report pattern). Raises OSError when
-    neither works: an unlistable hub is never reported as an empty, clean one."""
+    (seat_exec.seat_argv, the mailbox_traffic_report pattern). A recovery seat that may
+    not sudo as the owner (watchman, T-6142) falls back to probing the known inbox names
+    by traverse, and that result is used ONLY when the hub's st_nlink proves it is every
+    subdirectory. Raises OSError otherwise: an unlistable or partly-seen hub is never
+    reported as a clean one."""
     try:
         names = os.listdir(hub)
     except PermissionError:
         from tools.mailbox_traffic_report import hub_owner
         from tools.seat_exec import seat_argv
-        r = run(seat_argv(hub_owner(str(hub)), ["ls", "-1A", str(hub)]),
-                capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            raise PermissionError(f"listing {hub} as its owner exited {r.returncode}")
-        names = r.stdout.split()
+        try:
+            r = run(seat_argv(hub_owner(str(hub)), ["ls", "-1A", str(hub)]),
+                    capture_output=True, text=True, timeout=60)
+            owner_rc = r.returncode
+        except (OSError, subprocess.SubprocessError) as exc:
+            r, owner_rc = None, f"error ({exc})"
+        if r is not None and owner_rc == 0:
+            names = r.stdout.split()
+        else:
+            names = _probe_known_inboxes(hub, candidate_inboxes() if candidates is None
+                                         else candidates, owner_rc)
     return sorted(n for n in names if not n.startswith("."))
+
+
+def _is_real_dir(p: Path) -> bool:
+    try:
+        return stat.S_ISDIR(os.lstat(p).st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def _probe_known_inboxes(hub: Path, candidates, owner_rc) -> list[str]:
+    # lstat, not is_dir(): a symlinked name adds nothing to st_nlink, so it could stand in
+    # for an unnamed real inbox and make a partial view pass the completeness check
+    found = [n for n in candidates if _is_real_dir(hub / n)]
+    nlink = os.stat(hub).st_nlink
+    if nlink < 2:  # a filesystem that does not count subdirs (btrfs): unverifiable
+        raise PermissionError(f"listing {hub} as its owner exited {owner_rc}, and its "
+                              f"subdirectory count is unverifiable (st_nlink {nlink})")
+    expected = nlink - 2
+    if len(found) < expected:
+        raise PermissionError(
+            f"listing {hub} as its owner exited {owner_rc}; probed {len(found)} known "
+            f"inbox(es) but the hub has {expected} subdirectories, {expected - len(found)} "
+            "NOT auditable from this seat (run as recovery or the hub owner)")
+    return found
 
 
 def iter_messages(hub: Path, *, days: float, now: float, run=subprocess.run):

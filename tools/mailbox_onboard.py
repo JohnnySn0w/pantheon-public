@@ -54,8 +54,9 @@ Two-step shape, mirroring the sibling `tools/consume_onboard.py` (T-2679):
                 persona), the whole mailbox organ converges -- no single
                 invocation needs cross-account privilege.
 
-  verify     -- read-only. Hub subdir presence, group membership, wake-timer
-                enabled state, per persona (or all personas if --persona is
+  verify     -- read-only. Hub subdir presence, maildir ACL (every group member
+                rwx, access+default, on the maildir/new/tmp; T-6009), group
+                membership, wake-timer enabled state, per persona (or all personas if --persona is
                 omitted).
 
   teardown   -- dry-run by default. Disables + removes one persona's wake
@@ -162,6 +163,7 @@ class HostIdentity(Protocol):
     def user_exists(self, account: str) -> bool: ...
     def group_exists(self, group: str) -> bool: ...
     def user_in_group(self, account: str, group: str) -> tuple[bool, str]: ...
+    def group_members(self, group: str) -> tuple[str, ...]: ...
 
 
 class RealHostIdentity:
@@ -182,6 +184,23 @@ class RealHostIdentity:
     def user_in_group(self, account: str, group: str) -> tuple[bool, str]:
         return group_membership_lookup(account, group)
 
+    def group_members(self, group: str) -> tuple[str, ...]:
+        """T-6009: every account in the group; empty when the group is absent.
+
+        gr_mem lists SUPPLEMENTARY members only, so accounts whose PRIMARY gid is the
+        group are added from the passwd database (recovery, D15 sign-off). Order: gr_mem
+        first, then primary-gid accounts, de-duplicated."""
+
+        try:
+            entry = grp.getgrnam(group)
+        except KeyError:
+            return ()
+        members = list(entry.gr_mem)
+        for pw in pwd.getpwall():
+            if pw.pw_gid == entry.gr_gid and pw.pw_name not in members:
+                members.append(pw.pw_name)
+        return tuple(members)
+
 
 class FakeHostIdentity:
     def __init__(
@@ -189,10 +208,12 @@ class FakeHostIdentity:
         users: Sequence[str] = (),
         groups: Sequence[str] = (),
         memberships: Mapping[tuple[str, str], tuple[bool, str]] | None = None,
+        members: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self.users = set(users)
         self.groups = set(groups)
         self.memberships = dict(memberships or {})
+        self.members = {g: tuple(m) for g, m in (members or {}).items()}  # T-6009: group -> gr_mem
 
     def user_exists(self, account: str) -> bool:
         return account in self.users
@@ -202,6 +223,9 @@ class FakeHostIdentity:
 
     def user_in_group(self, account: str, group: str) -> tuple[bool, str]:
         return self.memberships.get((account, group), (False, f"{account} not in {group} (unscripted)"))
+
+    def group_members(self, group: str) -> tuple[str, ...]:
+        return self.members.get(group, ())
 
 
 # --------------------------------------------------------------------------
@@ -570,6 +594,90 @@ def provision(
 
 
 # --------------------------------------------------------------------------
+# T-6009: maildir ACL -- pure parse/evaluate over `getfacl -p` text. Mode 02770 and
+# group::--- grant the mailbox group nothing on the live hub: delivery rides per-user
+# named ACLs (access AND default), so verify reads those, never the mode.
+# --------------------------------------------------------------------------
+
+ACL_WANT = "rwx"
+
+
+def parse_getfacl(text: str) -> dict[str, dict]:
+    """{abs path: {owner, owner_access, owner_default, access:{user:perms}, default:{user:perms},
+    mask, default_mask}} from `getfacl -p` output. ``#effective:`` comments are ignored."""
+
+    parsed: dict[str, dict] = {}
+    entry: dict | None = None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("# file:"):
+            entry = parsed[line.split(":", 1)[1].strip()] = {
+                "owner": "", "owner_access": None, "owner_default": None,
+                "access": {}, "default": {}, "mask": None, "default_mask": None,
+            }
+            continue
+        if entry is None or not line:
+            continue
+        if line.startswith("# owner:"):
+            entry["owner"] = line.split(":", 1)[1].strip()
+            continue
+        line = line.split("#", 1)[0].strip()
+        kind = "default" if line.startswith("default:") else "access"
+        fields = line.removeprefix("default:").split(":")
+        if len(fields) != 3:
+            continue
+        tag, qualifier, perms = fields
+        if tag == "user" and qualifier:
+            entry[kind][qualifier] = perms
+        elif tag == "user":
+            entry["owner_default" if kind == "default" else "owner_access"] = perms
+        elif tag == "mask":
+            entry["default_mask" if kind == "default" else "mask"] = perms
+    return parsed
+
+
+def _effective(perms: str, mask: str | None) -> str:
+    if mask is None:
+        return perms
+    return "".join(p if p == m else "-" for p, m in zip(perms.ljust(3, "-"), mask.ljust(3, "-")))
+
+
+def _entry_gap(entry: dict, kind: str, account: str, owner: str) -> str | None:
+    if account == owner and entry["owner"] == account:  # the file owner rides user::, which no mask touches
+        perms = entry["owner_default" if kind == "default" else "owner_access"]
+        return None if perms == ACL_WANT else f"{kind} user:: is {perms or 'missing'}, want {ACL_WANT}"
+    perms = entry[kind].get(account)
+    if perms is None:
+        return f"{kind} ACL entry missing"
+    mask_name = "default:mask::" if kind == "default" else "mask::"
+    mask = entry["default_mask" if kind == "default" else "mask"]
+    if _effective(perms, mask) == ACL_WANT:
+        return None
+    if perms == ACL_WANT:
+        return f"{kind} ACL entry {perms} masked by {mask_name}{mask}"
+    return f"{kind} ACL entry is {perms}, want {ACL_WANT}"
+
+
+def acl_gaps(parsed: Mapping[str, dict], paths: Sequence[str], members: Sequence[str], owner: str) -> tuple[str, ...]:
+    """Every (member, path, access|default) short of effective rwx; fail closed on an unobserved path or no members."""
+
+    if not members:
+        return ("no mailbox group members observed (cannot evaluate)",)
+    gaps: list[str] = []
+    for path in paths:
+        entry = parsed.get(path)
+        if entry is None:
+            gaps.append(f"{path}: no ACL observed")
+            continue
+        for account in members:
+            for kind in ("access", "default"):
+                gap = _entry_gap(entry, kind, account, owner)
+                if gap:
+                    gaps.append(f"{account} {path}: {gap}")
+    return tuple(gaps)
+
+
+# --------------------------------------------------------------------------
 # verify() -- read-only.
 # --------------------------------------------------------------------------
 
@@ -580,6 +688,30 @@ class VerifyCheck:
     name: str
     ok: bool
     detail: str
+
+
+def _probe(runner: CommandRunner, argv: Sequence[str]) -> tuple[CommandResult | None, str]:
+    """T-6092: run a read-only observation; a missing binary is (None, message), not an escaping FileNotFoundError."""
+
+    try:
+        return runner.run(argv), ""
+    except FileNotFoundError:
+        return None, f"{argv[0]} not found (cannot observe: {' '.join(argv)})"
+
+
+def _acl_check(
+    ctx: MailboxContext, binding: PersonaBinding, hub_dir: Path, runner: CommandRunner, host_identity: HostIdentity
+) -> VerifyCheck:
+    """T-6009: every mailbox-group member holds effective rwx (access + default) on the maildir, new/ and tmp/."""
+
+    paths = (hub_dir, hub_dir / "new", hub_dir / "tmp")
+    result, unobserved = _probe(runner, ["getfacl", "-p", *map(str, paths)])  # read-only; rc!=0 for a missing path -> no ACL observed
+    if result is None:
+        return VerifyCheck(binding.persona, "maildir_acl", False, unobserved)
+    members = host_identity.group_members(ctx.mailbox_group)
+    gaps = acl_gaps(parse_getfacl(result.stdout), tuple(map(str, paths)), members, ctx.hub_owner)
+    detail = "; ".join(gaps) or f"{len(members)} {ctx.mailbox_group} members hold rwx (access+default) on {len(paths)} paths"
+    return VerifyCheck(binding.persona, "maildir_acl", not gaps, detail)
 
 
 def verify_persona(
@@ -595,13 +727,20 @@ def verify_persona(
         ok = path.is_dir()
         checks.append(VerifyCheck(binding.persona, f"hub.{sub}", ok, f"{path} {'present' if ok else 'MISSING'}"))
 
+    if hub_dir.is_dir():  # an absent maildir is hub.*'s finding, once
+        checks.append(_acl_check(ctx, binding, hub_dir, runner, host_identity))
+
     member_ok, member_detail = host_identity.user_in_group(binding.account, ctx.mailbox_group)
     checks.append(VerifyCheck(binding.persona, "group_membership", member_ok, member_detail))
 
     timer_unit = f"{WAKE_UNIT_STEM}@{binding.persona}.timer"
-    result = runner.run(["systemctl", "--user", "is-enabled", timer_unit])
-    enabled = result.returncode == 0 and result.stdout.strip() == "enabled"
-    detail = result.stdout.strip() or result.stderr.strip() or "unknown"
+    result, unobserved = _probe(runner, ["systemctl", "--user", "is-enabled", timer_unit])
+    # T-6092: an unobserved state is never healthy -- every branch below fails closed.
+    if result is None:
+        enabled, detail = False, unobserved
+    else:
+        enabled = result.returncode == 0 and result.stdout.strip() == "enabled"
+        detail = result.stdout.strip() or result.stderr.strip() or "unknown"
     # T-2702: the assertion direction flips with the allowlist -- for an
     # allowlisted (standalone-wake) persona, healthy means enabled; for
     # everyone else, healthy means NOT enabled (their wake path is the
@@ -619,12 +758,12 @@ def verify_persona(
             VerifyCheck(
                 binding.persona,
                 "wake_timer.secondary",
-                True,
-                f"allowed secondary waker (not provisioned here); observed: {detail}",
+                result is not None,
+                detail if result is None else f"allowed secondary waker (not provisioned here); observed: {detail}",
             )
         )
     else:
-        checks.append(VerifyCheck(binding.persona, "wake_timer.not_enabled", not enabled, detail))
+        checks.append(VerifyCheck(binding.persona, "wake_timer.not_enabled", result is not None and not enabled, detail))
 
     return tuple(checks)
 

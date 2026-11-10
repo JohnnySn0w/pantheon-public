@@ -1669,9 +1669,11 @@ class LocalReceiverBackend:
         *,
         expected: Literal["present", "absent"],
         topology_phase: TopologyPhase = "managed",
+        wait: bool = True,
     ) -> Mapping[str, str]:
         phase_binding = self._phase_binding(binding, topology_phase)
-        if phase_binding.claude_receiver_topology != "runtime-owned":
+        # T-6016: wait=False is a single-shot read for callers holding the runtime-operation lock.
+        if not wait or phase_binding.claude_receiver_topology != "runtime-owned":
             return self._claude_state_once(binding, expected, topology_phase=topology_phase)
         deadline = time.monotonic() + float(self.timeout_seconds)
         last: BridgeError | None = None
@@ -1692,9 +1694,10 @@ class LocalReceiverBackend:
         *,
         kind: str,
         topology_phase: TopologyPhase = "managed",
+        wait: bool = True,
     ) -> Mapping[str, str]:
         if kind == "claude":
-            return self._require_claude_state(binding, expected="absent", topology_phase=topology_phase)
+            return self._require_claude_state(binding, expected="absent", topology_phase=topology_phase, wait=wait)
         unit = binding.claude_receiver_unit if kind == "claude" else binding.codex_receiver_unit
         probe = self._unit_probe(unit)
         inactive = probe.active_state in {"inactive", "failed"} and probe.main_pid in {"", "0"}
@@ -1710,9 +1713,10 @@ class LocalReceiverBackend:
         *,
         kind: str,
         topology_phase: TopologyPhase = "managed",
+        wait: bool = True,
     ) -> Mapping[str, str]:
         if kind == "claude":
-            return self._require_claude_state(binding, expected="present", topology_phase=topology_phase)
+            return self._require_claude_state(binding, expected="present", topology_phase=topology_phase, wait=wait)
         unit = binding.claude_receiver_unit if kind == "claude" else binding.codex_receiver_unit
         probe = self._unit_probe(unit)
         if probe.active_state != "active" or probe.main_pid in {"", "0"}:
@@ -1867,6 +1871,9 @@ def render_unit(binding: CodexTelegramBinding) -> str:
             "Description=Pantheon Codex Telegram poller",
             "After=network-online.target",
             "Wants=network-online.target",
+            # T-6352: bound a sustained failure to one latched failed state.
+            "StartLimitIntervalSec=3600",
+            "StartLimitBurst=30",
             "",
             "[Service]",
             "Type=simple",
@@ -1874,6 +1881,9 @@ def render_unit(binding: CodexTelegramBinding) -> str:
             "ExecStart=/usr/bin/python3 %h/pantheon-config/tools/codex_telegram_bridge.py exec --mode poller",
             "Restart=always",
             "RestartSec=5",
+            # T-6352: exponential backoff (5..120s); NRestarts is cumulative.
+            "RestartSteps=5",
+            "RestartMaxDelaySec=120",
             "",
             "[Install]",
             "WantedBy=default.target",
@@ -4249,6 +4259,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     receiver_state.add_argument("--expected", choices=("present", "absent"), required=True)
     receiver_state.add_argument("--topology-phase", choices=("managed", "predecessor"), default=None)
     receiver_state.add_argument("--manifest", type=Path, default=_default_manifest_path())
+    receiver_state.add_argument("--no-wait", action="store_true", help="single-shot probe; never poll (T-6016)")
     receiver_state.add_argument("--json", action="store_true")
     snapshot_state = sub.add_parser("topology-snapshot-state")
     snapshot_state.add_argument("--persona", required=True)
@@ -4438,9 +4449,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise BridgeError("topology phase applies only to Claude receiver-state proof")
             topology_phase: TopologyPhase = args.topology_phase or "managed"
             if args.expected == "present":
-                evidence = backend._require_present(binding, kind=args.kind, topology_phase=topology_phase)
+                evidence = backend._require_present(binding, kind=args.kind, topology_phase=topology_phase, wait=not args.no_wait)
             else:
-                evidence = backend._require_absent(binding, kind=args.kind, topology_phase=topology_phase)
+                evidence = backend._require_absent(binding, kind=args.kind, topology_phase=topology_phase, wait=not args.no_wait)
             receipt = ReceiverStateReceipt(
                 schema="pantheon-codex-telegram-receiver-state/v1",
                 persona=binding.persona,

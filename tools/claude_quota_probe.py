@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
 
 from tools.claude_statusline_capture import SCHEMA as STATUSLINE_SCHEMA
+from tools.submit_verify import first_paste_render_wait
 
 
 PROBE_SCHEMA = "pantheon-claude-quota-probe/v1"
@@ -134,6 +135,25 @@ def _cap_sentinel(text: str) -> str | None:
         if match:
             return match.group(1)
     return None
+
+
+def _structured_cap(statusline: Mapping[str, Any] | None) -> str | None:
+    """Return a negative-authority cap from fresh, session-bound quota data."""
+
+    if statusline is None:
+        return None
+    rate_limits = statusline.get("rate_limits")
+    if not isinstance(rate_limits, Mapping):
+        return None
+    seven_day = rate_limits.get("seven_day")
+    if not isinstance(seven_day, Mapping):
+        return None
+    used = seven_day.get("used_percentage")
+    if isinstance(used, bool) or not isinstance(used, (int, float)):
+        return None
+    if not math.isfinite(float(used)) or float(used) < 100.0:
+        return None
+    return f"structured quota reports seven_day.used_percentage={used}"
 
 
 def _ready_for_submission(text: str) -> bool:
@@ -382,7 +402,7 @@ def run_probe(
                         "--harness",
                         "claude-code",
                         "--render-wait",
-                        "8",
+                        f"{first_paste_render_wait('claude-code'):g}",  # T-6293: profile is the source
                         tmux_target,
                         PROMPT,
                     ),
@@ -410,6 +430,7 @@ def run_probe(
                 baseline_sha256=baseline_statusline_sha256,
                 expected_session_id=expected_session_id,
             )
+            cap = cap or _structured_cap(candidate)
             observed = candidate if pong_observed else None
             if cap is None and observed is None:
                 sleep(0.25)

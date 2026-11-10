@@ -10304,7 +10304,7 @@ def _deny(reason: str) -> dict:
 def _reason(what: str) -> dict:
     return _deny(
         f"BLOCKED (worker-guard, T-1345): a subagent attempted {what}. This is "
-        "reserved to the head orchestrator / project-orchestrator tier and is "
+        "reserved to the head orchestrator (HO-exclusive since T-1673) and is "
         "structurally denied to workers after the 2026-06-27 runaway. If you "
         "believe you need this, STOP and report the need to your dispatcher in "
         "your final message — do not route around this guard."
@@ -12992,7 +12992,11 @@ _FED_ACTIVE = [False]
 _ENV_S_ACTIVE = [False]
 
 
-_HO_RECORDS_WHAT = "to write/commit orchestrator-owned protected docs (ledger / ADR / notes \u2014 and, inside an isolation worktree, the full protected-doc set: rulebook / bugs / incidents / lessons / sop / BACKLOG / goals / README)"
+_HO_RECORDS_WHAT = ("to write/commit orchestrator-owned protected docs (ledger / ADR / "
+                    "notes \u2014 and, inside an isolation worktree, the full protected-doc set: "
+                    "rulebook / bugs / incidents / lessons / sop / BACKLOG / goals / README). "
+                    "For read-only inspection, use the Read tool (or the Grep tool for "
+                    "searches)")
 
 
 def _decide_py_startup(runs: str, cwd: str) -> dict | None:
@@ -13251,7 +13255,8 @@ _SF_REASONS = {
     "path": ("to run a command after a `PATH=` that {} (T-5505): the hook cannot tell which "
              "file a bare command name runs. Use only absolute PATH entries that exist before "
              "this call (`PATH=/abs/bin:$PATH cargo build`), or run the program by its literal "
-             "absolute path"),
+             "absolute path. For a virtualenv, skip `source .venv/bin/activate` and run the "
+             "literal interpreter instead (`/abs/repo/.venv/bin/python -m pytest`)"),
     "relay": ("to hand a shell its script through {} (T-5505): the hook cannot see which file "
               "runs. Run each script by a literal path (`bash /abs/x.sh`), one per command"),
     "dynhead": ("to run a command whose name is built at run time (T-5662): `{}` is a "
@@ -14761,7 +14766,7 @@ def _sf_final_core() -> dict | None:
     if not st["runs"]:
         return None
     if st["bulk"]:
-        return _sf_reason("bulk", f"`{st['bulk'][0]}`")
+        return _sf_reason("bulk", st["bulk"][0])
     names: set = set()
     paths: set = set()
     inodes: set = set()

@@ -33,7 +33,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools.chronicle import CHRONICLE_ROOT, scrub_credentials  # noqa: E402
+from tools.chronicle import chronicle_root, scrub_credentials  # noqa: E402
 
 
 def _process_one(gz_path: Path, *, apply: bool, also_literals: list[str] | None = None) -> str:
@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="exhaustively redact this exact string too (repeatable; for a KNOWN leaked secret)")
     args = ap.parse_args(argv)
 
-    root = Path(args.root) if args.root else CHRONICLE_ROOT
+    root = Path(args.root) if args.root else chronicle_root()
     if not root.is_dir():
         print(f"no chronicle at {root} (nothing to sweep)")
         return 0

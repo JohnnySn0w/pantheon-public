@@ -516,6 +516,103 @@ class TestMonitorHelpers(Base):
             self.assertIs(ss.maintenance_active("specialist"), False)
 
 
+def u5_record(**over):
+    """The record a harness-manager run_state pause writes (T-5858 U5, harness-manager.py
+    _plan_rs_pause): paused-intake, indefinite, plus pause_id / anchor / plan_revision.
+    test_harness_manager_run_state.py pins that the planner's real record matches it."""
+    return record(**{"state": "paused-intake", "phase": "set", "set_by": "germinate:harness-manager run_state",
+                     "owner": "operator", "reason": "fleet bringdown: harness-manager run_state=paused (rs-x)",
+                     "expires": None, "indefinite": True, "ledger_entry": None,
+                     "pause_id": "rs-claude-research-20261026T110000Z", "anchor": "operator:TG-12733",
+                     "plan_revision": "a" * 40, **over})
+
+
+def u5_halted(**over):
+    """Recovery D15 (T-5858) (r1): a halted U5 pause KEEPS its record and adds run_state_halt."""
+    return u5_record(run_state_halt={"run_id": "r1", "op_id": "rs-drain", "at": iso(NOW),
+                                     "rollback": "python3 -m tools.germinate rollback --run r1"}, **over)
+
+
+class TestRunStatePauseVetoesRepair(Base):
+    """T-5918: a U5 run_state pause vetoes automated unit repair (pantheon-parity-remediate)
+    without changing what the monitor-facing fields say."""
+
+    def test_parse_u5_record_sets_repair_vetoed_only(self):
+        for doc in (u5_record(), u5_halted()):
+            c = ss.parse_record(doc, now=NOW)
+            self.assertTrue(c.repair_vetoed)
+            # every other reader sees exactly today's paused-intake
+            self.assertTrue(c.intake_blocked)
+            self.assertFalse(c.remediation_vetoed or c.launch_blocked or c.expected_down)
+
+    def test_operator_pause_and_bad_markers_do_not_veto(self):
+        for doc in (record(), record(indefinite=True, expires=None), u5_record(pause_id=""),
+                    u5_record(pause_id="   "), u5_record(pause_id=7), u5_record(pause_id=None)):
+            self.assertFalse(ss.parse_record(doc, now=NOW).repair_vetoed, doc.get("pause_id"))
+
+    def test_marker_on_deep_sleep_changes_nothing(self):
+        doc = record(state="deep-sleep", phase="asleep", pause_id="rs-x")
+        c = ss.parse_record(doc, now=NOW)
+        self.assertTrue(c.remediation_vetoed)
+        self.assertFalse(c.repair_vetoed)  # already vetoed via remediation_vetoed
+        self.assertFalse(ss.is_run_state_pause(doc))
+
+    def test_expired_u5_record_does_not_veto(self):
+        doc = u5_record(indefinite=False, expires=iso(NOW - timedelta(seconds=1)))
+        self.assertFalse(ss.parse_record(doc, now=NOW).repair_vetoed)
+
+    def test_effective_carries_repair_vetoed_and_leaves_monitor_fields(self):
+        self.put(u5_record())
+        e = self.eff()
+        self.assertTrue(e.repair_vetoed and ss.vetoes_repair(e))
+        self.assertEqual((e.state, e.intake_blocked, e.launch_blocked, e.remediation_vetoed, e.expected_down),
+                         ("paused-intake", True, False, False, False))
+        self.assertEqual(e.sources, ("seat-state",))
+
+    def test_vetoes_repair_union_and_fail_open(self):
+        from tools.seat_state_testkit import eff
+        self.assertTrue(ss.vetoes_repair(eff("deep-sleep", asleep=True)))
+        self.assertTrue(ss.vetoes_repair(eff(maintenance=True)))
+        self.assertTrue(ss.vetoes_repair(eff("paused-intake", run_state_pause=True)))
+        self.assertFalse(ss.vetoes_repair(eff("paused-intake")))
+        self.assertFalse(ss.vetoes_repair(eff(oom=True)))  # note section 6: unchanged
+        self.assertFalse(ss.vetoes_repair(eff()))
+        self.assertFalse(ss.vetoes_repair(None))
+
+    def test_remediation_vetoed_true_while_paused_and_halted_false_after_restore(self):
+        kw = {"now": NOW, "state_root": self.root, "maintenance_registry": self.maint,
+              "oom_holds_path": self.oom}
+        with unittest.mock.patch("tools.seat_state.getpass.getuser", return_value="claude-research"):
+            self.assertFalse(ss.remediation_vetoed("specialist", **kw))   # before the pause
+            self.put(u5_record())
+            self.assertTrue(ss.remediation_vetoed("specialist", **kw))    # paused
+            self.put(u5_halted())
+            self.assertTrue(ss.remediation_vetoed("specialist", **kw))    # halted: record kept (r1)
+            hs.seat_state_path("specialist", root=self.root).unlink()     # restore clears it LAST (p)
+            self.assertFalse(ss.remediation_vetoed("specialist", **kw))   # restored
+
+    def test_cross_account_read_carries_the_veto(self):
+        run = TestEffectiveFor._runner(self, out=json.dumps(u5_record()))
+        with unittest.mock.patch("tools.seat_state.getpass.getuser", return_value="recovery"):
+            e = ss.effective_for("specialist", now=NOW, state_root=self.root, maintenance_registry=self.maint,
+                                 oom_holds_path=self.oom, runner=run)
+        self.assertEqual(run.calls[0][0][2:4], ["-u", "claude-research"])
+        self.assertTrue(ss.vetoes_repair(e))
+        self.assertFalse(e.remediation_vetoed)
+
+    def test_repair_only_veto_states_slot_for_t5868(self):
+        self.assertEqual(ss.REPAIR_ONLY_VETO_STATES, ("halted",))  # T-5868 filled the slot
+        doc = record()
+        with unittest.mock.patch.object(ss, "REPAIR_ONLY_VETO_STATES", ("paused-intake",)):
+            c = ss.parse_record(doc, now=NOW)
+        self.assertTrue(c.repair_vetoed)
+        self.assertFalse(c.remediation_vetoed)
+
+    def test_text_output_names_repair_vetoed(self):
+        self.put(u5_record())
+        self.assertIn("repair_vetoed", ss._format_text("specialist", self.eff()))
+
+
 def _fake(deep=False, paused=False, maint=False):
     from tools.seat_state_testkit import eff
     if deep:

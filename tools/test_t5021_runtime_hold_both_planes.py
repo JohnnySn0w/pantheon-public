@@ -23,6 +23,10 @@ from unittest import mock
 from tools import mailbox
 from tools import persona_bringup
 from tools import runtime_controller as rc
+try:
+    from tools import _seat_state_isolation
+except ImportError:  # pragma: no cover
+    import _seat_state_isolation  # type: ignore[no-redef]
 from tools import test_runtime_controller as trc
 
 def _hold(root: Path, persona: str, *runtimes: str) -> None:
@@ -36,6 +40,16 @@ def _hold(root: Path, persona: str, *runtimes: str) -> None:
             },
         },
     )
+
+
+# T-6118: plain `python3 -m unittest` never loads tools/conftest.py; without this the controller
+# lifecycle tests wrote the REAL Chronicle / persona state. See tools/_seat_state_isolation.py.
+def setUpModule() -> None:
+    _seat_state_isolation.start()
+
+
+def tearDownModule() -> None:
+    _seat_state_isolation.stop()
 
 
 class ConsumePlaneHoldTests(unittest.TestCase):

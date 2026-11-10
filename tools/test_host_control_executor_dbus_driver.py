@@ -57,6 +57,11 @@ SEAT_CORE_TEMPLATES = (
     "tools/systemd/pantheon-mailbox-wake@.service",
     "tools/systemd/pantheon-mailbox-wake@.timer",
     "tools/systemd/pantheon-runtime-controller@.service",  # T-5448
+    # T-5961: the fleet-usage retention pair (every seat) and Codex export pair (codex seats)
+    "tools/systemd/pantheon-fleet-usage-prune@.service",
+    "tools/systemd/pantheon-fleet-usage-prune@.timer",
+    "tools/systemd/pantheon-fleet-usage-codex-export@.service",
+    "tools/systemd/pantheon-fleet-usage-codex-export@.timer",
 )
 # T-2917 5d.3: widened by mailbox.probe (the capability flip)
 IMPLEMENTED = frozenset(("diagnostics.read", "files.seat_root", "mailbox.probe"))

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -349,6 +350,209 @@ class TestLintStagedValidity(unittest.TestCase):
         self.assertEqual(
             lpl.lint_staged_validity(repo_root="/nonexistent/not/a/repo"), [])
 
+
+class TestLintStagedOrg001(unittest.TestCase):
+    """T-4739: ORG-001 rules on ledger lines ADDED in the staged diff; the rows already
+    in HEAD are grandfathered. Tmp git repos only; the real ledger/ is never touched."""
+
+    TS = "2026-10-08T15:00:00Z"
+
+    def _git(self, repo: Path, *args: str) -> subprocess.CompletedProcess:
+        env = os.environ.copy()
+        env.update({
+            "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@e.com",
+            "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@e.com",
+        })
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, text=True, check=True, env=env,
+        )
+
+    def _repo(self, tmp: str) -> tuple[Path, Path]:
+        repo = Path(tmp) / "r"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        shard = repo / "ledger" / "2026-W41" / "2026-W41.jsonl"
+        shard.parent.mkdir(parents=True)
+        return repo, shard
+
+    def _good(self, slug: str = "good") -> str:
+        return json.dumps({
+            "id": f"{self.TS}-{slug}", "ts": self.TS, "agent": "head_engineering_orchestrator",
+            "action": "a", "rationale": "r", "justifies_via": ["P4"],
+        })
+
+    def _bad(self) -> str:
+        return json.dumps({"ts": self.TS, "agent": "head_engineering_orchestrator", "action": "a"})
+
+    def test_added_valid_line_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo, shard = self._repo(t)
+            shard.write_text(self._good() + "\n")
+            self._git(repo, "add", "-A")
+            self.assertEqual(lpl.lint_staged_org001(repo_root=repo), [])
+
+    def test_added_invalid_line_fails_naming_id_and_problems(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo, shard = self._repo(t)
+            bad = json.loads(self._bad())
+            bad["id"] = f"{self.TS}-bad"
+            shard.write_text(json.dumps(bad) + "\n")
+            self._git(repo, "add", "-A")
+            out = lpl.lint_staged_org001(repo_root=repo)
+            self.assertEqual(len(out), 1)
+            self.assertIn(bad["id"], out[0]["error"])
+            self.assertIn("rationale", out[0]["error"])
+            self.assertIn("justifies_via", out[0]["error"])
+            self.assertEqual(out[0]["path"], "ledger/2026-W41/2026-W41.jsonl")
+
+    def test_preexisting_invalid_row_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo, shard = self._repo(t)
+            shard.write_text(self._bad() + "\n")
+            self._git(repo, "add", "-A")
+            self._git(repo, "commit", "-q", "-m", "history")
+            with shard.open("a") as fh:
+                fh.write(self._good("new") + "\n")
+            self._git(repo, "add", "-A")
+            self.assertEqual(lpl.lint_staged_org001(repo_root=repo), [])
+
+    def test_commit_later_than_the_write_time_is_not_a_skew_failure(self) -> None:
+        # the write path enforces ts-vs-clock; the hook must not fail an old-but-valid ts
+        with tempfile.TemporaryDirectory() as t:
+            repo, shard = self._repo(t)
+            shard.write_text(self._good() + "\n")  # TS is weeks in the past
+            self._git(repo, "add", "-A")
+            self.assertEqual(lpl.lint_staged_org001(repo_root=repo), [])
+
+    def test_vocab_load_failure_warns_and_passes_when_fail_open(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo, shard = self._repo(t)
+            shard.write_text(self._good() + "\n")
+            self._git(repo, "add", "-A")
+            with mock.patch.object(ledger_shard, "_role_vocabulary", side_effect=RuntimeError("x")):
+                with mock.patch.object(ledger_shard, "VOCAB_LOAD_FAIL_OPEN", True):
+                    self.assertEqual(lpl.lint_staged_org001(repo_root=repo), [])
+                with mock.patch.object(ledger_shard, "VOCAB_LOAD_FAIL_OPEN", False):
+                    out = lpl.lint_staged_org001(repo_root=repo)
+                    self.assertEqual(len(out), 1)
+                    self.assertIn("role vocabulary", out[0]["error"])
+
+    def test_nothing_is_flagged_while_enforce_is_off(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo, shard = self._repo(t)
+            shard.write_text(self._bad() + "\n")
+            self._git(repo, "add", "-A")
+            with mock.patch.object(ledger_shard, "ENFORCE", False):
+                self.assertEqual(lpl.lint_staged_org001(repo_root=repo), [])
+
+    def test_unparseable_line_is_left_to_the_validity_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo, shard = self._repo(t)
+            shard.write_text(self._good()[:-1] + "\n")
+            self._git(repo, "add", "-A")
+            self.assertEqual(lpl.lint_staged_org001(repo_root=repo), [])
+            self.assertEqual(len(lpl.lint_staged_validity(repo_root=repo)), 1)
+
+
+    def test_appetite_subledger_line_is_out_of_scope(self) -> None:
+        """T-4739 hotfix: ticket.py resolve appends {tid, ts, appetite, ...} to
+        ledger/appetite/<week>.jsonl; that is not an ORG-001 decision entry and must
+        never be judged (the unscoped check refused every resolve)."""
+        with tempfile.TemporaryDirectory() as t:
+            repo, _shard = self._repo(t)
+            app = repo / "ledger" / "appetite" / "2026-W45.jsonl"
+            app.parent.mkdir(parents=True)
+            app.write_text(json.dumps({
+                "active_spend_s": 3947, "appetite": 1, "budget_s": None,
+                "outcome": "shipped", "tid": "T-4739", "ts": "2026-11-03T01:08:28Z",
+            }) + "\n")
+            self._git(repo, "add", "-A")
+            self.assertEqual(lpl.lint_staged_org001(repo_root=repo), [])
+
+    def test_invalid_line_in_legacy_shard_still_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo, _shard = self._repo(t)
+            legacy = repo / "ledger" / "2026.jsonl"
+            bad = json.loads(self._bad())
+            bad["id"] = f"{self.TS}-legacy-bad"
+            legacy.write_text(json.dumps(bad) + "\n")
+            self._git(repo, "add", "-A")
+            out = lpl.lint_staged_org001(repo_root=repo)
+            self.assertEqual([o["path"] for o in out], ["ledger/2026.jsonl"])
+
+    def test_decision_shard_path_filter(self) -> None:
+        for rel, want in (
+            ("ledger/2026-W45/2026-W45.jsonl", True),
+            ("ledger/2026.jsonl", True),
+            ("ledger/appetite/2026-W45.jsonl", False),
+            ("ledger/2026-W45/notes.jsonl", False),
+            ("ledger/x/2026-W45.jsonl", False),
+        ):
+            with self.subTest(rel=rel):
+                self.assertIs(lpl._is_decision_shard(rel), want)
+
+
+class TestPreCommitHookEndToEnd(unittest.TestCase):
+    """T-4739 hotfix (orchestrator's ask): run the REAL .githooks/pre-commit through `git
+    commit` in a tmp repo, the way ticket.py resolve hits it. The hook bootstraps
+    _REPO_ROOT = .githooks/.. and imports tools.*, so the tmp repo gets a copy of the
+    hook and a symlink to this checkout's tools/. Unit tests of lint_staged_org001
+    alone passed while every resolve was refused; this pins the whole writer path."""
+
+    _TOOLS = Path(__file__).resolve().parent
+    _HOOK = _TOOLS.parent / ".githooks" / "pre-commit"
+
+    def _env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env.update({
+            "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@e.com",
+            "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@e.com",
+        })
+        return env
+
+    def _repo(self, tmp: str) -> Path:
+        repo = Path(tmp) / "r"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self._env())
+        (repo / ".githooks").mkdir()
+        shutil.copy2(self._HOOK, repo / ".githooks" / "pre-commit")
+        (repo / "tools").symlink_to(self._TOOLS, target_is_directory=True)
+        (repo / ".git" / "info" / "exclude").write_text("tools\n")
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "core.hooksPath", ".githooks"],
+            check=True, env=self._env(),
+        )
+        return repo
+
+    def _commit(self, repo: Path, rel: str, line: str) -> subprocess.CompletedProcess:
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as fh:
+            fh.write(line + "\n")
+        subprocess.run(["git", "-C", str(repo), "add", rel], check=True, env=self._env())
+        return subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m", "t"],
+            capture_output=True, text=True, env=self._env(), timeout=120,
+        )
+
+    def test_resolve_shaped_appetite_append_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo = self._repo(t)
+            res = self._commit(repo, "ledger/appetite/2026-W45.jsonl", json.dumps({
+                "active_spend_s": 3947, "appetite": 1, "budget_s": None,
+                "outcome": "shipped", "tid": "T-4739", "ts": "2026-11-03T01:08:28Z",
+            }))
+            self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_invalid_decision_shard_line_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo = self._repo(t)
+            res = self._commit(repo, "ledger/2026-W45/2026-W45.jsonl", json.dumps({
+                "id": "2026-11-03T01:00:00Z-bad", "ts": "2026-11-03T01:00:00Z",
+                "agent": "head_engineering_orchestrator", "action": "a",
+            }))
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("2026-11-03T01:00:00Z-bad", res.stderr)
 
 class TestSharedFraming(unittest.TestCase):
     """T-4202: added lines are framed by the shared structural parser
@@ -686,6 +890,12 @@ class TestDiffToolConfigDoesNotBlindTheLint(unittest.TestCase):
 
 
 class TestAppendEntry(unittest.TestCase):
+    def setUp(self) -> None:
+        # T-4739: placement mechanics with historical-ts fixtures, not ORG-001's rules.
+        _p = mock.patch.object(ledger_shard, "ENFORCE", False)
+        _p.start()
+        self.addCleanup(_p.stop)
+
     def test_places_by_entry_ts_not_now(self) -> None:
         with tempfile.TemporaryDirectory() as t:
             ledger = Path(t) / "ledger"

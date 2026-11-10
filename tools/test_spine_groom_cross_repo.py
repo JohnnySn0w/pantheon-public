@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 # Bootstrap: same sys.path trick as inbox_consumer.py — pass canonical smoke
 # `python3 -m unittest tools.test_spine_groom_cross_repo` AND a standalone run.
@@ -22,7 +23,7 @@ def _git(args, cwd):
 def _mk_repo(base: Path, name: str) -> Path:
     r = base / name
     r.mkdir()
-    _git(["init", "-q"], r)
+    _git(["init", "-q", "-b", "main"], r)
     _git(["config", "user.email", "t@t"], r)
     _git(["config", "user.name", "t"], r)
     return r
@@ -118,6 +119,104 @@ class RunCrossRepoTests(unittest.TestCase):
         dirty = subprocess.run(["git", "-C", str(r), "status", "--porcelain"],
                                capture_output=True, text=True).stdout.strip()
         self.assertEqual(dirty, "")
+
+
+class MirrorLegTests(unittest.TestCase):
+    """T-4705: the ORG-101 dual-write leg runs only after origin accepted the push,
+    with HEAD:<branch>, and never changes the push result or the revert safety net."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        self.repo = _mk_repo(self.base, "repoA")
+        _git(["checkout", "-q", "-b", "main"], self.repo)
+        (self.repo / "notes").mkdir()
+        (self.repo / "notes" / "README.md").write_text("# notes\n")
+        (self.repo / "notes" / "foo.md").write_text("# Foo\n\nFoo desc.\n")
+        _git(["add", "-A"], self.repo)
+        _git(["commit", "-q", "-m", "base"], self.repo)
+        self.docs = {"repoA": {"notes": x.notes_handler}}
+
+    def _wire_origin(self):
+        origin = self.base / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+        _git(["remote", "add", "origin", str(origin)], self.repo)
+        _git(["push", "-q", "-u", "origin", "main"], self.repo)
+        return origin
+
+    def _head(self, cwd):
+        return subprocess.run(["git", "-C", str(cwd), "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+
+    def _run(self):
+        return x.run_cross_repo(self.base, apply=True, push=True, docs=self.docs)
+
+    def test_success_calls_leg_once_with_cwd_and_head_branch_refspec(self):
+        origin = self._wire_origin()
+        with patch("tools._git_utils.mirror_push_after_origin",
+                   return_value="mirror pushed") as m:
+            res = self._run()
+        m.assert_called_once_with(self.repo, "HEAD:main")
+        self.assertIn("repoA: push ok", res)
+        self.assertEqual(res.index("repoA: mirror pushed"), res.index("repoA: push ok") + 1)
+        self.assertEqual(self._head(self.repo), self._head(origin))
+
+    def test_failed_push_never_calls_leg_and_still_reverts(self):
+        head_before = self._head(self.repo)  # no remote: the origin push fails
+        with patch("tools._git_utils.mirror_push_after_origin") as m:
+            res = self._run()
+        m.assert_not_called()
+        self.assertTrue(any("push FAILED" in line and "reverted" in line for line in res))
+        self.assertFalse(any("mirror" in line for line in res))
+        self.assertEqual(self._head(self.repo), head_before)
+
+    def test_leg_exception_keeps_push_ok_and_the_commit(self):
+        origin = self._wire_origin()
+        with patch("tools._git_utils.mirror_push_after_origin",
+                   side_effect=RuntimeError("boom")):
+            res = self._run()
+        self.assertIn("repoA: push ok", res)
+        self.assertFalse(any("push FAILED" in line for line in res))
+        self.assertTrue(any(line.startswith("repoA: mirror push failed") and "boom" in line
+                            for line in res))
+        self.assertEqual(self._head(self.repo), self._head(origin))  # commit kept, not reverted
+
+    def test_leg_failure_note_keeps_push_ok(self):
+        origin = self._wire_origin()
+        note = "mirror push failed (denied); reconciler will heal"
+        with patch("tools._git_utils.mirror_push_after_origin", return_value=note):
+            res = self._run()
+        self.assertIn("repoA: push ok", res)
+        self.assertIn(f"repoA: {note}", res)
+        self.assertFalse(any("push FAILED" in line for line in res))
+        self.assertEqual(self._head(self.repo), self._head(origin))
+
+    def test_inert_leg_adds_no_line(self):
+        self._wire_origin()
+        with patch("tools._git_utils.mirror_push_after_origin", return_value=None) as m:
+            res = self._run()
+        m.assert_called_once()
+        self.assertIn("repoA: push ok", res)
+        self.assertFalse(any("mirror" in line for line in res))
+
+    def test_detached_head_skips_leg(self):
+        with patch("tools.spine_groom_cross_repo._git") as g, \
+                patch("tools._git_utils.mirror_push_after_origin") as m:
+            g.return_value = subprocess.CompletedProcess([], 0, stdout="HEAD\n", stderr="")
+            note = x._mirror_leg(self.repo)
+        m.assert_not_called()
+        self.assertEqual(note, "mirror leg skipped (no current branch)")
+
+    def test_detached_head_end_to_end_push_ok_and_skip_noted(self):
+        # A bare push from a detached HEAD fails, so in practice the leg is never
+        # reached from a detached HEAD; this pins that the failure path stays intact.
+        self._wire_origin()
+        _git(["checkout", "-q", "--detach"], self.repo)
+        with patch("tools._git_utils.mirror_push_after_origin") as m:
+            res = self._run()
+        m.assert_not_called()
+        self.assertFalse(any("push ok" in line for line in res))
 
 
 if __name__ == "__main__":

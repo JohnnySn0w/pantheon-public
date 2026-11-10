@@ -4,7 +4,7 @@
 **Author:** Orchestrator (Orchestrator), crediting Mason (suborch1) and Artisan (suborch2) for the sub-splits named below
 **Status:** Authored (lessons/ is an Authored, non-ratifiable class per ORG-015)
 **Anchor directive:** D11 — *third-party surface verification: read the spec, validate against the real API*. D11 is this family's ratified core stated for one surface class; everything below generalizes it inward, to our own surfaces.
-**Re-evaluate when:** a twelfth face appears that none of the eleven below absorbs; or when enough of the family is structurally enforced (lints, meta-tests) that this map demotes to a pointer at the guards. **Splitting test (Recovery's, T-2207):** if two failures sharing a face have *different remedies*, they are different faces — size is the symptom, divergent remedies are the diagnosis.
+**Re-evaluate when:** a thirteenth face appears that none of the twelve below absorbs (Face 12 added 2026-11-02, T-4559); or when enough of the family is structurally enforced (lints, meta-tests) that this map demotes to a pointer at the guards. **Splitting test (Recovery's, T-2207):** if two failures sharing a face have *different remedies*, they are different faces — size is the symptom, divergent remedies are the diagnosis.
 
 ## What this file is
 
@@ -40,6 +40,7 @@ That is the whole reason this map exists rather than a single rule.
 | **Handoff drift** | a number arrives without its derivation | receiver **accepts or redoes** — no middle | send the terms, not the total |
 | **Referent drift** | the claim was true; the artifact under it was rewritten | false claim **reads as verified** | cite something that cannot move without you knowing |
 | **Reach drift** | the settling evidence was in hand; you reached further out | peer/tier **spends a turn** on a settled question | read the surface already open before escalating or contradicting |
+| **Unknown as no** | a probe that could not look returns the same value as one that looked and saw nothing | an unmeasured answer **read as definite**, in whichever direction the caller treats as safe | return a three-valued answer (value / empty / UNKNOWN) and let each caller choose its fail direction |
 
 ---
 
@@ -1103,6 +1104,18 @@ the code around your change has already faced your question, your job is to find
 re-litigate it one tier up.
 
 ---
+
+## Face 12 — Unknown as no: "couldn't look" returned as "looked, saw nothing"
+
+*(Added 2026-11-02, T-4559; full lesson: `lessons/2026-11-02-unknown-must-not-stand-in-for-no.md`.)*
+
+A probe that could not look (timeout, denied, malformed output, a field never set) hands back the same value
+as one that looked and found nothing: an empty set, "down", "idle", MISSING, `DEFAULT 0`. Every caller then
+acts on an answer that was never measured. **The splitting test:** False GREEN's remedy is to read the
+defining surface instead; here the defining surface IS being read, and the defect is what happens when that
+read fails. The fix is in the TYPE of the answer (value / empty / UNKNOWN), with each caller choosing its own
+fail direction. Thirteen instances (four from the 2026-07-29 lease/lock night, canonically T-2307, and nine later); the sibling face is
+`lessons/2026-07-28-failure-presents-as-absence.md` (T-4558).
 
 ## Candidate faces — passed the remedy test, held below the instance bar
 

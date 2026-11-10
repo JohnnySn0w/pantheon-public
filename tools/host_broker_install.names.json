@@ -1,7 +1,7 @@
 {
   "generator": "tools/host_broker_install.py names",
   "manifest_revision": "provisional-2026-10-27",
-  "out_of_scope": "the ORG-052 wire vocabulary (error names, journal events, evidence labels; ADR :1129-1159) is not install surface; its canonical table is tools/host_control/README.md 'Provisional names pending ratification'",
+  "out_of_scope": "the ORG-052 wire vocabulary (error names, journal events, evidence labels; ADR \u00a7Provisional wire names) is not install surface; its canonical table is tools/host_control/README.md 'Provisional names pending ratification'",
   "rows": [
     {
       "item": "broker service account",
@@ -475,26 +475,6 @@
       "minted_in": "T-2920 U1",
       "proposed_final": "/etc/pantheon/host-broker/manifests",
       "provisional": "/etc/pantheon/host-broker/manifests",
-      "rename_later_is_migration": "no: regenerated per framework update",
-      "status": "PROVISIONAL",
-      "used_in": []
-    },
-    {
-      "item": "producer run root (root:root 0755)",
-      "kind": "path",
-      "minted_in": "T-2920 U1",
-      "proposed_final": "/run/pantheon-host-install",
-      "provisional": "/run/pantheon-host-install",
-      "rename_later_is_migration": "no: regenerated per framework update",
-      "status": "PROVISIONAL",
-      "used_in": []
-    },
-    {
-      "item": "producer staging dir (fresh per run, nobody:nogroup 0700)",
-      "kind": "path",
-      "minted_in": "T-2920 U1",
-      "proposed_final": "/run/pantheon-host-install/staging",
-      "provisional": "/run/pantheon-host-install/staging",
       "rename_later_is_migration": "no: regenerated per framework update",
       "status": "PROVISIONAL",
       "used_in": []

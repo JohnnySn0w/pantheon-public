@@ -1,0 +1,18 @@
+[Unit]
+Description=Pantheon decision-register sweep for seat %i (T-5054) — counts uncovered the operator rulings in that seat's chat
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# --dry-run: count only, files nothing. Codex seats add `--harness codex` via a drop-in at install.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/operator_decision_sweep.py --seat %i --dry-run
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min

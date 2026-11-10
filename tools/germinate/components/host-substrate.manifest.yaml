@@ -56,3 +56,5 @@ legacy_requirements:
     note: T-5157 earlyoom swap backstop config (a daemon config, not a unit; legacy tools/deploy_systemd_oomd.sh)
   - path: /usr/bin/earlyoom
     note: T-5157 earlyoom package (package management is outside the ORG-052 §8 envelope)
+  - path: /etc/tmpfiles.d/pantheon-health.conf
+    note: T-4884 B2/B3/B4b health dirs (/run/pantheon-health incl. kino ACL, /run/recovery-seat-health, /var/lib/codex-recovery-public); repo source tools/systemd/system/pantheon-health.tmpfiles.conf (byte-equal 2026-11-02); no tmpfiles family yet (follow-up T-6011)

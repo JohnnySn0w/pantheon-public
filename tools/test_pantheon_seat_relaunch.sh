@@ -330,6 +330,22 @@ assert_contains "PANTHEON_TMUX_SESSION=suborch1-main" "dry-run env reconstructio
 assert_contains "/home/suborch1/.npm-global/bin/claude --model claude-opus-4-8 --permission-mode bypassPermissions" "dry-run captured argv"
 teardown_sandbox
 
+# --- T-4533: fleet-usage mod env rides the respawn; helper failure fails open ----
+setup_sandbox
+mkdir -p "$SBX/clone/tools/mods/fleet-usage"
+export PANTHEON_SEAT_RELAUNCH_CLONE_ROOT="$SBX/clone"
+run_sut 0 "T-4533 dry-run carries fleet-usage env" -- "${REQ[@]}" --dry-run
+assert_contains "PANTHEON_FLEET_USAGE_SEAT=mason" "dry-run injects the persona as the fleet-usage seat"
+export PANTHEON_SEAT_RELAUNCH_CLONE_ROOT="$SBX/no-such-clone"
+run_sut 0 "T-4533 helper yielding nothing still respawns (fail open)" -- "${REQ[@]}" --dry-run
+assert_contains "PANTHEON_TMUX_SESSION=suborch1-main" "respawn plan intact without the fleet-usage keys"
+export PANTHEON_SEAT_RELAUNCH_CLONE_ROOT="$SBX/clone"
+run_sut 0 "T-4533 real respawn carries fleet-usage env" -- "${REQ[@]}" --skip-ack
+assert_logged systemd_run_log "PANTHEON_FLEET_USAGE_SEAT=mason" "respawn argv carries the fleet-usage seat"
+assert_not_logged systemd_run_log "CLAUDE_CODE_PLUGIN_DIRS" "T-4643 step 4: respawn never injects the mod sideload"
+unset PANTHEON_SEAT_RELAUNCH_CLONE_ROOT
+teardown_sandbox
+
 # --- fence DRAINS an in-flight consume, THEN proceeds (T-3846) --------------
 # persona-consume@ is Type=oneshot => a running run is ActiveState=activating,
 # NEVER "active". The old `is-active`-only check missed it, so a consume the timer

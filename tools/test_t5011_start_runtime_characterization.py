@@ -33,6 +33,10 @@ from unittest import mock
 
 from tools import bypass_consent as bypass_consent_module
 from tools import runtime_controller as rc
+try:
+    from tools import _seat_state_isolation
+except ImportError:  # pragma: no cover
+    import _seat_state_isolation  # type: ignore[no-redef]
 from tools.harness_adapter import claude as claude_module
 from tools.harness_adapter import codex as codex_module
 from tools.harness_adapter import integration as integration_module
@@ -88,6 +92,16 @@ def _binding(harness: str) -> SimpleNamespace:
             policy=FailoverPolicy(5.0, ()),
         ),
     )
+
+
+# T-6118: plain `python3 -m unittest` never loads tools/conftest.py; without this the controller
+# lifecycle tests wrote the REAL Chronicle / persona state. See tools/_seat_state_isolation.py.
+def setUpModule() -> None:
+    _seat_state_isolation.start()
+
+
+def tearDownModule() -> None:
+    _seat_state_isolation.stop()
 
 
 class _FakeAdapter:
@@ -214,9 +228,13 @@ class StartRuntimeCharacterizationTests(unittest.TestCase):
                                 "/tmp/t5011-account/work dir",
                                 "/usr/bin/env",
                                 "--unset=PANTHEON_INSTANCE_MANIFEST",
+                                "--unset=CLAUDE_CODE_RETRY_WATCHDOG",
                                 "--",
                                 "PATH=/tmp/t5011-account/.bun/bin:/tmp/t5011-account/.npm-global/bin"
                                 ":/usr/local/bin:/usr/bin:/bin",
+                                # T-4643 step 4: a claude seat gets its fleet-usage seat (no
+                                # sideload since the managed org mod); codex gets nothing.
+                                *(("PANTHEON_FLEET_USAGE_SEAT=recovery",) if harness == "claude" else ()),
                                 "PANTHEON_T5011=value with space",
                                 f"/usr/bin/{harness}",
                                 "--model",

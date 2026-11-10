@@ -347,6 +347,107 @@ def _pilot_costs() -> dict:
     }
 
 
+SEM_REVISION = "4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f"
+SEM_MAP_NAME = "semantic-map.resolved.json"
+# Run-level (not record-bound) map instances; the 10 collector/scope keys are taken from the record.
+SEM_RUN_LEVEL_DEFAULTS = {
+    "dimension": ["branch", "line"],
+    "unit": {"branch": "percent", "line": "percent"},
+    "denominator": {"line": "totals.num_statements", "branch": "totals.num_branches"},
+    "branch_semantics": {"effective_core": "ctrace", "has_arcs": True},
+    "function_semantics": "deferred",
+    "test_selection": {"argv_selection": ["tools/"], "extra_args": [], "narrowing_flags_present": False},
+}
+
+
+def _sem_json(obj: object) -> bytes:
+    return (json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def _sem_bundle(
+    prefix: str,
+    record: dict,
+    *,
+    declarations: dict | None = None,
+    instances: dict | None = None,
+    map_mutator=None,
+    manifest_mutator=None,
+    manifest_revision: str | None = None,
+    manifest_adapter_id: str | None = None,
+    map_adapter_id: str | None = None,
+) -> tuple[str, list[dict]]:
+    """Real digest-verified run manifest + resolved map (adapter formats) as inline ArtifactRecords."""
+    mod = importlib.import_module("tools.repository_evidence")
+    adapter = record["collector"]["adapter_id"]
+    values: dict = {}
+    for key in mod.COMPARABILITY_CHECKED_FIELDS:
+        if key.startswith("collector."):
+            values[key] = record["collector"][key.split(".", 1)[1]]
+        elif key.startswith("scope."):
+            values[key] = record["scope"][key.split(".", 1)[1]]
+        else:
+            values[key] = SEM_RUN_LEVEL_DEFAULTS[key]
+    values = copy.deepcopy(values)
+    values.update(copy.deepcopy(instances or {}))
+    compared = {
+        key: {"declaration": (declarations or {}).get(key, f"declaration of {key}"), "instance": value}
+        for key, value in values.items()
+    }
+    map_obj = {
+        "schema": "org083.adapter-resolved-map.v1",
+        "adapter_id": map_adapter_id or adapter,
+        "static_map_sha256": "0" * 64,
+        "compared": compared,
+        "observations": {},
+    }
+    if map_mutator is not None:
+        map_mutator(map_obj)
+    map_bytes = _sem_json(map_obj)
+    map_id, manifest_id = f"{prefix}-map", f"{prefix}-manifest"
+    manifest_obj = {
+        "schema": "org083.adapter-run-manifest.v1",
+        "adapter_id": manifest_adapter_id or adapter,
+        "revision": manifest_revision or record["revision"],
+        "members": [{"name": SEM_MAP_NAME, "artifact_id": map_id, "sha256": _sha(map_bytes), "size": len(map_bytes)}],
+    }
+    if manifest_mutator is not None:
+        manifest_mutator(manifest_obj)
+    return manifest_id, [
+        _artifact(manifest_id, _sem_json(manifest_obj)),
+        _artifact(map_id, map_bytes),
+    ]
+
+
+def _set_artifact_bytes(artifact: dict, content: bytes, *, refresh: bool = True) -> None:
+    artifact["storage_locator"] = {"kind": "inline", "value": base64.b64encode(content).decode("ascii")}
+    if refresh:
+        artifact["digest"] = _sha(content)
+        artifact["size"] = len(content)
+
+
+def _retention_for(contract: dict, artifact: dict) -> dict:
+    retention = copy.deepcopy(contract["retention_records"][0])
+    aid = artifact["artifact_id"]
+    content = base64.b64decode(artifact["storage_locator"]["value"])
+    retention.update(retention_id=f"ret-{aid}", artifact_id=aid, storage_locator=artifact["storage_locator"], digest=artifact["digest"])
+    receipt = retention["retrieval_receipts"][0]
+    receipt.update(receipt_id=f"receipt-{aid}", artifact_id=aid, observed_digest=artifact["digest"], observed_size=len(content))
+    retention["availability"]["retrieval_receipt_id"] = f"receipt-{aid}"
+    return retention
+
+
+def _attach_semantics(contract: dict, record: dict, *, retain: bool = False, **bundle_kwargs) -> list[dict]:
+    """Attach (or replace) the record's retained semantic evidence; points record.artifact_id at the manifest."""
+    manifest_id, artifacts = _sem_bundle(f"sem-{record['measurement_id']}", record, **bundle_kwargs)
+    ids = {artifact["artifact_id"] for artifact in artifacts}
+    contract["artifact_records"] = [a for a in contract["artifact_records"] if a["artifact_id"] not in ids] + artifacts
+    record["artifact_id"] = manifest_id
+    if retain:
+        contract["retention_records"] = [r for r in contract["retention_records"] if r["artifact_id"] != manifest_id]
+        contract["retention_records"].append(_retention_for(contract, artifacts[0]))
+    return artifacts
+
+
 def _measurement(measurement_id: str, dimension: str, *, artifact_id: str = "art-pending", changed_fields: list[str] | None = None) -> dict:
     return {
         "measurement_id": measurement_id,
@@ -727,12 +828,9 @@ class RepositoryEvidenceTests(unittest.TestCase):
 
     def _make_baseline_ready(self, contract: dict) -> None:
         contract["parity_records"][0]["verdict"] = "exact"
-        contract["quantitative_measurements"].extend(
-            [
-                _measurement("measure-line", "line"),
-                _measurement("measure-branch", "branch"),
-            ]
-        )
+        for measurement in (_measurement("measure-line", "line"), _measurement("measure-branch", "branch")):
+            _attach_semantics(contract, measurement, retain=True)
+            contract["quantitative_measurements"].append(measurement)
         for record in contract["dimension_dispositions"]:
             dimension = record["dimension"]
             if dimension in ("line", "branch"):
@@ -1395,8 +1493,11 @@ class RepositoryEvidenceTests(unittest.TestCase):
     def test_stage_specific_support_retention_is_computed_above_declared_maturity(self) -> None:
         contract = self._contract()
         self._make_baseline_ready(contract)
-        contract["artifact_records"].append(_artifact("art-unretained-measure", b"measurement proof\n"))
-        contract["quantitative_measurements"][0]["artifact_id"] = "art-unretained-measure"
+        # Real (digest-verified) semantic evidence whose manifest is deliberately not retained.
+        measurement = contract["quantitative_measurements"][0]
+        unretained_id, unretained = _sem_bundle("sem-unretained", measurement)
+        contract["artifact_records"].extend(unretained)
+        measurement["artifact_id"] = unretained_id
         result = self._validate(contract)
         self.assertEqual(result.issues, ())
         self.assertFalse(result.facts.stage_artifacts_retained)
@@ -1680,6 +1781,536 @@ class RepositoryEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(malformed.returncode, 2)
         self.assertIn("repository_evidence_parse", malformed.stderr)
+
+
+DIRECT_MUTATIONS = {
+    "collector.adapter_id": lambda r: r["collector"].update(adapter_id="other-adapter"),
+    "collector.tool_name": lambda r: r["collector"].update(tool_name="other-tool"),
+    "collector.tool_version": lambda r: r["collector"].update(tool_version="2"),
+    "collector.command_fingerprint": lambda r: r["collector"].update(command_fingerprint="other-command"),
+    "collector.config_digest": lambda r: r["collector"].update(config_digest="other-config"),
+    "collector.runner_fingerprint": lambda r: r["collector"].update(runner_fingerprint="other-runner"),
+    "scope.include_selectors": lambda r: r["scope"].update(include_selectors=["tools/", "docs/"]),
+    "scope.exclusion_ids": lambda r: r["scope"].update(exclusion_ids=["ex-other"]),
+    "scope.generated_source_ids": lambda r: r["scope"].update(generated_source_ids=["gen-other"]),
+    "scope.scope_fingerprint": lambda r: r["scope"].update(scope_fingerprint="other-scope"),
+    "dimension": lambda r: r.update(dimension="branch"),
+    "unit": lambda r: r.update(unit="ratio"),
+}
+RUN_LEVEL_KEYS = ("dimension", "unit", "denominator", "branch_semantics", "function_semantics", "test_selection")
+
+
+class ComparabilityDerivationTests(unittest.TestCase):
+    """T-5840: the validator derives comparability changes; producer changed_fields is only a superset claim."""
+
+    _module = RepositoryEvidenceTests._module
+    _contract = RepositoryEvidenceTests._contract
+    _validate = RepositoryEvidenceTests._validate
+
+    def _pair(
+        self,
+        *,
+        verdict: str = "comparable",
+        changed: tuple[str, ...] = (),
+        equivalence: bool = False,
+        reset: bool = False,
+        cur_mutate=None,
+        base_kw: dict | None = None,
+        cur_kw: dict | None = None,
+        mutate_contract=None,
+    ) -> dict:
+        contract = self._contract()
+        base = _measurement("m-base", "line")
+        cur = _measurement("m-cur", "line")
+        cur["baseline"]["measurement_id"] = "m-base"
+        cur["current"]["measurement_id"] = "m-cur"
+        cur["comparability"].update(baseline_measurement_id="m-base", current_measurement_id="m-cur", verdict=verdict, changed_fields=list(changed))
+        if cur_mutate is not None:
+            cur_mutate(cur)
+        if equivalence:
+            cur["comparability"].update(
+                equivalence_artifact_id="art-pending",
+                equivalence_decision=_authority_decision("decision-eq", kind="measurement", dimension=cur["dimension"], measurement_id="m-cur"),
+            )
+        if reset:
+            cur["comparability"].update(
+                reset_artifact_id="art-pending",
+                reset_authority_decision=_authority_decision("decision-reset", kind="measurement", dimension=cur["dimension"], measurement_id="m-cur"),
+            )
+        _attach_semantics(contract, base, **(base_kw or {}))
+        _attach_semantics(contract, cur, **(cur_kw or {}))
+        contract["quantitative_measurements"].extend([base, cur])
+        if mutate_contract is not None:
+            mutate_contract(contract, base, cur)
+        return contract
+
+    def _issues(self, contract: dict) -> list:
+        return [i for i in self._validate(contract).issues if i.code.startswith("comparability")]
+
+    def _omissions(self, contract: dict) -> list:
+        return [i for i in self._issues(contract) if i.path.endswith("/comparability/changed_fields")]
+
+    def _fail_closed(self, contract: dict) -> list:
+        return [i for i in self._issues(contract) if i.code == "comparability_reset_required" and "/semantic" in i.path]
+
+    # --- no false positives -------------------------------------------------------------------
+    def test_identical_inputs_distinct_ids_have_no_comparability_issue(self) -> None:
+        self.assertEqual(self._issues(self._pair()), [])
+
+    def test_self_baseline_still_resolves_and_has_no_issue(self) -> None:
+        contract = self._contract()
+        record = _measurement("m-self", "line")
+        _attach_semantics(contract, record)
+        contract["quantitative_measurements"].append(record)
+        self.assertEqual(self._issues(contract), [])
+        _set_artifact_bytes(next(a for a in contract["artifact_records"] if a["artifact_id"] == "sem-m-self-map"), b"{bad", refresh=True)
+        self.assertTrue(self._fail_closed(contract), "self-baseline is not exempt from semantic evidence")
+
+    def test_observations_only_difference_is_not_a_change(self) -> None:
+        contract = self._pair(cur_kw={"map_mutator": lambda m: m["observations"].update(junit_node_id_count=99)})
+        self.assertEqual(self._issues(contract), [])
+
+    def test_refused_verdict_claims_nothing_and_is_skipped(self) -> None:
+        contract = self._pair(verdict="refused", cur_mutate=lambda r: r["comparability"].update(checked_fields=[]))
+        for art in contract["artifact_records"]:
+            if art["artifact_id"].startswith("sem-m-cur"):
+                _set_artifact_bytes(art, b"{bad", refresh=True)
+        self.assertEqual(self._issues(contract), [])
+
+    # --- every directly derived record field, mutated independently -----------------------------
+    def test_each_direct_field_mutation_is_derived_and_omission_is_flagged(self) -> None:
+        for field, mutate in DIRECT_MUTATIONS.items():
+            with self.subTest(field=field):
+                issues = self._omissions(self._pair(cur_mutate=mutate))
+                self.assertEqual([i.code for i in issues], ["comparability_material_change_unapproved"])
+                self.assertIn(field, issues[0].message)
+                for other in DIRECT_MUTATIONS:
+                    if other != field:
+                        self.assertNotIn(f"'{other}'", issues[0].message)
+
+    def test_each_direct_field_mutation_is_exactly_that_field_when_authorized(self) -> None:
+        for field, mutate in DIRECT_MUTATIONS.items():
+            with self.subTest(field=field):
+                self.assertEqual(self._issues(self._pair(changed=(field,), equivalence=True, cur_mutate=mutate)), [])
+                self.assertEqual(self._issues(self._pair(verdict="reset_required", changed=(field,), reset=True, cur_mutate=mutate)), [])
+
+    def test_each_direct_field_mutation_without_equivalence_is_unapproved(self) -> None:
+        for field, mutate in DIRECT_MUTATIONS.items():
+            with self.subTest(field=field):
+                codes = [(i.code, i.path.rsplit("/", 1)[-1]) for i in self._issues(self._pair(changed=(field,), cur_mutate=mutate))]
+                self.assertEqual(codes, [("comparability_material_change_unapproved", "equivalence_decision")])
+
+    # --- every key of the resolved map ------------------------------------------------------------
+    def test_each_compared_key_declaration_change_is_derived(self) -> None:
+        mod = self._module()
+        for key in mod.COMPARABILITY_CHECKED_FIELDS:
+            with self.subTest(key=key):
+                kw = {"declarations": {key: "REVISED declaration"}}
+                issues = self._omissions(self._pair(cur_kw=kw))
+                self.assertEqual(len(issues), 1)
+                self.assertIn(f"'{key}'", issues[0].message)
+                self.assertEqual(self._issues(self._pair(changed=(key,), equivalence=True, cur_kw=kw)), [])
+
+    def test_each_run_level_instance_change_is_derived(self) -> None:
+        for key in RUN_LEVEL_KEYS:
+            with self.subTest(key=key):
+                kw = {"instances": {key: {"changed": key}}}
+                issues = self._omissions(self._pair(cur_kw=kw))
+                self.assertEqual(len(issues), 1)
+                self.assertIn(f"'{key}'", issues[0].message)
+                self.assertEqual(self._issues(self._pair(verdict="reset_required", changed=(key,), reset=True, cur_kw=kw)), [])
+
+    def test_bound_instance_disagreeing_with_record_fails_closed(self) -> None:
+        mod = self._module()
+        for key in mod.COMPARABILITY_CHECKED_FIELDS:
+            if key in RUN_LEVEL_KEYS:
+                continue
+            with self.subTest(key=key):
+                self.assertTrue(self._fail_closed(self._pair(cur_kw={"instances": {key: "forged"}})))
+
+    def test_wrong_declaration_instance_shape_fails_closed(self) -> None:
+        def drop_instance(m):
+            del m["compared"]["unit"]["instance"]
+        self.assertTrue(self._fail_closed(self._pair(cur_kw={"map_mutator": drop_instance})))
+
+    # --- producer claim is a conservative superset ------------------------------------------------------
+    def test_producer_extra_claim_is_accepted_when_authorized(self) -> None:
+        self.assertEqual(self._issues(self._pair(changed=("denominator",), equivalence=True)), [])
+
+    def test_producer_partial_claim_is_flagged_as_omission(self) -> None:
+        def two(r):
+            r["collector"].update(tool_version="2", config_digest="x")
+        issues = self._omissions(self._pair(changed=("collector.tool_version",), equivalence=True, cur_mutate=two))
+        self.assertEqual(len(issues), 1)
+        self.assertIn("collector.config_digest", issues[0].message)
+        self.assertNotIn("collector.tool_version", issues[0].message)
+
+    def test_unauthorized_comparable_with_hand_written_empty_changed_fields(self) -> None:
+        issues = self._issues(self._pair(cur_mutate=DIRECT_MUTATIONS["collector.tool_version"]))
+        self.assertTrue(issues)
+        self.assertTrue(all(i.code == "comparability_material_change_unapproved" for i in issues))
+        # The effective claim is (derived U producer): the equivalence requirement bites even though the producer claimed nothing.
+        self.assertTrue(any(i.path.endswith("/comparability/equivalence_decision") for i in issues))
+
+    def test_reset_required_without_reset_authority_still_fails(self) -> None:
+        codes = {i.code for i in self._issues(self._pair(verdict="reset_required", changed=("denominator",)))}
+        self.assertIn("comparability_reset_required", codes)
+
+    # --- fail closed on missing / malformed / tampered / contradictory evidence ---------------------------
+    def _art(self, contract: dict, aid: str) -> dict:
+        return next(a for a in contract["artifact_records"] if a["artifact_id"] == aid)
+
+    def test_map_bytes_differing_from_manifest_member_digest_fail_closed(self) -> None:
+        contract = self._pair()
+        art = self._art(contract, "sem-m-cur-map")
+        original = base64.b64decode(art["storage_locator"]["value"])
+        tampered = original.replace(b"declaration of unit", b"declaration of unix")  # same size: only the sha256 can tell
+        self.assertEqual(len(tampered), len(original))
+        _set_artifact_bytes(art, tampered, refresh=True)  # record refreshed, manifest member not
+        self.assertTrue(self._fail_closed(contract))
+
+    def test_map_bytes_differing_from_artifact_record_digest_fail_closed(self) -> None:
+        def retarget(contract, base, cur):
+            original = base64.b64decode(self._art(contract, "sem-m-cur-map")["storage_locator"]["value"])
+            tampered = original.replace(b"declaration of unit", b"declaration of unix")  # same size: only the digest can tell
+            self.assertEqual(len(tampered), len(original))
+            self.assertNotEqual(tampered, original)
+            manifest = self._art(contract, "sem-m-cur-manifest")
+            obj = json.loads(base64.b64decode(manifest["storage_locator"]["value"]))
+            obj["members"][0].update(sha256=_sha(tampered), size=len(tampered))
+            _set_artifact_bytes(manifest, _sem_json(obj), refresh=True)
+            _set_artifact_bytes(self._art(contract, "sem-m-cur-map"), tampered, refresh=False)  # member ok, record digest stale
+        self.assertTrue(self._fail_closed(self._pair(mutate_contract=retarget)))
+
+    def test_manifest_bytes_differing_from_artifact_record_digest_fail_closed(self) -> None:
+        contract = self._pair()
+        _set_artifact_bytes(self._art(contract, "sem-m-cur-manifest"), b"{}\n", refresh=False)
+        self.assertTrue(self._fail_closed(contract))
+
+    def test_missing_map_member_fails_closed(self) -> None:
+        self.assertTrue(self._fail_closed(self._pair(cur_kw={"manifest_mutator": lambda m: m["members"].clear()})))
+
+    def test_duplicate_map_member_fails_closed(self) -> None:
+        self.assertTrue(self._fail_closed(self._pair(cur_kw={"manifest_mutator": lambda m: m["members"].append(dict(m["members"][0]))})))
+
+    def test_wrong_manifest_schema_fails_closed(self) -> None:
+        self.assertTrue(self._fail_closed(self._pair(cur_kw={"manifest_mutator": lambda m: m.update(schema="other.v1")})))
+
+    def test_missing_manifest_artifact_record_fails_closed(self) -> None:
+        def unlink(contract, base, cur):
+            cur["artifact_id"] = "art-does-not-exist"
+        self.assertTrue(self._fail_closed(self._pair(mutate_contract=unlink)))
+
+    def test_missing_map_artifact_record_fails_closed(self) -> None:
+        def drop(contract, base, cur):
+            contract["artifact_records"] = [a for a in contract["artifact_records"] if a["artifact_id"] != "sem-m-cur-map"]
+        self.assertTrue(self._fail_closed(self._pair(mutate_contract=drop)))
+
+    def test_unretrievable_bytes_fail_closed(self) -> None:
+        contract = self._pair()
+        self._art(contract, "sem-m-cur-map")["storage_locator"] = {"kind": "inline", "value": "***not-base64***"}
+        self.assertTrue(self._fail_closed(contract))
+
+    def test_malformed_json_fails_closed(self) -> None:
+        contract = self._pair()
+        _set_artifact_bytes(self._art(contract, "sem-m-cur-map"), b"{not json", refresh=True)
+        self.assertTrue(self._fail_closed(contract))
+
+    def test_map_missing_a_compared_key_fails_closed(self) -> None:
+        self.assertTrue(self._fail_closed(self._pair(cur_kw={"map_mutator": lambda m: m["compared"].pop("test_selection")})))
+
+    def test_map_with_an_extra_compared_key_fails_closed(self) -> None:
+        extra = lambda m: m["compared"].update(extra={"declaration": "x", "instance": 1})
+        self.assertTrue(self._fail_closed(self._pair(cur_kw={"map_mutator": extra})))
+
+    def test_baseline_side_evidence_is_also_required(self) -> None:
+        contract = self._pair(base_kw={"manifest_mutator": lambda m: m["members"].clear()})
+        # The CURRENT record (index 1) must fail closed because its baseline side is unverifiable, not merely the baseline's own record.
+        self.assertTrue([i for i in self._fail_closed(contract) if i.path.startswith("/quantitative_measurements/1/")])
+
+    def test_manifest_adapter_id_contradicting_record_fails_closed(self) -> None:
+        self.assertTrue(self._fail_closed(self._pair(cur_kw={"manifest_adapter_id": "someone-else"})))
+
+    def test_map_adapter_id_contradicting_record_fails_closed(self) -> None:
+        self.assertTrue(self._fail_closed(self._pair(cur_kw={"map_adapter_id": "someone-else"})))
+
+    def test_current_side_manifest_revision_mismatch_fails_closed(self) -> None:
+        contract = self._pair(cur_kw={"manifest_revision": "0" * 40})
+        self.assertTrue([i for i in self._fail_closed(contract) if i.path.startswith("/quantitative_measurements/1/")])
+
+    def test_self_baseline_manifest_revision_mismatch_fails_closed(self) -> None:
+        contract = self._contract()
+        record = _measurement("m-self", "line")
+        _attach_semantics(contract, record, manifest_revision="0" * 40)
+        contract["quantitative_measurements"].append(record)
+        issues = self._issues(contract)
+        self.assertEqual(
+            [(i.code, i.path) for i in issues],
+            [("comparability_reset_required", "/quantitative_measurements/0/comparability/semantic_evidence")],
+        )
+
+    # --- every side binds its own record, whatever the verdict or authority (T-5840 REBOUND 2) ---------------
+    CUR_PATH = "/quantitative_measurements/1/comparability/semantic_evidence"
+
+    @staticmethod
+    def _refuse_base(contract, base, cur):
+        base["comparability"]["verdict"] = "refused"  # never derived itself
+
+    def _assert_cur_fails_closed(self, contract: dict) -> None:
+        hits = [(i.code, i.path) for i in self._issues(contract)]
+        self.assertIn(("comparability_reset_required", self.CUR_PATH), hits)
+
+    def test_consultant_probe_refused_baseline_with_stale_manifest_revision_fails_current_row(self) -> None:
+        contract = self._pair(base_kw={"manifest_revision": "0" * 40}, mutate_contract=self._refuse_base)
+        self.assertEqual(contract["quantitative_measurements"][0]["comparability"]["verdict"], "refused")
+        self.assertEqual(contract["quantitative_measurements"][1]["comparability"]["verdict"], "comparable")
+        self.assertEqual(
+            [(i.code, i.path) for i in self._issues(contract)],
+            [("comparability_reset_required", self.CUR_PATH)],
+        )
+
+    def test_refused_baseline_with_bad_adapter_id_fails_current_row(self) -> None:
+        for kw in ({"manifest_adapter_id": "someone-else"}, {"map_adapter_id": "someone-else"}):
+            with self.subTest(kw=kw):
+                self._assert_cur_fails_closed(self._pair(base_kw=kw, mutate_contract=self._refuse_base))
+
+    def test_refused_baseline_with_bad_instance_fails_current_row(self) -> None:
+        mod = self._module()
+        for key in mod.COMPARABILITY_CHECKED_FIELDS:
+            if key in RUN_LEVEL_KEYS:
+                continue
+            with self.subTest(key=key):
+                self._assert_cur_fails_closed(self._pair(base_kw={"instances": {key: "forged"}}, mutate_contract=self._refuse_base))
+
+    def test_reset_required_current_row_with_stale_baseline_revision_fails_closed_despite_reset_authority(self) -> None:
+        contract = self._pair(verdict="reset_required", changed=("denominator",), reset=True,
+                              base_kw={"manifest_revision": "0" * 40}, mutate_contract=self._refuse_base)
+        self._assert_cur_fails_closed(contract)
+
+    def test_equivalence_authorized_current_row_with_stale_baseline_revision_fails_closed(self) -> None:
+        contract = self._pair(changed=("denominator",), equivalence=True,
+                              base_kw={"manifest_revision": "0" * 40}, mutate_contract=self._refuse_base)
+        self._assert_cur_fails_closed(contract)
+
+    def test_equivalence_authorized_current_row_with_own_stale_revision_fails_closed(self) -> None:
+        self._assert_cur_fails_closed(self._pair(changed=("denominator",), equivalence=True, cur_kw={"manifest_revision": "0" * 40}))
+
+    def test_reset_authorized_current_row_with_own_stale_revision_fails_closed(self) -> None:
+        self._assert_cur_fails_closed(
+            self._pair(verdict="reset_required", changed=("denominator",), reset=True, cur_kw={"manifest_revision": "0" * 40})
+        )
+
+    def test_authority_never_rescues_baseline_adapter_or_instance_contradiction(self) -> None:
+        for base_kw in ({"manifest_adapter_id": "someone-else"}, {"instances": {"collector.tool_name": "forged"}}):
+            with self.subTest(base_kw=base_kw):
+                self._assert_cur_fails_closed(
+                    self._pair(changed=("denominator",), equivalence=True, base_kw=base_kw, mutate_contract=self._refuse_base)
+                )
+                self._assert_cur_fails_closed(
+                    self._pair(verdict="reset_required", changed=("denominator",), reset=True, base_kw=base_kw, mutate_contract=self._refuse_base)
+                )
+
+    def test_equivalence_authorized_current_row_with_own_adapter_or_instance_contradiction_fails_closed(self) -> None:
+        for cur_kw in ({"map_adapter_id": "someone-else"}, {"instances": {"scope.scope_fingerprint": "forged"}}):
+            with self.subTest(cur_kw=cur_kw):
+                self._assert_cur_fails_closed(self._pair(changed=("denominator",), equivalence=True, cur_kw=cur_kw))
+
+    # --- owner ruling (a): only manifests used as comparison evidence are resolved ------------------------------
+    def test_unreferenced_refused_row_stays_unresolved_and_makes_no_claim(self) -> None:
+        cases = {
+            "missing manifest ArtifactRecord": lambda c, r: r.update(artifact_id="art-gone"),
+            "stale revision": lambda c, r: _attach_semantics(c, r, manifest_revision="0" * 40),
+            "mismatched adapter_id": lambda c, r: _attach_semantics(c, r, manifest_adapter_id="someone-else"),
+            "mismatched instance": lambda c, r: _attach_semantics(c, r, instances={"collector.tool_name": "forged"}),
+        }
+        for name, break_evidence in cases.items():
+            with self.subTest(case=name):
+                contract = self._contract()
+                record = _measurement("m-refused", "line")
+                record["comparability"]["verdict"] = "refused"
+                break_evidence(contract, record)
+                contract["quantitative_measurements"].append(record)
+                self.assertEqual(self._issues(contract), [])
+
+    def test_same_refused_row_fails_closed_once_a_comparable_row_references_it(self) -> None:
+        cases = {
+            "stale revision": dict(base_kw={"manifest_revision": "0" * 40}),
+            "missing manifest ArtifactRecord": dict(mutate_contract=lambda c, b, r: (self._refuse_base(c, b, r), b.update(artifact_id="art-gone"))),
+            "mismatched adapter_id": dict(base_kw={"manifest_adapter_id": "someone-else"}),
+            "mismatched instance": dict(base_kw={"instances": {"scope.scope_fingerprint": "forged"}}),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(case=name):
+                kwargs = dict(kwargs)
+                kwargs.setdefault("mutate_contract", self._refuse_base)
+                contract = self._pair(**kwargs)
+                self.assertEqual(contract["quantitative_measurements"][0]["comparability"]["verdict"], "refused")
+                self._assert_cur_fails_closed(contract)
+
+    def test_distinct_baseline_and_current_sharing_one_manifest_fail_closed(self) -> None:
+        def share(contract, base, cur):
+            cur["artifact_id"] = base["artifact_id"]
+        self.assertTrue(self._fail_closed(self._pair(mutate_contract=share)))
+
+    def test_baseline_id_not_in_index_fails_closed(self) -> None:
+        def dangling(contract, base, cur):
+            cur["comparability"]["baseline_measurement_id"] = "m-missing"
+            cur["baseline"]["measurement_id"] = "m-missing"
+        self.assertTrue(self._fail_closed(self._pair(mutate_contract=dangling)))
+
+    def test_record_baseline_disagreeing_with_comparability_baseline_fails_closed(self) -> None:
+        def disagree(contract, base, cur):
+            cur["baseline"]["measurement_id"] = "m-cur"
+        self.assertTrue(self._fail_closed(self._pair(mutate_contract=disagree)))
+
+    def test_comparability_current_id_not_the_record_fails_closed(self) -> None:
+        def disagree(contract, base, cur):
+            # Fully self-consistent ids that merely point at the OTHER record: only the record-id check can tell.
+            cur["comparability"]["current_measurement_id"] = "m-base"
+            cur["current"]["measurement_id"] = "m-base"
+        contract = self._pair(mutate_contract=disagree)
+        self.assertTrue([i for i in self._fail_closed(contract) if i.path.startswith("/quantitative_measurements/1/")])
+
+
+class SelfBaselineStageTests(unittest.TestCase):
+    """T-6044: a self-baseline may derive `baseline` but never satisfies the distinct comparable evidence above it.
+
+    Distinctness is checked at id and content level only; run lineage is T-6090.
+    """
+
+    _module = RepositoryEvidenceTests._module
+    _contract = RepositoryEvidenceTests._contract
+    _validate = RepositoryEvidenceTests._validate
+    _make_baseline_ready = RepositoryEvidenceTests._make_baseline_ready
+
+    def _self_ready(self) -> dict:
+        contract = self._contract()
+        self._make_baseline_ready(contract)
+        return contract
+
+    def _distinct_ready(self) -> dict:
+        contract = self._self_ready()
+        for cur in list(contract["quantitative_measurements"]):
+            base = _measurement(f"base-{cur['dimension']}", cur["dimension"])
+            cur["baseline"]["measurement_id"] = base["measurement_id"]
+            cur["comparability"]["baseline_measurement_id"] = base["measurement_id"]
+            # Honest rerun: byte-identical resolved maps; the sides differ via their nonce-bearing member ids.
+            _attach_semantics(contract, base, retain=True)
+            contract["quantitative_measurements"].append(base)
+        return contract
+
+    def _artifact_by_id(self, contract: dict, artifact_id: str) -> dict:
+        return next(a for a in contract["artifact_records"] if a["artifact_id"] == artifact_id)
+
+    def _alias_current(self, contract: dict, rewrap, *, dimensions=("line", "branch"), edit_map: bool = False) -> None:
+        """Re-point each current row at a NEW artifact id carrying a re-wrapped copy of its baseline's manifest."""
+        for cur in contract["quantitative_measurements"]:
+            dim = cur["dimension"]
+            if not cur["measurement_id"].startswith("measure-") or dim not in dimensions:
+                continue
+            base_manifest = self._artifact_by_id(contract, f"sem-base-{dim}-manifest")
+            raw = base64.b64decode(base_manifest["storage_locator"]["value"])
+            extra: list[dict] = []
+            if edit_map:
+                manifest = json.loads(raw)
+                member = manifest["members"][0]
+                map_obj = json.loads(base64.b64decode(self._artifact_by_id(contract, member["artifact_id"])["storage_locator"]["value"]))
+                map_obj["observations"]["junit_node_id_count"] = 12345  # not a compared field
+                map_bytes = _sem_json(map_obj)
+                member.update(artifact_id=f"alias-{dim}-map", sha256=_sha(map_bytes), size=len(map_bytes))
+                extra.append(_artifact(f"alias-{dim}-map", map_bytes))
+                raw = _sem_json(manifest)
+            alias = _artifact(f"alias-{dim}-manifest", rewrap(raw))
+            own = f"sem-{cur['measurement_id']}"
+            contract["artifact_records"] = [a for a in contract["artifact_records"] if not a["artifact_id"].startswith(own)] + [alias, *extra]
+            contract["retention_records"] = [r for r in contract["retention_records"] if not r["artifact_id"].startswith(own)]
+            contract["retention_records"].append(_retention_for(contract, alias))
+            cur["artifact_id"] = alias["artifact_id"]
+
+    def _promote_everything_else(self, facts):
+        import dataclasses
+
+        flags = {
+            f.name: True
+            for f in dataclasses.fields(facts)
+            if f.type in (bool, "bool") and f.name != "above_baseline_comparison_distinct"
+        }
+        return self._module().derive_repository_maturity(dataclasses.replace(facts, **flags))
+
+    def test_valid_first_self_baseline_still_derives_baseline(self) -> None:
+        result = self._validate(self._self_ready())
+        self.assertEqual(result.issues, ())
+        self.assertEqual(result.derived_maturity, "baseline")
+        self.assertFalse(result.facts.above_baseline_comparison_distinct)
+
+    def test_self_baseline_cannot_promote_with_every_other_fact_satisfied(self) -> None:
+        result = self._validate(self._self_ready())
+        self.assertEqual(self._promote_everything_else(result.facts), "baseline")
+
+    def test_distinct_comparable_pair_satisfies_the_gate(self) -> None:
+        contract = self._distinct_ready()
+        self.assertEqual(
+            self._artifact_by_id(contract, "sem-base-line-map")["digest"],
+            self._artifact_by_id(contract, "sem-measure-line-map")["digest"],
+        )
+        result = self._validate(contract)
+        self.assertEqual(result.issues, ())
+        self.assertEqual(result.derived_maturity, "baseline")
+        self.assertTrue(result.facts.above_baseline_comparison_distinct)
+        self.assertEqual(self._promote_everything_else(result.facts), "enforcing")
+
+    def test_borrowed_manifest_rewrapped_under_new_artifact_id_is_refused(self) -> None:
+        rewraps = {
+            "byte copy": lambda b: b,
+            "whitespace": lambda b: json.dumps(json.loads(b), indent=4).encode("utf-8"),
+            "key order": lambda b: json.dumps(dict(reversed(list(json.loads(b).items())))).encode("utf-8"),
+        }
+        for name, rewrap in rewraps.items():
+            with self.subTest(rewrap=name):
+                contract = self._distinct_ready()
+                self._alias_current(contract, rewrap)
+                result = self._validate(contract)
+                self.assertEqual(result.issues, ())
+                self.assertEqual(result.derived_maturity, "baseline")
+                self.assertFalse(result.facts.above_baseline_comparison_distinct)
+                self.assertEqual(self._promote_everything_else(result.facts), "baseline")
+
+    def test_one_aliased_dimension_is_enough_to_refuse(self) -> None:
+        contract = self._distinct_ready()
+        self._alias_current(contract, lambda b: b, dimensions=("branch",))
+        self.assertFalse(self._validate(contract).facts.above_baseline_comparison_distinct)
+
+    def test_non_finite_number_in_current_manifest_fails_closed_without_raising(self) -> None:
+        contract = self._distinct_ready()
+        for cur in contract["quantitative_measurements"]:
+            if not cur["measurement_id"].startswith("measure-"):
+                continue
+            dim = cur["dimension"]
+            raw = base64.b64decode(self._artifact_by_id(contract, f"sem-base-{dim}-manifest")["storage_locator"]["value"])
+            self.assertTrue(raw.endswith(b"}\n"))
+            forged = _artifact(f"forged-{dim}-manifest", raw[:-2] + b',"x":1e999}\n')
+            own = f"sem-{cur['measurement_id']}"
+            contract["artifact_records"] = [a for a in contract["artifact_records"] if not a["artifact_id"].startswith(own)] + [forged]
+            contract["retention_records"] = [r for r in contract["retention_records"] if not r["artifact_id"].startswith(own)]
+            contract["retention_records"].append(_retention_for(contract, forged))
+            cur["artifact_id"] = forged["artifact_id"]
+        result = self._validate(contract)  # must not raise
+        self.assertFalse(result.facts.above_baseline_comparison_distinct)
+        self.assertEqual(result.derived_maturity, "baseline")
+        self.assertEqual(self._promote_everything_else(result.facts), "baseline")
+
+    def test_measured_dimension_without_measurements_is_not_vacuously_satisfied(self) -> None:
+        contract = self._distinct_ready()
+        for record in contract["dimension_dispositions"]:
+            if record["dimension"] == "branch":
+                record["measurement_ids"] = []
+        self.assertFalse(self._validate(contract).facts.above_baseline_comparison_distinct)
+
+    @unittest.expectedFailure  # T-6090: no run lineage in manifest (flips loudly when lineage lands)
+    def test_borrowed_manifest_with_edited_member_and_map_is_refused(self) -> None:
+        contract = self._distinct_ready()
+        self._alias_current(contract, lambda b: b, edit_map=True)
+        self.assertFalse(self._validate(contract).facts.above_baseline_comparison_distinct)
 
 
 if __name__ == "__main__":

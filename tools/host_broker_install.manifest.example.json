@@ -56,5 +56,6 @@
     "host": {"prefix": "/usr/local/lib/pantheon/host-mcp-adapter", "launcher": "/usr/local/libexec/pantheon-host-mcp-adapter"},
     "approval": {"prefix": "/usr/local/lib/pantheon/approval-mcp-adapter", "launcher": "/usr/local/libexec/pantheon-approval-mcp-adapter"}
   },
-  "producer": {"user": "nobody", "group": "nogroup", "via": "setpriv"}
+  "producer": {"user": "nobody", "group": "nogroup", "via": "setpriv"},
+  "plan_registration": {"protocol_test_seat_ids": []}
 }

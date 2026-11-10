@@ -199,7 +199,7 @@ This SOP does NOT cover:
 
 - **Per-domain test mechanics** — those live in the sibling SOPs ([visual-verification-for-ui-tickets.md](visual-verification-for-ui-tickets.md) for UI-tier mechanics; [auto-commit-cron-default-safe-contract.md](auto-commit-cron-default-safe-contract.md) for cron-script Layer-3 fixture mechanics).
 - **The brief-construction checklist** — that's [team-orchestrator-dispatch-checklist.md](team-orchestrator-dispatch-checklist.md). This SOP says *which cells of the matrix to honor*; the dispatch checklist says *how to operationalize those cells in the brief*.
-- **The reviewer's REBOUND criteria** — see worker-persona files in `claude-config/personas/` for the canonical reviewer convention. This SOP says *what counts as a REBOUND-able test-tier absence*; the persona says *how the reviewer REBOUNDs*.
+- **The reviewer's REBOUND criteria** — see worker-persona files in `harness/claude/agents/` for the canonical reviewer convention. This SOP says *what counts as a REBOUND-able test-tier absence*; the persona says *how the reviewer REBOUNDs*.
 - **Test-naming conventions** — per D6 §brief-named tests + [plan-first-dispatch.md](plan-first-dispatch.md). This SOP determines *which tests must exist*; the brief determines *what they're called*.
 
 ## Cross-references

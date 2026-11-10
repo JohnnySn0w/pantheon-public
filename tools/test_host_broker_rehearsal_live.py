@@ -656,10 +656,11 @@ class GateTest(unittest.TestCase):
             self.assertTrue(self.ok(argv, cwd=self.fw))
             self.refused(argv)  # cwd is part of the template
             self.refused(AT.OLD_SETPRIV_PREFIX + argv[8:], cwd=self.fw)
-            other = next(x for x in regs if x is not e)["source"]["producer_argv"]
-            swapped = argv[:17] + [other[17]] + argv[18:]
-            if swapped != argv:
-                self.refused(swapped, cwd=self.fw)
+            # a seat record of another seat (the plan names one protocol-test seat, #1665)
+            other_record = {**json.loads(argv[17]), "seat_id": "some-other-seat"}
+            swapped = argv[:17] + [H.canonical(other_record)] + argv[18:]
+            self.assertNotEqual(swapped, argv)
+            self.refused(swapped, cwd=self.fw)
             self.refused(argv[:21] + ["/tmp/elsewhere.json"], cwd=self.fw)
             self.refused(argv[:4] + argv[5:], cwd=self.fw)  # a hardening flag dropped
         with mock.patch.object(L, "SETPRIV_TEMPLATE_RULED", False):

@@ -32,7 +32,7 @@ _PRIVATE_MODE = 0o700
 class GateTree:
     """Layout handle for a temp gate-tree root.
 
-    Mirrors ORG-080 Base engine mechanics L306-327: a system-scope leaf plus
+    Mirrors ORG-080 run-state note (notes/2026-11-02-org-080-run-state-relocated.md) §File modes and §Gate location: a system-scope leaf plus
     zero or more seat-scope leaves, all under a shared ancestor chain. Only
     the ancestor chain is pre-created (mode 0755) -- per-component leaf
     ``_component_gate.json`` files are the admission tier's (tranche A's)
@@ -92,7 +92,7 @@ def temp_gate_tree(seat_uids: Sequence[int] = ()) -> Iterator[GateTree]:
 class StateStore:
     """Layout handle for a temp run-state store root.
 
-    Mirrors ORG-080 Base engine mechanics L306-311:
+    Mirrors ORG-080 run-state note (notes/2026-11-02-org-080-run-state-relocated.md) §File modes:
     ``<scope_root>/schema-v1/<instance>/<component>/<scope>/<leg>/<run_id>/
     record.json``. ``root`` here stands in for one ``<scope_root>`` at a
     time (system OR one seat) -- tests that need both scopes open two

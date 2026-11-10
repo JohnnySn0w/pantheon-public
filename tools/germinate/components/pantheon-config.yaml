@@ -6,21 +6,54 @@
 # observations; the handlers (pantheon-config_handlers.py) bring the three op
 # kinds below. The simulated handler is the only registered one; the real
 # git-backed handler (pantheon_config_git.py, T-5133) lands dark and unselected.
+#
+# Install leg (simulated tier; T-5107, residual live handler T-6098): plan_install
+# also types the hand-run bringup. An absent checkout plans [repo.clone,
+# repo.hooks-activate] (the engine applies in list order and rolls back reversed:
+# hooks are undone first, then the clone). A present hand-installed checkout with
+# healthy hooks is adopted by a pantheon-config.adopt-attest op (provenance basis
+# observed-legacy) and refused when its hooks are inactive or hooksPath is not the clone's own
+# .githooks (relative, absolute or via a link into it; D15 change A).
+# An engine-installed checkout plans nothing at install (drift is configure's and
+# verify's). The local sibling handler pantheon-config-local serves the two new
+# kinds; only the simulated one is registered.
+#
+# Configure leg (simulated tier; T-5107, residual live handler T-6098): plan_configure
+# converges an engine-recorded checkout's hooks (a repo.hooks-activate when hooksPath is
+# unset; a missing hook, a hooksPath that is not the clone's own .githooks or a lost exec bit is
+# refused, the fix being the hand-run tools/install_hooks.sh) and checks-and-records the
+# instance.yaml manifest with one pantheon-config.manifest-attest op (a digest of the
+# observed bytes, recorded only when the manifest parses and carries its
+# role_membership_projection block). The engine never writes instance.yaml.
+#
+# Health leg (simulated tier; T-5107 PR3, residual T-6096 emitter and T-6098 live branch
+# observation): legs.verify is bound to the CURRENT invariant list
+# org.pantheon.pantheon-config/v1 (PC-1..PC-6; pantheon-config.invariants.yaml), Recovery
+# signoff complete 2026-11-03 (D15). pantheon-config_handlers.VERIFY evaluates it over the SIMULATED
+# observation of both handlers, per spec checkout: managed, tree clean, hooks active, clone
+# currency (fleet_clone_currency_check terms), manifest valid and attestation currency. The engine never reaches
+# a host for it. There is NO emitter block: no Health1 emitter exists yet and the live
+# collector derives its subscriptions from contract emitter blocks (T-6096, ORG-081 D-11).
 component:
   id: pantheon-config
   steward: orchestrator
   version: 1
   planner_kind: python
-  contract_digest: sha256:d166114d8f608190f51c31f761a24585437ec7183918261ea41f73a19f2bc777
-  handlers_digest: sha256:5703896135b50d12f715f19db5035dba17ce7d009919cd814fd161355eaf229e
+  contract_digest: sha256:f01745bb990cc6d8c767aef0cbb6c3b4501bb60845a10d95d7e16e00a1cafe6b
+  handlers_digest: sha256:a493f02ce8d956211e22d60048137aec8a5a850adb2d23de901dc8d146b5eeec
   depends_on: []
   scopes: [system]
+  invariant_list_id: org.pantheon.pantheon-config/v1
+  invariant_list_digest: sha256:6a7f949f2968fe98f4a3c0c782887f7e48542751fcebbe2fe761f339b83a2759
   privilege:
-    seat: [repo.clone, repo.ff-advance, repo.reclaim]
+    seat: [repo.clone, repo.ff-advance, repo.reclaim, repo.hooks-activate, pantheon-config.adopt-attest, pantheon-config.manifest-attest]
   legs:
     install: plan_install
+    configure: plan_configure
     update: plan_update(source_rev_from, source_rev_to)
     remove: plan_remove
     repair: plan_repair(verify_result)
+    verify:
+      invariant_list_ref: org.pantheon.pantheon-config/v1@sha256:6a7f949f2968fe98f4a3c0c782887f7e48542751fcebbe2fe761f339b83a2759
   receipts:
     schema: pantheon-receipt/v1

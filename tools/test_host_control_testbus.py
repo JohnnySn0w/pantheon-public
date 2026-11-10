@@ -155,20 +155,37 @@ class TestbusHelperTests(unittest.TestCase):
         with open(bus_config, "w", encoding="utf-8") as handle:
             handle.write(_BUS_CONFIG.format(socket=socket_path))
         script = (
-            "import subprocess, sys\n"
+            "import subprocess, sys, warnings\n"
+            # This parent must exit while its Popen child is still alive: that
+            # is the orphan state sweep() is meant to repair.  Force warnings
+            # on for the fixture, then suppress only Popen.__del__'s expected
+            # complaint about that deliberate lifecycle violation.
+            "warnings.filterwarnings('ignore', category=ResourceWarning, "
+            "module='subprocess')\n"
             f"p = subprocess.Popen([{testbus.DBUS_DAEMON!r}, "
-            f"{f'--config-file={bus_config}'!r}, '--nofork'])\n"
+            f"{f'--config-file={bus_config}'!r}, '--nofork'], "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
             "print(p.pid)\n"
             "sys.stdout.flush()\n"
         )
         parent = subprocess.Popen(
-            [sys.executable, "-c", script], stdout=subprocess.PIPE, text=True
+            [sys.executable, "-W", "always::ResourceWarning", "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         line = parent.stdout.readline()
         daemon_pid = int(line.strip())
         parent_start_ticks = testbus._start_ticks(parent.pid)
         parent.wait(timeout=10)  # parent is now genuinely, fully gone
+        parent_stderr = parent.stderr.read()
         parent.stdout.close()
+        parent.stderr.close()
+        if "ResourceWarning" in parent_stderr:
+            raise AssertionError(
+                "intentional orphan fixture emitted a ResourceWarning:\n"
+                f"{parent_stderr}"
+            )
         deadline = time.monotonic() + 5
         while not os.path.exists(socket_path):
             if time.monotonic() > deadline:

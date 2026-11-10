@@ -6,6 +6,7 @@ The facts dicts mirror real netdata parent replies captured 2026-10-20 (pve2 pac
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import json
 import subprocess
@@ -127,6 +128,32 @@ class MainTests(unittest.TestCase):
         self.assertNotIn("FAIL", err)
         report.assert_called_once()
         self.assertEqual(report.call_args.args[:2], ("pve2-heat", "NeedsLogin"))
+
+    def test_enospc_preserves_alert_state_and_recovery_stays_suppressed(self):
+        run = mock.Mock(return_value=subprocess.CompletedProcess(
+            [], 0, json.dumps(facts(gpu=88)), ""))
+        with tempfile.TemporaryDirectory() as tmp:
+            sp = Path(tmp) / "state.json"
+            original = json.dumps({"alerted_at": NOW - 60})
+            sp.write_text(original)
+            with mock.patch.object(hm.time, "time", return_value=NOW), \
+                    mock.patch.object(hm.subprocess, "run", run), \
+                    mock.patch.object(hm.json, "dump",
+                                      side_effect=OSError(errno.ENOSPC, "No space left on device")):
+                with self.assertRaises(OSError) as raised:
+                    hm.main(["--state", str(sp)])
+            self.assertEqual(raised.exception.errno, errno.ENOSPC)
+            self.assertEqual(sp.read_text(), original)
+            self.assertEqual(list(sp.parent.glob(f".{sp.name}.*")), [])
+
+            err, out = io.StringIO(), io.StringIO()
+            with mock.patch.object(hm.time, "time", return_value=NOW), \
+                    mock.patch.object(hm.subprocess, "run", run), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                rc = hm.main(["--state", str(sp)])
+            self.assertEqual(rc, 0)
+            self.assertIn("still hot (alerted", out.getvalue())
+            self.assertEqual(json.loads(sp.read_text()), {"alerted_at": NOW - 60})
 
 
 

@@ -193,6 +193,8 @@ duplicate known-positive fixtures: each is observed red before the fix and green
 after it. A lint that exists but is not automatically run, or has not been shown
 to fail, is not architectural insurance.
 
+> Implemented by: T-2426 (2026-08-25, `674bb0caf9`, PR #357): `tools/grand_project_program.py` and `tickets/grand-project-reevaluation-obligations.yaml`, evaluated by the weekly `tools/adr_reeval_walk.py`. The walker files one deduplicated review ticket when an obligation's predicate holds (milestone: `depends_on` the named ticket; calendar: `not_before` = `next_check`; threshold: a metric crossing) rather than pre-filing it, treats proposal and incident obligations as surface-only (all 51 current obligations), and drops index-owned ids from its legacy per-trigger lane.
+
 ### 7. Define failure and pause honestly
 
 A stage may be:

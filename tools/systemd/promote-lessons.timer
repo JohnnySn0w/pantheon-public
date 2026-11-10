@@ -5,7 +5,7 @@
 # Weekly is enough — promotion is not urgent (design note §inc 4). Persistent=true
 # so a fire missed while the machine was off runs at next boot. The proof-of-life
 # digest sends every fire regardless of candidate count, so a silent week is still
-# visible (same contract as ticket_grooming's digest).
+# visible (to recovery's mailbox, T-6370).
 
 [Unit]
 Description=Lessons→hooks promotion — weekly (T-0649 inc 4)

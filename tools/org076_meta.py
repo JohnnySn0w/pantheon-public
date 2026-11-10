@@ -36,7 +36,8 @@ stale externally and OnFailure alerts). If the store cannot push a ticket (git/G
 episode accumulates durably and emits on recovery (RFC-004 s5 git row).
 
 Tickets: requester ``recovery`` (detector owner / steward), routed to a repair persona on another harness
-(Consultant@codex) through the store's ``_route`` (RFC-004 s5).
+(Watchman@codex, ``repair_evidence.RECOVERY_CANDIDATE``) through the store's ``_route``
+(RFC-004 s5).
 
 Uninstall leg (ORG-068 Remove): delete this module and ``tools/test_org076_meta.py``; drop the
 ``org076_meta`` calls from ``org076_store_runner.run_cycle``; remove the runner-state key ``meta``
@@ -73,6 +74,7 @@ def specs(account: str, requester: str = "recovery") -> list:
         out.append(es.DetectorSpec(
             detector=det, domain_key=DOMAIN, subsystem=SUBSYSTEM, requester=requester, harness="claude",
             account=account, candidates=(repair_evidence.RECOVERY_CANDIDATE,),
+            any_live_fallback=(repair_evidence.RECOVERY_CANDIDATE,),  # T-5998 B(i)
             redactor=repair_evidence.make_default_redactor(account)))
     return out
 

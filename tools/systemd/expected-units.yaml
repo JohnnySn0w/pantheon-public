@@ -37,7 +37,7 @@ orchestrator:
   # Echo-corpus obligation lint (T-3495)
   - {unit: pantheon-echo-lint.timer, enabled: true}
   - {unit: pantheon-echo-lint.service, enabled: false}
-  # Shared echo cargo target prune, weekly (T-4852)
+  # Shared echo cargo target prune, hourly with a size cap (T-4852, T-6121); installer-owned, not instanced
   - {unit: pantheon-echo-target-prune.timer, enabled: true}
   - {unit: pantheon-echo-target-prune.service, enabled: false}
   # CI-audit tip coverage: "THIS UNIT BELONGS ON THE `claude` SEAT AND ONLY THERE" (T-2440)
@@ -53,9 +53,14 @@ orchestrator:
   # Decision-register sweep (T-5015 phase 2): reads the orchestrator seat's own session jsonls, so claude-seat only.
   - {unit: pantheon-decision-sweep.timer, enabled: true}
   - {unit: pantheon-decision-sweep.service, enabled: false}
+  # Per-seat template pantheon-decision-sweep@.{service,timer} (T-5054): not expected anywhere yet; enabled per instance at install.
   # Throughline trigger (T-5015 phase 3): weekly; files one HO ticket when the register gained rows.
   - {unit: pantheon-decision-throughline.timer, enabled: true}
   - {unit: pantheon-decision-throughline.service, enabled: false}
+  # Owner-side /tmp session prune, instanced by persona (T-6141); installer-owned, Claude seats except recovery
+  - {unit: pantheon-tmp-session-prune@.service, enabled: false}
+  - {unit: pantheon-tmp-session-prune@.timer, enabled: false}
+  - {unit: pantheon-tmp-session-prune@orchestrator.timer, enabled: true}
 
 recovery:
   # pantheon-session-reset-reconcile.{timer,service}: NOT expected — RETIRED
@@ -81,9 +86,21 @@ recovery:
   - {unit: pantheon-parity-remediate.service, enabled: false}
   # Unit-failure alert: OnFailure= target, never enabled itself (T-1868)
   - {unit: pantheon-unit-failure-alert@.service, enabled: false}
+  # Codex seat timers (T-6125, from T-6115): recovery runs them AS the codex account, so they are
+  # instanced on the ACCOUNT (codex = consultant). Instances follow instance.yaml
+  # persona_installer.codex_seat_timers.personas; watchman (codex-fallback) is added here in
+  # the same change that adds it there, after the T-5740 soak.
+  - {unit: pantheon-codex-handoff-checkpoint@.service, enabled: false}
+  - {unit: pantheon-codex-handoff-checkpoint@.timer, enabled: false}
+  - {unit: pantheon-codex-handoff-checkpoint@codex.timer, enabled: true}
+  - {unit: pantheon-codex-thread-rotate@.service, enabled: false}
+  - {unit: pantheon-codex-thread-rotate@.timer, enabled: false}
+  - {unit: pantheon-codex-thread-rotate@codex.timer, enabled: true}
   # Mirror drift-sweep section (T-1994, T-2213, T-2157, T-2217)
   - {unit: pantheon-resource-sampler.timer, enabled: true}
   - {unit: pantheon-resource-sampler.service, enabled: false}
+  - {unit: pantheon-resource-sampler-coverage.timer, enabled: true}
+  - {unit: pantheon-resource-sampler-coverage.service, enabled: false}
   - {unit: pantheon-mail-staleness.timer, enabled: true}
   - {unit: pantheon-mail-staleness.service, enabled: false}
   - {unit: pantheon-forgejo-mirror-verify.timer, enabled: true}
@@ -161,3 +178,43 @@ recovery:
   - {unit: pantheon-context-fill-monitor@recovery.timer, enabled: true}
   - {unit: pantheon-activity-monitor@.service, enabled: false}
   - {unit: pantheon-activity-monitor@orchestrator.timer, enabled: true}
+
+specialist:
+  # Owner-side /tmp session prune, instanced by persona (T-6141); installer-owned, Claude seats except recovery
+  - {unit: pantheon-tmp-session-prune@.service, enabled: false}
+  - {unit: pantheon-tmp-session-prune@.timer, enabled: false}
+  - {unit: pantheon-tmp-session-prune@specialist.timer, enabled: true}
+  # Receipt-driven Chronicle prune (T-6118 PR-5); installer-owned, every seat except recovery/orchestrator (bucket cap)
+  - {unit: pantheon-chronicle-prune@.service, enabled: false}
+  - {unit: pantheon-chronicle-prune@.timer, enabled: false}
+  - {unit: pantheon-chronicle-prune@specialist.timer, enabled: true}
+
+mason:
+  # Owner-side /tmp session prune, instanced by persona (T-6141); installer-owned, Claude seats except recovery
+  - {unit: pantheon-tmp-session-prune@.service, enabled: false}
+  - {unit: pantheon-tmp-session-prune@.timer, enabled: false}
+  - {unit: pantheon-tmp-session-prune@mason.timer, enabled: true}
+  # Receipt-driven Chronicle prune (T-6118 PR-5); installer-owned, every seat except recovery/orchestrator (bucket cap)
+  - {unit: pantheon-chronicle-prune@.service, enabled: false}
+  - {unit: pantheon-chronicle-prune@.timer, enabled: false}
+  - {unit: pantheon-chronicle-prune@mason.timer, enabled: true}
+
+artisan:
+  # Owner-side /tmp session prune, instanced by persona (T-6141); installer-owned, Claude seats except recovery
+  - {unit: pantheon-tmp-session-prune@.service, enabled: false}
+  - {unit: pantheon-tmp-session-prune@.timer, enabled: false}
+  - {unit: pantheon-tmp-session-prune@artisan.timer, enabled: true}
+  # Receipt-driven Chronicle prune (T-6118 PR-5); installer-owned, every seat except recovery/orchestrator (bucket cap)
+  - {unit: pantheon-chronicle-prune@.service, enabled: false}
+  - {unit: pantheon-chronicle-prune@.timer, enabled: false}
+  - {unit: pantheon-chronicle-prune@artisan.timer, enabled: true}
+
+archivist:
+  # Owner-side /tmp session prune, instanced by persona (T-6141); installer-owned, Claude seats except recovery
+  - {unit: pantheon-tmp-session-prune@.service, enabled: false}
+  - {unit: pantheon-tmp-session-prune@.timer, enabled: false}
+  - {unit: pantheon-tmp-session-prune@archivist.timer, enabled: true}
+  # Receipt-driven Chronicle prune (T-6118 PR-5); installer-owned, every seat except recovery/orchestrator (bucket cap)
+  - {unit: pantheon-chronicle-prune@.service, enabled: false}
+  - {unit: pantheon-chronicle-prune@.timer, enabled: false}
+  - {unit: pantheon-chronicle-prune@archivist.timer, enabled: true}

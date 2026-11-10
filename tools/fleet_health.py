@@ -48,9 +48,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # Make `from tools.X import Y` work whether invoked as `python3 tools/foo.py`
 # or `python3 -m tools.foo` (same shim as restart_drain.py).
@@ -62,6 +64,7 @@ if str(_REPO_ROOT) not in sys.path:
 from tools.agent_role_map import control_plane_consume_service as _control_plane_consume_service  # noqa: E402  (needs sys.path above)
 from tools.agent_role_map import instance_binding as _instance_binding  # noqa: E402  (needs sys.path above)
 from tools import seat_state  # noqa: E402  (needs sys.path above)
+from tools import chronicle_export  # noqa: E402  (needs sys.path above)
 
 
 def _consume_timer(persona: str) -> str:
@@ -321,6 +324,10 @@ def _seat_note(e) -> dict | None:
         return None
     until = e.expires or "no expiry"
     who = f"{e.owner or '?'}: {e.reason or '-'}"
+    if e.alertable is True or e.state == seat_state.STATE_HALTED:
+        # T-5868: HALTED is an incident (red, with the rollback command), never "expected".
+        return {"name": "seat-state", "status": FAIL,
+                "detail": f"HALTED ({who}); rollback: {e.rollback_cmd or '(see seat-state record)'}"}
     if e.state == seat_state.STATE_PAUSED_INTAKE:
         return {"name": "seat-state", "status": OK,
                 "detail": f"paused (intake held; {who}; until {until})"}
@@ -633,6 +640,128 @@ def render_chronicle(records: list[dict]) -> str:
     return "\n".join(lines)
 
 
+# T-6118 PR-4b. SOFT: a low transcript ratio is a WARN and never moves the exit code.
+CHRONICLE_TRANSCRIPT_DAYS = 7
+# Fleet agent -> its chronicle-export seat dir. archivist decision 1 (2026-11-04): the codex
+# persona exports under the appserver seat `consultant`; every other agent exports under its own name.
+EXPORT_SEAT = {"codex": "consultant"}
+
+
+def transcript_coverage_sweep(agents: list[str], *, run=_run) -> list[dict]:
+    """Per seat, the share of non-hollow session ends that have a transcript (7d), run AS the seat's
+    account like chronicle_coverage_sweep. Below threshold or unqueryable is WARN, never FAIL."""
+    records: list[dict] = []
+    for agent in agents:
+        user = FLEET[agent]["user"]
+        rc, out, ran = run(user, "python3 ~/pantheon-config/tools/session_chronicle.py "
+                                 f"transcript-coverage --persona {agent} --days {CHRONICLE_TRANSCRIPT_DAYS} --json")
+        if not ran:
+            records.append({"agent": agent, "status": WARN, "ratio": None,
+                            "detail": "could not query (sudo/timeout)"})
+            continue
+        try:
+            parsed = json.loads((out or "").strip().splitlines()[-1])
+            if not isinstance(parsed, dict) or parsed.get("status") not in (OK, FAIL):
+                raise ValueError("no verdict")
+        except (ValueError, IndexError):
+            records.append({"agent": agent, "status": WARN, "ratio": None,
+                            "detail": "unreadable transcript-coverage output"})
+            continue
+        records.append({"agent": agent, "status": OK if parsed["status"] == OK else WARN,
+                        "ratio": parsed.get("ratio"), "eligible": parsed.get("eligible"),
+                        "with_transcript": parsed.get("with_transcript"), "hollow": parsed.get("hollow"),
+                        "threshold": parsed.get("threshold"), "detail": parsed.get("detail", "?")})
+    return records
+
+
+_EXPORT_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_real_dir(path: str, *, dir_fd: int | None = None) -> int | None:
+    """fd of a real directory, or None. O_NOFOLLOW|O_DIRECTORY: a symlink (to anything) is never entered."""
+    try:
+        return os.open(path, _EXPORT_DIR_FLAGS, dir_fd=dir_fd)
+    except OSError:
+        return None
+
+
+def export_size_sweep(agents: list[str], *, days: int = CHRONICLE_TRANSCRIPT_DAYS,
+                      now: datetime | None = None) -> tuple[dict, str | None]:
+    """({export_seat: {YYYY-MM-DD: bytes}}, note). Reads the export tree directly (group-readable, no
+    sudo; PANTHEON_CHRONICLE_EXPORT_ROOT is honoured). Bytes are the simple sum of st_size of regular
+    files (lstat) per date dir; seat and date dirs are opened O_NOFOLLOW (a symlinked dir counts 0): a file hardlinked to the Chronicle copy shares an inode, so this is
+    apparent bytes per file name, not unique disk usage. `.ingested` is skipped. An unreadable or
+    unprovisioned tree gives a note, never an error."""
+    root = chronicle_export.export_root()
+    current = now or datetime.now(timezone.utc)
+    floor = (current - timedelta(days=days)).strftime("%Y-%m-%d")
+    note = "export tree unreadable/unprovisioned"
+    sizes: dict[str, dict[str, int]] = {}
+    try:
+        if not root.is_dir():
+            return {}, note
+        for seat in sorted({EXPORT_SEAT.get(a, a) for a in agents}):
+            per_day: dict[str, int] = {}
+            sizes[seat] = per_day
+            seat_fd = _open_real_dir(str(root / seat))
+            if seat_fd is None:
+                continue
+            try:
+                for date in sorted(os.listdir(seat_fd), reverse=True):
+                    if len(date) != 10 or date[4] != "-" or date < floor:
+                        continue
+                    date_fd = _open_real_dir(date, dir_fd=seat_fd)
+                    if date_fd is None:
+                        continue
+                    try:
+                        total = 0
+                        for name in os.listdir(date_fd):
+                            st = os.stat(name, dir_fd=date_fd, follow_symlinks=False)
+                            if stat.S_ISREG(st.st_mode):
+                                total += st.st_size
+                        per_day[date] = total
+                    except OSError:
+                        continue
+                    finally:
+                        os.close(date_fd)
+            except OSError:
+                continue
+            finally:
+                os.close(seat_fd)
+    except OSError:
+        return {}, note
+    return sizes, None
+
+
+def _human(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "K", "M", "G"):
+        if size < 1024 or unit == "G":
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{n}B"
+
+
+def render_chronicle_export(cov: list[dict], sizes: dict, note: str | None) -> str:
+    """One line per seat: transcript ratio + export bytes per day (newest first)."""
+    lines = []
+    for r in cov:
+        seat = EXPORT_SEAT.get(r["agent"], r["agent"])
+        if r.get("ratio") is None and r.get("eligible") is None:
+            ratio = f"n/a ({r['detail']})"
+        else:
+            ratio = (f"ratio {r['ratio']:.2f} ({r.get('with_transcript')}/{r.get('eligible')}, "
+                     f"hollow {r.get('hollow')})" if r.get("ratio") is not None
+                     else f"ratio n/a (0 eligible, hollow {r.get('hollow')})")
+        days = " ".join(f"{d} {_human(b)}" for d, b in sorted(sizes.get(seat, {}).items(), reverse=True))
+        flag = "!" if r["status"] != OK else " "
+        lines.append(f"[{flag}] chronicle-export {seat} {CHRONICLE_TRANSCRIPT_DAYS}d {ratio} | "
+                     f"{days or 'no export files in window'}")
+    if note:
+        lines.append(f"chronicle-export: {note}")
+    return "\n".join(lines)
+
+
 def render(results: list[dict], failed: list[dict] | None = None) -> str:
     glyph = {OK: "✓", WARN: "!", FAIL: "✗", PAUSED: "⏸", ASLEEP: "z"}
     lines = []
@@ -698,15 +827,24 @@ def main(argv=None) -> int:
     results = sweep(agents)
     failed = None if args.no_failed_sweep else failed_units_sweep(agents)
     chronicle_records = chronicle_coverage_sweep(agents) if args.chronicle else None
+    transcript_records = export_bytes = export_note = None
+    if args.chronicle:  # T-6118 PR-4b: soft extras; they never touch the exit code
+        transcript_records = transcript_coverage_sweep(agents, run=_run)
+        export_bytes, export_note = export_size_sweep(agents)
     if args.json:
         payload = {"agents": results, "failed_units": failed}
         if chronicle_records is not None:
             payload["chronicle"] = chronicle_records
+            payload["transcript_coverage"] = transcript_records
+            payload["export_bytes"] = export_bytes
+            if export_note:
+                payload["export_note"] = export_note
         print(json.dumps(payload, indent=2))
     else:
         print(render(results, failed))
         if chronicle_records is not None:
             print(render_chronicle(chronicle_records))
+            print(render_chronicle_export(transcript_records, export_bytes, export_note))
     agent_fail = any(r["status"] == FAIL for r in results)
     units_fail = bool(failed) and any(fr["status"] == FAIL for fr in failed)
     chronicle_fail = bool(chronicle_records) and any(r["status"] == FAIL for r in chronicle_records)

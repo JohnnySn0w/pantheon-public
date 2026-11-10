@@ -1,0 +1,21 @@
+[Unit]
+# T-6118 PR-5: receipt-driven prune of this seat's memex-exported Chronicle copies. Deletes ONLY on
+# validated, matching receipts (size + sha256 from the ingest account, whole record receipted); every
+# doubt keeps the file. Runs AS the seat's own account; the instance is the PERSONA and the tool
+# resolves the export seat itself. Exit codes are unchanged: 2 (refused) and 3 (a newly alerted
+# condition or an error) alert via OnFailure. A manual dry run is `chronicle_prune.py --persona <p>`
+# with no flag. No git writes.
+Description=Pantheon chronicle prune: receipted export + Chronicle copies for seat %i
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/chronicle_prune.py --persona %i --execute
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,39 @@
+# pantheon-config verify invariant list (T-5107 PR3; ORG-080 §2 / §6, ORG-081 D-11).
+#
+# CURRENT, D15 co-authorship with recovery, tracked on T-6096. Recovery signed PC-1..PC-6 on 2026-11-03
+# (D15), including changes A-C as built: the PC-3 hooksPath rule (a value is healthy iff it
+# resolves to that clone's own .githooks: relative, absolute or via a link into it), the
+# severity softening (unknown reads degraded, not failed) and the PENDING_PUSH age (an
+# unpushed commit older than 24h is degraded). Attestation drift stays degraded; there is no B2.
+# Evaluated by pantheon-config_handlers.VERIFY through the engine verify leg over the
+# SIMULATED observation of both handlers (the repo handler's per-checkout facts, plus the
+# local handler's hook, attestation and manifest facts); the evaluator reads nothing from a
+# host and never imports a monitor. Each invariant is evaluated per spec checkout and
+# names the checkout in any breach. A fact that is missing or of the wrong type never
+# passes (it reads failed, or degraded where the invariant says could-not-evaluate).
+# Severities: failed makes the state unhealthy, degraded-only makes it degraded.
+# The currency invariant mirrors tools/fleet_clone_currency_check.py (OFF_MAIN, DRIFTED
+# past 20 commits behind; ahead is its PENDING_PUSH, an alert here only past 24 hours) and the hook set mirrors
+# tools/hooks/ensure-hooks-active.sh; the literals are pinned by tests, not imported.
+# Bound to the contract's legs.verify by invariant_list_id + invariant_list_digest. There
+# is NO Health1 emitter and no emitter block (the live collector derives subscriptions from
+# contract emitter blocks; T-6096); this is the vocabulary it will report. The digest is
+# the compact sorted-key sha256 of {id, invariants}; the status fields are not part of it.
+schema: pantheon-invariant-list/v0
+id: org.pantheon.pantheon-config/v1
+status: CURRENT
+co_author: recovery
+signoff: complete 2026-11-03
+invariants:
+  - id: PC-1-checkout-managed
+    check: at least one checkout is observed, and every observed checkout exists and is managed (its origin equals the manifest remote); an empty observation, an absent checkout or a foreign origin is failed, naming the checkout
+  - id: PC-2-tree-clean
+    check: every managed checkout's working tree is clean; a dirty tree, or a dirty fact that is not a bool, is failed
+  - id: PC-3-hooks-active
+    check: every checkout has core.hooksPath that resolves (realpath; a relative value is taken from the clone's top level) to that clone's own existing .githooks directory (a relative .githooks, the clone's absolute .githooks, or a symlink resolving into it), and the three hooks (pre-commit, commit-msg, pre-push) present and executable; an unset path, another clone's .githooks, a nonexistent path, any other directory, a missing or non-executable hook, or a mistyped fact is failed, naming the checkout and hook; no local observation for the checkout is degraded (could not evaluate)
+  - id: PC-4-currency
+    check: in tools/fleet_clone_currency_check.py's terms, a checkout on its tracked branch at the desired target, or at most 20 commits behind it, is current; more than 20 behind is degraded (DRIFTED); on another branch or a detached HEAD is degraded (OFF_MAIN); ahead of the target is not a breach unless the oldest unpushed commit is more than 24 hours old at observation time (PENDING_PUSH, degraded), and ahead with that age not observed is degraded (could not evaluate); an unreachable remote, an unresolved target, an unresolvable ancestry or an unobserved branch is degraded (could not evaluate); a checkout missing the currency facts is failed
+  - id: PC-5-manifest-valid
+    check: every checkout has an observed instance.yaml manifest that parses and carries its role_membership_projection block; an absent manifest, an invalid manifest, or a missing manifest observation is failed, naming the checkout; no local observation for the checkout is degraded (could not evaluate)
+  - id: PC-6-attestations-current
+    check: when an adopt attestation is recorded, the current evidence equals it on every stable key (checkout_id, origin, hooks_path, hook_modes); when a manifest attestation is recorded, the current manifest digest equals it; any drifted key is degraded and named; a recorded attestation that is not an object, or evidence that is not an object while an attestation is recorded, is failed; none recorded passes; an unobserved attestation fact or no local observation is degraded (could not evaluate)

@@ -278,6 +278,17 @@ class CodexBannerTests(unittest.TestCase):
         hit = classify_codex_usage_limit("You've hit your usage limit. try again at Jan 2nd 4:13 AM", now=now, tz=timezone.utc)
         self.assertEqual(hit.reset_at.year, 2027)
 
+    def test_recently_passed_reset_keeps_this_year(self):
+        # T-5801: a banner still shown days after its reset is past, not a year away.
+        now = datetime(2026, 11, 7, 12, 0, tzinfo=timezone.utc)
+        hit = classify_codex_usage_limit("You've hit your usage limit. try again at Nov 4th 8:02 AM", now=now, tz=timezone.utc)
+        self.assertEqual(hit.reset_at, datetime(2026, 11, 4, 8, 2, tzinfo=timezone.utc))
+
+    def test_dec_reset_shown_in_jan_rolls_back(self):
+        now = datetime(2027, 1, 2, 12, 0, tzinfo=timezone.utc)
+        hit = classify_codex_usage_limit("You've hit your usage limit. try again at Dec 31st 4:13 AM", now=now, tz=timezone.utc)
+        self.assertEqual(hit.reset_at, datetime(2026, 12, 31, 4, 13, tzinfo=timezone.utc))
+
     def test_banner_without_parseable_time_still_classifies_as_cap(self):
         hit = classify_codex_usage_limit("You've hit your usage limit.", now=NOW)
         self.assertIsNotNone(hit)

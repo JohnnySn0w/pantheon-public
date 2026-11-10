@@ -199,7 +199,7 @@ def test_absent_projection_block_refuses(wired, tmp_path, monkeypatch):
     """Belt-and-braces: an instance.yaml with NO role_membership_projection block
     fails closed (MembershipSourceMissing), unlike the fail-safe binding loaders that
     fall back to a hardcoded mirror. A silent fallback here would be the second
-    authority ORG-085 §253 bans."""
+    authority ORG-085 §Field ownership and authority bans."""
     manifest = tmp_path / "instance.yaml"
     manifest.write_text(yaml.safe_dump({"roles": {}}, sort_keys=False), encoding="utf-8")
     monkeypatch.setattr(arm, "_INSTANCE_YAML", manifest)

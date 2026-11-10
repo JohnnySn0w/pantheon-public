@@ -280,6 +280,73 @@ class ChronicleTest(unittest.TestCase):
         self.assertEqual([r["uuid"] for r in rows], ["g"], "malformed lines skipped, good kept")
 
 
+class ExportPermsTest(unittest.TestCase):
+    """T-6118 PR-2: mode/group land on the temp fd BEFORE the rename (archivist hardlinks the file)."""
+
+    def setUp(self):
+        import grp
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name) / "chronicle"
+        self.gid = os.getegid()
+        self.group = grp.getgrgid(self.gid).gr_name
+
+    def test_mode_and_gid_applied_before_replace(self):
+        d = Path(self._tmp.name) / "d"
+        d.mkdir()
+        calls = []
+        real = (os.fchmod, os.fchown, os.replace)
+        with mock.patch.object(os, "fchmod", side_effect=lambda *a: (calls.append("fchmod"), real[0](*a))[1]), \
+             mock.patch.object(os, "fchown", side_effect=lambda *a: (calls.append("fchown"), real[1](*a))[1]), \
+             mock.patch.object(os, "replace", side_effect=lambda *a: (calls.append("replace"), real[2](*a))[1]):
+            cy._write_snapshot_required(d / "x.md", "hi", mode=0o640, gid=self.gid)
+        self.assertEqual(calls, ["fchmod", "fchown", "replace"])
+
+    def test_default_stays_0600_and_makes_no_perm_calls(self):
+        d = Path(self._tmp.name) / "d"
+        d.mkdir()
+        with mock.patch.object(os, "fchmod") as chm, mock.patch.object(os, "fchown") as cho:
+            cy._write_snapshot_required(d / "x.md", "hi")
+        chm.assert_not_called()
+        cho.assert_not_called()
+        self.assertEqual((d / "x.md").stat().st_mode & 0o777, 0o600)
+
+    def test_archive_required_lands_0640_in_group(self):
+        p = cy.archive_required("recovery", "# H\nbody", jsonl_uuid="u1", reason="r", ts="2026-11-04T01:00:00Z",
+                                root=self.root, mode=0o640, group=self.group)
+        self.assertEqual(p.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(p.stat().st_gid, self.gid)
+
+    def test_write_companion_text_lands_0640_in_group(self):
+        p = cy.write_companion_text("recovery", "{}", jsonl_uuid="u1", ts="2026-11-04T01:00:00Z",
+                                    suffix="session.json", root=self.root, mode=0o640, group=self.group)
+        self.assertEqual(p.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(p.stat().st_gid, self.gid)
+
+    def test_unknown_group_raises_durability_error(self):
+        with self.assertRaises(cy.ChronicleDurabilityError):
+            cy.archive_required("recovery", "x", jsonl_uuid="u1", reason="r", ts="2026-11-04T01:00:00Z",
+                                root=self.root, group="no-such-group-t6118")
+        with self.assertRaises(cy.ChronicleDurabilityError):
+            cy.write_companion_text("recovery", "x", jsonl_uuid="u1", ts="2026-11-04T01:00:00Z",
+                                    suffix="session.json", root=self.root, group="no-such-group-t6118")
+
+    def test_default_archive_required_unchanged_0600(self):
+        p = cy.archive_required("recovery", "x", jsonl_uuid="u2", reason="r", ts="2026-11-04T01:00:00Z", root=self.root)
+        self.assertEqual(p.stat().st_mode & 0o777, 0o600)
+
+    def test_archive_group_problem(self):
+        self.assertIsNone(cy.archive_group_problem(None))
+        self.assertIsNone(cy.archive_group_problem(self.group))
+        self.assertIn("does not exist", cy.archive_group_problem("no-such-group-t6118"))
+
+    def test_codex_thread_rotate_delegates(self):
+        from tools import codex_thread_rotate as rot
+        with mock.patch.object(rot.chronicle, "archive_group_problem", return_value="sentinel") as m:
+            self.assertEqual(rot.archive_group_problem("g"), "sentinel")
+        m.assert_called_once_with("g")
+
+
 class CliTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

@@ -27,6 +27,9 @@ from typing import Final, Literal, Mapping
 from tools.germinate.planner_sandbox.wal.artifacts import canonical_json_bytes, sha256_hex
 from tools.host_control.envelope import (
     EXECUTOR_KIND_CLASSES,
+    INSPECTION_PORT_METHODS,
+    INSPECTION_READ_PURPOSES,
+    INSPECTION_UNIT_ROLES,
     KIND_INSPECTION_READS,
     ORG082_SUBSTRATE_FAMILIES,
     OUT_OF_ENVELOPE_KINDS,
@@ -139,6 +142,17 @@ def build_entries(engine_kinds: Mapping[str, tuple[str, Privilege]] = ENGINE_KIN
     unknown = sorted(set(KIND_INSPECTION_READS) - set(EXECUTOR_KIND_CLASSES))
     if unknown:
         raise OpRegistryError(f"inspection reads declared for kinds outside the executor envelope: {unknown}")
+    for kind, declared in KIND_INSPECTION_READS.items():
+        for read in declared:
+            if not (isinstance(read, tuple) and len(read) == 3 and all(isinstance(part, str) for part in read)):
+                raise OpRegistryError(f"inspection read for {kind!r} is not a (method, role, purpose) string triple: {read!r}")
+            method, role, purpose = read
+            if method not in INSPECTION_PORT_METHODS:
+                raise OpRegistryError(f"inspection read for {kind!r}: method {method!r} not in {sorted(INSPECTION_PORT_METHODS)}")
+            if role not in INSPECTION_UNIT_ROLES:
+                raise OpRegistryError(f"inspection read for {kind!r}: unit role {role!r} not in {sorted(INSPECTION_UNIT_ROLES)}")
+            if purpose not in INSPECTION_READ_PURPOSES:
+                raise OpRegistryError(f"inspection read for {kind!r}: read purpose {purpose!r} is not a ReadPurpose value")
     for kind, klass in EXECUTOR_KIND_CLASSES.items():
         read_only = klass in READ_ONLY_CLASSES
         reads = tuple(tuple(read) for read in KIND_INSPECTION_READS.get(kind, ()))

@@ -17,6 +17,11 @@ renders one sop/standard/<x>.md (or sop/remediation/<x>.md, T-4782) as ~/.claude
 into tools/persona_orientation/sop-skill-bindings.yaml. Persona skills are
 Claude-only until T-3338 Phase 2.
 
+T-6116 adds role-gated VENDORED skills: tools/persona_orientation/vendored-skills.yaml
+(see vendored_skills.py) renders skills/vendored/<up>/<skill>/ as copies under
+~/.claude/skills/<name>/ for seats holding one of the entry's `roles:`; stamped into
+vendored-skill-bindings.yaml, claude harness only.
+
 CLI:
     render.py             extract, render, WRITE artifacts, stamp the bindings files
     render.py --dry-run   extract, render, print to stdout, write nothing
@@ -1159,7 +1164,20 @@ def run(root: Path, home: Path, mode: str, harness: str = "claude", codex_home: 
     if "claude" in harnesses:
         rc = max(rc, run_persona(root, home, mode, stamp))
     rc = max(rc, run_sop_skills(root, home, mode, harnesses, codex_home, hermes_skills_root, stamp, seat_roles))
+    if "claude" in harnesses:  # T-6116: role-gated vendored third-party skills (claude only)
+        rc = max(rc, _vendored_module().run_vendored(root, home, mode, seat_roles, stamp))
     return rc
+
+
+def _vendored_module():
+    try:
+        from tools.persona_orientation import vendored_skills
+    except ImportError:  # run as a script: put tools/ on sys.path, as resolve_seat_roles does
+        tools_dir = str(Path(__file__).resolve().parents[1])
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        from persona_orientation import vendored_skills  # resolves as tools.persona_orientation (host-broker closure walk)
+    return vendored_skills
 
 
 def main(argv: list[str] | None = None) -> int:

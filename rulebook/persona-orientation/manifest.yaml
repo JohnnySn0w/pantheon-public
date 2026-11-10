@@ -154,6 +154,18 @@ base_layer:
         curated subset. The smoke command is the project's actual CI
         workflow command, not a hand-picked shortcut.
 
+    - id: stale_instruction_precedence
+      extract: inline
+      body: |
+        When an instruction file's description of the code (a path, command,
+        API, file layout, or coding convention) conflicts with what the
+        repository actually contains, treat the repository as current, say
+        that the instruction file looks stale, and do not rewrite working code
+        to match it. This never applies to behavioural, safety, access-control
+        or approval rules; those bind regardless of what any code does.
+        (the operator TG 13191, T-6354; evidence and carve-out rationale in
+        knowledge/episodic/2026-11-09-stale-instruction-precedence-proposal/.)
+
     - id: forbidden_byte_guard
       extract: inline
       body: |

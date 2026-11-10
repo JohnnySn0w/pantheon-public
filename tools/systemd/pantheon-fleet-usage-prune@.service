@@ -1,0 +1,15 @@
+[Unit]
+# T-4536 rollout (c), T-5933: retention for the per-seat usage ledger. Deletes only the
+# seat's OWN day files under /var/lib/pantheon/fleet-usage/turns/%i older than 35 days
+# (the ledger refuses another seat and any window below its minimum). No git writes.
+# Install as each seat's own account, Claude and Codex seats alike.
+Description=Pantheon fleet usage: prune seat %i day files older than 35 days
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PANTHEON_FLEET_USAGE_SEAT=%i
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/fleet_usage_ledger.py prune --seat %i --older-than-days 35 --commit
+TimeoutStartSec=5min
+Nice=10

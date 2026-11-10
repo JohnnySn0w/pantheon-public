@@ -149,6 +149,8 @@ class KillInjection(unittest.TestCase):
                 if proc.poll() is None:
                     proc.kill()
                     proc.wait()
+                proc.stdout.close()
+                proc.stderr.close()
             self.assertEqual(proc.returncode, -signal.SIGKILL)
             epoch = alive["epoch"]
             # the file survives the kill; time passing is the only thing that changes -> stale

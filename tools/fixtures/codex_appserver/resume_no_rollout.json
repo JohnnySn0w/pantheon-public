@@ -1,0 +1,6 @@
+{
+  "provenance": "RECORDED 2026-11-03 (T-6130) from a real codex app-server 0.147.0 (stdio), throwaway CODEX_HOME, no credentials: server A initialize + thread/start (the thread never ran a turn), killed; server B initialize + thread/resume of that thread id. The frame is verbatim from B's stdout; only the thread id differs per run.",
+  "request": {"id": 2, "method": "thread/resume", "params": {"threadId": "01a1a3c1-f3b7-7930-a798-6fffd5c5860d"}},
+  "frame": {"error": {"code": -32600, "message": "no rollout found for thread id 01a1a3c1-f3b7-7930-a798-6fffd5c5860d"}, "id": 2},
+  "recorded_thread_id": "01a1a3c1-f3b7-7930-a798-6fffd5c5860d"
+}

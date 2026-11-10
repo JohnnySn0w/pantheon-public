@@ -52,6 +52,7 @@ each alert line prints its ratio + raw counts so real alerts self-calibrate.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -81,6 +82,8 @@ HEADING_LOSS_RATIO = 0.4    # heading-survival fraction below this -> section-lo
 MIN_OLD_HEADINGS = 2        # skip section-loss check below this OLD heading count
 
 OPEN_TICKET_LIST_CAP = 20   # open-ticket-loss: list at most this many ids, then "+N more"
+SIZE_ALERT_THRESHOLD = 36_000
+SIZE_PRUNE_LINE = 45_000
 
 # ----------------------------------------------------------- entity extractors
 _TICKET_RE = re.compile(r"\bT-\d+\b")
@@ -268,6 +271,38 @@ def check_conservation(old_text: str, new_text: str,
     return alerts
 
 
+def _section_sizes(text: str) -> list[tuple[str, int]]:
+    matches = list(_HEADING_RE.finditer(text))
+    out = []
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        out.append((" ".join(m.group(2).split()), end - m.start()))
+    return sorted(out, key=lambda x: (-x[1], x[0]))[:3]
+
+
+def check_size_alert(text: str, state_file: Path | str | None = None,
+                     threshold: int = SIZE_ALERT_THRESHOLD,
+                     prune_line: int = SIZE_PRUNE_LINE) -> str | None:
+    """Return one advisory alert on upward threshold crossing, never raise."""
+    try:
+        size = len(text.encode("utf-8"))
+        path = Path(state_file) if state_file else None
+        prior = False
+        if path and path.exists():
+            prior = json.loads(path.read_text(encoding="utf-8")).get("above", False)
+        now = size >= threshold
+        if path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"above": now}), encoding="utf-8")
+        if not now or prior:
+            return None
+        sections = ", ".join(f"{name}={n}B" for name, n in _section_sizes(text)) or "none"
+        return (f"size-warning: HANDOFF is {size}B (threshold {threshold}B; "
+                f"prune line {prune_line}B); largest sections: {sections}")
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------- CLI
 def _log(msg: str) -> None:
     print(f"[handoff-conservation] {msg}", file=sys.stderr)
@@ -282,6 +317,10 @@ def _cli_check(args: argparse.Namespace) -> int:
     except (FileNotFoundError, OSError) as exc:
         _log(f"cannot read handoff {args.handoff_file} (non-fatal): {exc}")
         return 0
+
+    size_alert = check_size_alert(new_text, args.size_state)
+    if size_alert:
+        _log(f"ADVISORY: {size_alert}")
 
     agent = args.agent or chronicle.agent_from_handoff_path(args.handoff_file)
     if not agent:
@@ -324,7 +363,9 @@ def _build_parser() -> argparse.ArgumentParser:
     c.add_argument("--root", default=None, help="chronicle root (default: <state-dir>/chronicle)")
     c.add_argument("--tickets-root", default=None,
                    help="tickets dir for the open-ticket-loss check "
-                        "(default: <repo-root>/tickets, from this file's location)")
+                   "(default: <repo-root>/tickets, from this file's location)")
+    c.add_argument("--size-state", default=None,
+                   help="state file for once-per-threshold-crossing size warning")
     c.set_defaults(func=_cli_check)
     return p
 

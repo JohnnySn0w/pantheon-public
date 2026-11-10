@@ -20,6 +20,7 @@ class RolloutCliTest(unittest.TestCase):
         self.home = Path(self._tmp.name) / "seat"
         (self.home / "pantheon-config" / "tools" / "hooks").mkdir(parents=True)
         (self.home / "pantheon-config" / "tools" / "hooks" / "worker-guard.py").write_text("# guard\n")
+        (self.home / "pantheon-config" / "tools" / "hooks" / "worker-guard-v2.py").write_text("# v2\n")
         self.codex_home = self.home / ".codex"
         self.codex_home.mkdir()
         self.config = self.codex_home / "config.toml"
@@ -58,6 +59,35 @@ class RolloutCliTest(unittest.TestCase):
                                         wraps=rollout.ensure_worker_guard_hook) as ensure:
             self._run("apply")
         self.assertIs(ensure.call_args.kwargs["trust_marker"], False)
+
+    def _v1_home(self):
+        v1 = f"/usr/bin/python3 -I {self.home}/pantheon-config/tools/hooks/worker-guard.py"
+        h = FakeCodexHooks.definition_hash(v1, 30, "Bash|apply_patch")
+        self.config.write_text(
+            f'[[hooks.PreToolUse]]\nmatcher = "Bash|apply_patch"\n\n[[hooks.PreToolUse.hooks]]\n'
+            f'type = "command"\ncommand = "{v1}"\ntimeout = 30\n\n'
+            f'[hooks.state."{self.config}:pre_tool_use:0:0"]\ntrusted_hash = "{h}"\n')
+        return v1
+
+    def test_apply_keeps_a_rollback_seat_on_v1(self) -> None:
+        v1 = self._v1_home()
+        before = self.config.read_bytes()
+        rc, report = self._run("apply")
+        self.assertEqual((rc, report["changed"], report["status"]["generation"]),
+                         (rollout.EXIT_OK, False, "rollback-v1"))
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertIn(v1, self.config.read_text())
+
+    def test_apply_upgrade_rollback_moves_v1_to_v2(self) -> None:
+        self._v1_home()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = rollout.main(["apply", "--upgrade-rollback", "--account-home", str(self.home)],
+                              read_hooks=self.codex)
+        report = json.loads(out.getvalue())
+        self.assertEqual((rc, report["changed"], report["status"]["generation"], report["status"]["ok"]),
+                         (rollout.EXIT_OK, True, "v2", True))
+        self.assertIn("worker-guard-v2.py", self.config.read_text())
 
     def test_unmeasurable_when_the_app_server_read_fails(self) -> None:
         self._run("apply")

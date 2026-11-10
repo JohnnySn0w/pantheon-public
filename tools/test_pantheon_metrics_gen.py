@@ -171,5 +171,155 @@ class ProbeFailureIsUnknownNotNegative(unittest.TestCase):
         states, _ = self._collect(emit=True, svc_active="active", jsonl_fresh=True)
         self.assertEqual(states, {"orchestrator": "active", "echo": "idle"})
 
+
+class ExpectedDownExcludedFromTotal(unittest.TestCase):
+    """T-5655: an ORG-106 expected-down (deep-sleep, asleep) seat that the probe confirms
+    down is omitted from agents_total; everything else counts exactly as before."""
+
+    NOW = "2026-11-04T12:00:00Z"
+
+    T0 = 1_800_000_000  # fixed "now" for the staleness maths
+
+    def _write(self, d, persona="orchestrator", **doc):
+        import json
+        (Path(d) / f"{persona}.json").write_text(json.dumps(doc))
+
+    def _ed(self, doc_or_none, now_offset=0, persona="orchestrator", raw=None):
+        """_expected_down against a temp health dir holding at most one record."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            if raw is not None:
+                (Path(d) / f"{persona}.json").write_text(raw)
+            elif doc_or_none is not None:
+                self._write(d, persona, **doc_or_none)
+            return pmg._expected_down(persona, health_dir=d, now=self.T0 + now_offset)
+
+
+    # --- the pure count ---
+    def test_asleep_down_seat_leaves_total_and_up_unchanged(self) -> None:
+        entries = [("active", False)] * 6 + [("down", True)]
+        self.assertEqual(pmg.count_cluster(entries), (6, 6))
+
+    def test_non_sleep_down_seat_still_lowers_up(self) -> None:
+        entries = [("active", False)] * 6 + [("down", False)]
+        self.assertEqual(pmg.count_cluster(entries), (6, 7))
+
+    def test_mixed_only_the_asleep_seat_is_excluded(self) -> None:
+        entries = [("active", False)] * 5 + [("down", True), ("down", False)]
+        self.assertEqual(pmg.count_cluster(entries), (5, 6))
+
+    def test_live_expected_down_seat_is_counted_up(self) -> None:
+        self.assertEqual(pmg.count_cluster([("idle", True), ("active", False)]), (2, 2))
+
+    def test_unknown_stays_in_total_even_if_asleep(self) -> None:
+        self.assertEqual(pmg.count_cluster([("unknown", True), ("active", False)]), (1, 2))
+
+    def test_invariants_and_edges(self) -> None:
+        self.assertEqual(pmg.count_cluster([("down", True)] * 3), (0, 0))  # all asleep
+        self.assertEqual(pmg.count_cluster([]), (0, 0))
+        up, total = pmg.count_cluster([("down", True), ("down", False), ("idle", True), ("unknown", False)])
+        self.assertTrue(0 <= up <= total)
+
+    # --- the read: health_export record, fresh-only, fail-open ---
+    def test_fresh_expected_down_true(self) -> None:
+        self.assertTrue(self._ed({"exported_at": self.T0 - 30, "expected_down": True}))
+
+    def test_fresh_expected_down_false(self) -> None:
+        self.assertFalse(self._ed({"exported_at": self.T0 - 30, "expected_down": False}))
+
+    def test_staleness_boundary(self) -> None:
+        self.assertEqual(pmg.HEALTH_RECORD_MAX_AGE_SEC, 180)
+        rec = {"exported_at": self.T0 - 180, "expected_down": True}
+        self.assertTrue(self._ed(rec))                       # exactly 180s old: still usable
+        self.assertFalse(self._ed(rec, now_offset=1))        # 181s old: stale, ignored
+
+    def test_future_dated_record_is_ignored(self) -> None:
+        self.assertFalse(self._ed({"exported_at": self.T0 + 60, "expected_down": True}))
+
+    def test_missing_file_fails_open(self) -> None:
+        self.assertFalse(self._ed(None))
+        self.assertFalse(pmg._expected_down("orchestrator", health_dir="/nonexistent-dir-xyz", now=self.T0))
+        with patch.object(pmg, "HEALTH_DIR", None):
+            self.assertFalse(pmg._expected_down("orchestrator", now=self.T0))
+
+    def test_malformed_json_fails_open(self) -> None:
+        self.assertFalse(self._ed(None, raw="{not json"))
+        self.assertFalse(self._ed(None, raw="[]"))
+        self.assertFalse(self._ed(None, raw=""))
+
+    def test_non_bool_expected_down_fails_open(self) -> None:
+        for bad in ("true", 1, "yes", None, [True]):
+            self.assertFalse(self._ed({"exported_at": self.T0, "expected_down": bad}), bad)
+
+    def test_missing_or_bad_exported_at_fails_open(self) -> None:
+        self.assertFalse(self._ed({"expected_down": True}))
+        self.assertFalse(self._ed({"exported_at": "2026", "expected_down": True}))
+        self.assertFalse(self._ed({"exported_at": True, "expected_down": True}))
+        self.assertFalse(self._ed({"exported_at": None, "expected_down": True}))
+
+    def test_dir_comes_from_health_export_constant(self) -> None:
+        import tools.health_export as he
+        self.assertEqual(pmg.HEALTH_DIR, he.DEFAULT_OUT_DIR)
+
+    def test_gen_has_no_sudo_read_path_for_asleep(self) -> None:
+        import inspect
+        self.assertNotIn("sudo", inspect.getsource(pmg._expected_down))
+
+
+    # --- collect() end to end ---
+    def _collect(self, states, asleep_labels, probe_unknown=False):
+        roster = [{"label": l, "acct": "a-" + l, "kind": "agent"} for l in states]
+        roster.append({"label": "echo", "acct": "claude", "kind": "service", "service": "echo.service"})
+        asked = []
+
+        def exp(lbl, runner=None):
+            asked.append(lbl)
+            return lbl in asleep_labels
+        uids = {"a-" + l: i + 100 for i, l in enumerate(states)}
+        by_uid = {v: k[2:] for k, v in uids.items()}
+        with patch.object(pmg, "_uid", side_effect=lambda acct: uids[acct]), \
+             patch.object(pmg, "_account_pids", return_value=[]), \
+             patch.object(pmg, "_has_agent_proc", side_effect=lambda uid: states[by_uid[uid]] != "down"), \
+             patch.object(pmg, "_jsonl_fresh", return_value=None if probe_unknown else True), \
+             patch.object(pmg, "_svc_show", side_effect=lambda a, s, p: "active" if p == "ActiveState" else "0"), \
+             patch.object(pmg, "_mem_pct_account", return_value=0.0), \
+             patch.object(pmg, "_host_up", return_value=True), \
+             patch.object(pmg, "_expected_down", side_effect=exp), \
+             patch.object(pmg.time, "sleep"):
+            doc = pmg.collect(roster, sample_sec=0.01)
+        return doc, asked
+
+    def test_collect_asleep_seat_excluded_state_stays_down_and_leak_scan_ok(self) -> None:
+        doc, asked = self._collect({"orchestrator": "up", "specialist": "up", "archivist": "down"}, {"archivist"})
+        self.assertEqual(doc["cluster"]["agents_total"], 3)   # orchestrator, specialist, echo
+        self.assertEqual(doc["cluster"]["agents_up"], 3)
+        self.assertEqual({a["label"]: a["state"] for a in doc["agents"]}["archivist"], "down")
+        self.assertEqual(asked, ["archivist"])  # only the confirmed-down seat is queried
+        self.assertTrue(pmg.leak_scan(doc))
+
+    def test_collect_plain_down_seat_still_lowers_up(self) -> None:
+        doc, _ = self._collect({"orchestrator": "up", "archivist": "down"}, set())
+        self.assertEqual((doc["cluster"]["agents_up"], doc["cluster"]["agents_total"]), (2, 3))
+        self.assertTrue(pmg.leak_scan(doc))
+
+    def test_collect_failed_probe_never_excluded_as_asleep(self) -> None:
+        # EMIT_UNKNOWN off: unknown is remapped to legacy "down" -- it must STILL count in total.
+        with patch.object(pmg, "EMIT_UNKNOWN", False):
+            doc, asked = self._collect({"orchestrator": "up"}, {"orchestrator"}, probe_unknown=True)
+        self.assertEqual(doc["cluster"]["agents_total"], 2)
+        self.assertEqual(asked, [])
+        self.assertTrue(pmg.leak_scan(doc))
+
+    def test_leak_scan_still_rejects_up_over_total(self) -> None:
+        doc, _ = self._collect({"orchestrator": "up"}, set())
+        doc["cluster"]["agents_up"] = doc["cluster"]["agents_total"] + 1
+        with self.assertRaises(AssertionError):
+            pmg.leak_scan(doc)
+
+    def test_echo_service_never_asked(self) -> None:
+        _, asked = self._collect({"orchestrator": "up"}, set())
+        self.assertNotIn("echo", asked)
+
+
 if __name__ == "__main__":
     unittest.main()

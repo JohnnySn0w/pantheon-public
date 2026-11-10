@@ -69,7 +69,9 @@ _METER_QUOTA_PAIRS = {
     ("hermes", "api", "provider-api"),
 }
 _NATIVE_KEYS = {
-    "claude": {"permission_mode", "channels", "effort"},
+    # claude.CLAUDE_NATIVE_KEYS (an equality test pins the copy, T-4531;
+    # base_url is the T-6005-guarded backend override).
+    "claude": {"permission_mode", "channels", "effort", "base_url"},
     "codex": {"sandbox", "config_overrides", "permission_posture", "execution_boundary"},
     # T-5011 PR-B: hermes.HERMES_NATIVE_KEYS (an equality test pins the copy;
     # importing hermes here would pull its render/yaml chain into diagnostics).

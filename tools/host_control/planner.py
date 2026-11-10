@@ -60,9 +60,66 @@ _HEX_256 = re.compile(r"[0-9a-f]{64}\Z")
 
 # T-2917 5b planner partition (HO ruling T-4861, coordinator ruling B8).
 SEAT_LOCAL_RESIDUE_LIMIT: Final = 32
+# T-5961 (orchestrator ruling on B8, 2026-11-02): the enumerated, allowlisted seat periodic timer ops
+# (seat-owned user units named pantheon-fleet-usage-*) are counted in their OWN bucket, capped
+# at 16 ops = 4 timer pairs x 4 ops per pair (service unit-install, timer unit-install, enable,
+# observe; was 12 = 3 pairs before T-6125), so the general residue cap above stays 32. A Claude
+# seat uses 4 (prune), a codex seat 8 (prune + codex-export), recovery 12 (T-6125: + consultant's
+# checkpoint and rotate pairs). Anything else of these kinds counts as general residue.
+# T-6125 (orchestrator ruling 2026-11-04): +4 headroom for watchman's codex seat timers; a seat past 16 needs a fresh ruling, not an automatic bump.
+SEAT_PERIODIC_TIMER_LIMIT: Final = 16
+SEAT_PERIODIC_TIMER_KINDS: Final = frozenset(
+    {"seat-periodic-unit-install", "seat-periodic-timer-enable", "seat-periodic-timer-observe"}
+)
+_SEAT_PERIODIC_TIMER_STEMS: Final = r"(?:pantheon-fleet-usage-prune|pantheon-tmp-session-prune|pantheon-chronicle-prune|pantheon-fleet-usage-codex-export|pantheon-codex-handoff-checkpoint|pantheon-codex-thread-rotate)"
+# unit-install targets the TEMPLATE file (empty instance); enable/observe target an instance TIMER.
+# T-6121: pantheon-echo-target-prune is host-global and NOT instanced; its exact unit names are
+# allowlisted as a second form (no `@`), so the same bucket cap applies and nothing is raised.
+_SEAT_PERIODIC_SINGLETON_STEMS: Final = r"pantheon-echo-target-prune"
+SEAT_PERIODIC_TEMPLATE_RE: Final = re.compile(
+    r"(?:" + _SEAT_PERIODIC_TIMER_STEMS + r"@\.(?:service|timer)|" + _SEAT_PERIODIC_SINGLETON_STEMS + r"\.(?:service|timer))\Z")
+SEAT_PERIODIC_TIMER_INSTANCE_RE: Final = re.compile(
+    r"(?:" + _SEAT_PERIODIC_TIMER_STEMS + r"@[a-z0-9][a-z0-9_-]{0,63}\.timer|" + _SEAT_PERIODIC_SINGLETON_STEMS + r"\.timer)\Z")
+# a seat's user unit dir is (<root>)/home/<account>/.config/systemd/user (persona_installer)
+SEAT_PERIODIC_USER_UNIT_DIR_TAIL: Final = (".config", "systemd", "user")
 SEAT_LOCAL_STATUS: Final = "pending-seat-local"
 SEAT_LOCAL_ACTION_PREFIX: Final = "seat-local."
 SEAT_LOCAL_CAPABILITY_PREFIX: Final = "seat-local:"
+
+
+def is_seat_periodic_timer_op(kind: str, target: str) -> bool:
+    """T-5961: True for an op in the seat-periodic-timer bucket, i.e. exactly the shapes the
+    installer emits: a seat-periodic-unit-install of an allowlisted TEMPLATE unit file at an
+    absolute, normalized .../home/<account>/.config/systemd/user/ path, or a seat-periodic-timer-enable /
+    -observe of a bare allowlisted instance .timer name. Anything else of these kinds is
+    general residue (T-5962/T-5961 review LOW-2: a suffix match let look-alike paths in)."""
+    if kind not in SEAT_PERIODIC_TIMER_KINDS or not isinstance(target, str) or "\n" in target:
+        return False
+    if kind == "seat-periodic-unit-install":
+        parts = target.split("/")
+        if (not target.startswith("/") or any(p in ("", ".", "..") for p in parts[1:])
+                or len(parts) < 7 or parts[-6] != "home"
+                or tuple(parts[-4:-1]) != SEAT_PERIODIC_USER_UNIT_DIR_TAIL):
+            return False
+        return SEAT_PERIODIC_TEMPLATE_RE.match(parts[-1]) is not None
+    return "/" not in target and SEAT_PERIODIC_TIMER_INSTANCE_RE.match(target) is not None
+
+
+def residue_bucket_counts(kind_targets: Iterable[tuple[str, str]]) -> tuple[int, int]:
+    """(general, periodic-timer) counts of out-of-envelope residue (kind, target) pairs."""
+    periodic = general = 0
+    for kind, target in kind_targets:
+        if is_seat_periodic_timer_op(kind, target):
+            periodic += 1
+        else:
+            general += 1
+    return general, periodic
+
+
+def require_residue_bounds(kind_targets: Iterable[tuple[str, str]], error: Callable[[], Exception]) -> None:
+    general, periodic = residue_bucket_counts(kind_targets)
+    if general > SEAT_LOCAL_RESIDUE_LIMIT or periodic > SEAT_PERIODIC_TIMER_LIMIT:
+        raise error()
 
 
 def launch_routed_operation_ids(plan: InstallPlan) -> frozenset[str]:
@@ -116,8 +173,10 @@ def partition_installer_plan(
     # own bound; B8 cap unchanged. SEAT_LOCAL_RESIDUE_LIMIT bounds only the
     # out-of-envelope residue; the routed ops (fixed, enumerated, in-envelope
     # kinds) are bounded at one op per LAUNCH_KINDS | LAUNCH_DEPENDENT_KINDS kind.
-    if len([op for op in residue if op.operation_id not in routed]) > SEAT_LOCAL_RESIDUE_LIMIT:
-        raise PolicyDenied("family_denied")
+    require_residue_bounds(
+        ((op.kind, op.target) for op in residue if op.operation_id not in routed),
+        lambda: PolicyDenied("family_denied"),
+    )
     require_routed_launch_bound(op.kind for op in residue if op.operation_id in routed)
     residue_by_id = {op.operation_id: op for op in residue}
     residue_kinds = {op.kind for op in residue}
@@ -214,6 +273,7 @@ def seat_local_residue(plan: InstallPlan) -> list[dict[str, str]]:
     """The bounded residue list as the approver-facing summary shows it."""
 
     entries = []
+    targets = []
     for action in plan.operator_actions:
         if not action.action_id.startswith(SEAT_LOCAL_ACTION_PREFIX):
             continue
@@ -224,12 +284,15 @@ def seat_local_residue(plan: InstallPlan) -> list[dict[str, str]]:
                 "status": SEAT_LOCAL_STATUS,
             }
         )
+        targets.append(action.target)
     # T-5470 partition routing (HO ruling 2026-10-26): routed launches have their
     # own bound; B8 cap unchanged. A residue entry of an in-envelope kind can only
     # be a routed launch (or dependent); the rest is the out-of-envelope residue.
     routed = [entry for entry in entries if entry["kind"] in EXECUTOR_KIND_CLASSES]
-    if len(entries) - len(routed) > SEAT_LOCAL_RESIDUE_LIMIT:
-        raise HostControlError("seat-local residue exceeds its bound")
+    require_residue_bounds(
+        ((e["kind"], t) for e, t in zip(entries, targets) if e["kind"] not in EXECUTOR_KIND_CLASSES),
+        lambda: HostControlError("seat-local residue exceeds its bound"),
+    )
     require_routed_launch_bound(entry["kind"] for entry in routed)
     return entries
 

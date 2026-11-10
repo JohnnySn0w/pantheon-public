@@ -36,6 +36,9 @@ class PersonaCutoverImportRootCase(unittest.TestCase):
                 cutover_companion_rejoined() { return 0; }
                 cutover_urgent_env_confirmed() { return 0; }
                 cutover_telegram_poller_present() { return 0; }
+                companion_snapshot_path() { printf '%s\\n' /dev/null; }
+                companion_snapshot_write() { return 0; }
+                companion_should_restore() { return 0; }
                 """
             ),
             encoding="utf-8",

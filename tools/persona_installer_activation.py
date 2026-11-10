@@ -575,13 +575,107 @@ def _bootstrap_residue_entries(persona_state_root: Path, persona: str) -> list[t
 
 _RESIDUE_SAFE_ACTIVE_STATES = frozenset({"inactive", "failed"})
 
+# T-5612: the seat's tmux session is a third liveness signal. A FAILED controller unit does not
+# prove the claude pane is gone, so the pane is read directly and enters the SAME gate as a
+# pseudo-entry in the states mapping: key ``tmux-session:<name>``, value "live" | "absent" | None.
+TMUX_SESSION_KEY_PREFIX = "tmux-session:"
+PANE_LIVE = "live"
+PANE_ABSENT = "absent"
+_TMUX_SESSION_NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.@-]{0,63}$")
+_PANE_ABSENT_STDERR = ("no server running", "can't find session")
+PANE_PROBE_TIMEOUT_SECONDS = 10.0
+
+
+def seat_tmux_socket(uid: int) -> str:
+    """The seat's tmux server socket, derived from the SEAT's uid (never the caller's default):
+    tmux puts it at ``/tmp/tmux-<uid>/default``. Nothing in the codebase sets TMUX_TMPDIR for a
+    seat, so the stock location is the one the seat's controller uses."""
+    return f"/tmp/tmux-{int(uid)}/default"
+
+
+def pane_probe_argv(session: str, socket: str) -> list[str]:
+    """The ONE read-only pane probe: ``has-session`` against an explicit socket (-S), exact
+    session match (``=``). has-session never creates a server or a session."""
+    return ["tmux", "-S", socket, "has-session", "-t", f"={session}"]
+
+
+def pane_state_from_probe(returncode: int, stderr: str) -> str | None:
+    """live (rc 0) | absent (tmux says no server / no such session) | None (anything else:
+    permission denied, a foreign or stale socket, an unknown error -> the gate refuses)."""
+    if returncode == 0:
+        return PANE_LIVE
+    text = (stderr or "").lower()
+    if returncode == 1 and any(marker in text for marker in _PANE_ABSENT_STDERR):
+        return PANE_ABSENT
+    return None
+
+
+def read_seat_pane_state(
+    session: str | None,
+    uid: int | None,
+    *,
+    run: Callable[[list[str]], Any],
+    stat: Callable[[str], os.stat_result] = os.stat,
+) -> str | None:
+    """THE shared, read-only pane read (installer and per-seat executor). ``run(argv)`` returns an
+    object with ``returncode``/``stderr`` and may raise OSError/TimeoutExpired. Fail closed (None):
+    no/invalid session name, undeterminable seat uid, a socket path that is unreadable, not a
+    socket, or not owned by the seat uid, or a probe that errors. A missing socket is absent."""
+    if not isinstance(session, str) or not _TMUX_SESSION_NAME.match(session):
+        return None
+    if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0:
+        return None
+    socket = seat_tmux_socket(uid)
+    try:
+        info = stat(socket)
+    except (FileNotFoundError, NotADirectoryError):
+        return PANE_ABSENT
+    except OSError:
+        return None
+    if (info.st_mode & 0o170000) != 0o140000 or info.st_uid != uid:
+        return None
+    try:
+        result = run(pane_probe_argv(session, socket))
+    except Exception:  # noqa: BLE001 - OSError, TimeoutExpired, a missing tmux binary: all unreadable
+        return None
+    return pane_state_from_probe(getattr(result, "returncode", 1), getattr(result, "stderr", "") or "")
+
+
+def pane_liveness_states(
+    session: str | None,
+    uid: int | None,
+    *,
+    run: Callable[[list[str]], Any],
+    stat: Callable[[str], os.stat_result] = os.stat,
+) -> dict[str, str | None]:
+    """The pseudo-entry to merge into the liveness mapping. A missing session name still yields an
+    entry (None) so a plan that never named the pane refuses rather than silently skipping."""
+    key = f"{TMUX_SESSION_KEY_PREFIX}{session if isinstance(session, str) and session else '<unnamed>'}"
+    return {key: read_seat_pane_state(session, uid, run=run, stat=stat)}
+
 
 def _runtime_liveness_refusal(states: Mapping[str, str | None]) -> str | None:
     """THE shared liveness gate for the residue quarantine (both backends; reviewer B1). ``states``
     maps unit -> ActiveState (None == unreadable). Anything but inactive/failed -- active,
     activating, reloading, deactivating, an unreadable or unknown state -- means the old runtime
-    may still own runtime.json, so the quarantine fails closed."""
+    may still own runtime.json, so the quarantine fails closed. T-5612: a ``tmux-session:<name>``
+    pseudo-entry is "live" (refuse), "absent" (no objection) or None (unreadable, refuse)."""
     for unit, state in states.items():
+        if unit.startswith(TMUX_SESSION_KEY_PREFIX):
+            session = unit[len(TMUX_SESSION_KEY_PREFIX):]
+            if state is None:
+                return (
+                    f"tmux session {session} pane state is unreadable: refusing to move runtime "
+                    "state under a possibly live seat"
+                )
+            if state == PANE_LIVE:
+                return (
+                    f"tmux session {session} still has a live pane: the old runtime may still own "
+                    "its runtime state, stop it first; refusing to move its runtime state"
+                )
+            if state != PANE_ABSENT:
+                return f"tmux session {session} pane state is unknown ({state}): refusing"
+            continue
         if state is None:
             return f"{unit} state is unreadable: refusing to move runtime state under a possibly live seat"
         if state not in _RESIDUE_SAFE_ACTIVE_STATES:

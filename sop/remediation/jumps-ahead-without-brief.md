@@ -49,7 +49,7 @@ Ranked by precedent + cost.
 
 **Path C — Whole-team redispatch with persona-brief amendment carry-forward.** *Use when worker-only redispatch also fires jumps-ahead OR when the pattern recurs across two cycles within a week (signals persona-conditioning regression, not single-worker variance).*
 
-- HO does: SendMessage-shutdown the current workers, then Agent-spawn a fresh cycle with new orchestrator + new implementer + new reviewer; persona briefs (`~/.claude/agents/<persona>.md`) audited for stay-idle rule presence — if absent or weakened, file a persona-amendment ticket (separate ticket, HO-direct or Recovery-target per `claude-config` submodule conventions); new team's dispatch brief carries the readback-gate from Path B.
+- HO does: SendMessage-shutdown the current workers, then Agent-spawn a fresh cycle with new orchestrator + new implementer + new reviewer; persona briefs (`~/.claude/agents/<persona>.md`) audited for stay-idle rule presence — if absent or weakened, file a persona-amendment ticket against the canonical `harness/claude/agents/` source; new team's dispatch brief carries the readback-gate from Path B.
 - Why: persona-conditioning regression isn't fixable at brief-tier; it needs persona-tier amendment. Path C separates the live-cycle remediation (fresh team) from the persona-tier discipline (separate amendment ticket).
 - Expected outcome: live cycle proceeds with corrected discipline; persona-amendment ticket addresses the systemic source.
 - When to escalate: if Path C also surfaces jumps-ahead, bubble up — pattern signals harness-tier issue (the spawn-then-brief pre-stage pattern may need a structural change, e.g., explicit "ready" signal from the dispatcher before workers receive any context). Candidate research-dispatch.
@@ -64,7 +64,7 @@ Ranked by precedent + cost.
 
 This SOP is the *post-jump-ahead* remediation. The *pre-jump-ahead* discipline lives at three layers:
 
-1. **Persona-brief stay-idle rule** — every implementer/reviewer persona brief at `~/.claude/agents/<persona>.md` carries the stay-idle rule verbatim ("you do not emit artifacts before receiving a dispatch brief from your orchestrator"). Tracked by `claude-config` submodule. Per b33-incident-followup; T-0170 was the first cycle with the amendment fully applied. Codified now as standard discipline.
+1. **Persona-brief stay-idle rule** — every implementer/reviewer persona brief at `~/.claude/agents/<persona>.md` carries the stay-idle rule verbatim ("you do not emit artifacts before receiving a dispatch brief from your orchestrator"). Canonical source: `harness/claude/agents/` in pantheon-config. Per b33-incident-followup; T-0170 was the first cycle with the amendment fully applied. Codified now as standard discipline.
 2. **Pre-stage timing discipline** — orchestrator pattern: dispatch brief *immediately* after pre-stage spawn, never with a gap. The "stay-idle window" should be measured in seconds, not minutes — minimize the variance surface. Per `sop/standard/team-orchestrator-dispatch-checklist.md`.
 3. **Harness-tier ready-signal** — speculative: the Agent tool could withhold a pre-staged worker's first turn until an explicit "ready" signal from the dispatcher. No mechanism today; candidate Anthropic feedback / harness-research per `lessons/structural-enforcement-retires-the-prose-rule.md`. If such a primitive lands, layers 1 + 2 retire. *(ORG-036's spawn-with-brief-inline default already structurally avoids the window for the common case.)*
 

@@ -239,5 +239,149 @@ class NestedGitStrip(unittest.TestCase):
         self.assertNotIn("160000 ", staged, "a gitlink was recorded instead of content")
 
 
+MIRROR_BEGIN = "# --- T-5993 mirror leg: begin ---"
+MIRROR_END = "# --- T-5993 mirror leg: end ---"
+
+_STUB_OK = (
+    "import os, pathlib\n"
+    "def mirror_push_after_origin(cwd, refspec):\n"
+    "    pathlib.Path(os.environ['STUB_LOG']).write_text(f'{cwd}|{refspec}')\n"
+    "    return 'mirror pushed'\n"
+)
+
+
+def _mirror_block() -> str:
+    lines = _script_lines()
+    b = [i for i, ln in enumerate(lines) if ln.strip() == MIRROR_BEGIN]
+    e = [i for i, ln in enumerate(lines) if ln.strip() == MIRROR_END]
+    assert len(b) == 1 and len(e) == 1 and b[0] < e[0], (
+        f"expected one mirror-leg fence in {SCRIPT.name}, found begin={b} end={e}"
+    )
+    return "\n".join(lines[b[0] + 1 : e[0]])
+
+
+class MirrorLeg(unittest.TestCase):
+    """T-5993: the ORG-101 dual-write leg for root's backup push. Root must never import
+    code from a claude-writable checkout, so the leg imports _git_utils only from a lib
+    dir that the running uid owns and nobody else can write. The fenced block (the
+    mirror_leg function plus the push branch) runs against a temp checkout with a bare
+    origin and a STUB _git_utils; nothing real is pushed and no lib is installed."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.origin = root / "origin.git"
+        _git("init", "-q", "--bare", "-b", "main", str(self.origin), cwd=root)
+        self.repo = root / "backup"
+        self.repo.mkdir()
+        _git("init", "-q", "-b", "main", cwd=self.repo)
+        _git("remote", "add", "origin", str(self.origin), cwd=self.repo)
+        (self.repo / "f").write_text("x\n")
+        _git("add", "f", cwd=self.repo)
+        _git("commit", "-qm", "c", cwd=self.repo)
+        self.lib = root / "lib"
+        (self.lib / "tools").mkdir(parents=True)
+        os.chmod(self.lib, 0o755)
+        os.chmod(self.lib / "tools", 0o755)
+        self._stub(_STUB_OK)
+        self.log = root / "stub.log"
+
+    def _stub(self, body):
+        f = self.lib / "tools" / "_git_utils.py"
+        f.write_text(body)
+        os.chmod(f, 0o644)
+
+    def _run(self, *, no_push="0", lib=None):
+        prog = (f"set -euo pipefail\nREPO_DIR={self.repo!s}\ncd \"$REPO_DIR\"\n"
+                f"export VPS_BACKUP_NO_PUSH={no_push}\n"
+                f"export VPS_BACKUP_MIRROR_TOOLS_DIR={lib or self.lib}\n"
+                f"export STUB_LOG={self.log}\n{_mirror_block()}\n")
+        return _run_bash(prog)
+
+    def test_good_push_calls_the_leg_with_main_main_and_exits_0(self):
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.log.read_text(), f"{self.repo}|main:main")
+        self.assertIn("vps_state_backup: mirror leg: mirror pushed", r.stdout)
+
+    def test_no_push_makes_no_call(self):
+        r = self._run(no_push="1")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertFalse(self.log.exists())
+
+    def test_broken_origin_exits_non_zero_and_never_calls_the_leg(self):
+        _git("remote", "set-url", "origin", "/nonexistent/origin.git", cwd=self.repo)
+        r = self._run()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(self.log.exists())
+
+    def test_a_raising_stub_still_exits_0(self):
+        self._stub("def mirror_push_after_origin(cwd, refspec):\n    raise RuntimeError('boom')\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("vps_state_backup: mirror leg: error", r.stdout)
+
+    def test_a_stub_that_exits_non_zero_still_exits_0(self):
+        self._stub("import sys\ndef mirror_push_after_origin(cwd, refspec):\n    sys.exit(3)\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("vps_state_backup: mirror leg: error", r.stdout)
+
+    def test_inert_mirror_says_inert(self):
+        self._stub("def mirror_push_after_origin(cwd, refspec):\n    return None\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("vps_state_backup: mirror leg: inert", r.stdout)
+
+    def test_missing_lib_dir_prints_skipped(self):
+        r = self._run(lib=Path(self._tmp.name) / "nope")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("vps_state_backup: mirror leg: skipped", r.stdout)
+
+    def test_group_writable_lib_file_is_refused(self):
+        os.chmod(self.lib / "tools" / "_git_utils.py", 0o664)
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("vps_state_backup: mirror leg: skipped (unsafe", r.stdout)
+        self.assertFalse(self.log.exists())
+
+    def test_world_writable_lib_dir_is_refused(self):
+        os.chmod(self.lib, 0o757)
+        r = self._run()
+        self.assertIn("skipped (unsafe", r.stdout)
+        self.assertFalse(self.log.exists())
+
+    def test_symlink_in_lib_is_refused(self):
+        os.symlink("/etc/hostname", self.lib / "tools" / "link")
+        r = self._run()
+        self.assertIn("skipped (unsafe", r.stdout)
+        self.assertFalse(self.log.exists())
+
+    def test_pythonpath_cannot_shadow_the_lib(self):
+        evil = Path(self._tmp.name) / "evil"
+        evil.mkdir()
+        (evil / "_git_utils.py").write_text(
+            "import os, pathlib\ndef mirror_push_after_origin(c, r):\n"
+            "    pathlib.Path(os.environ['STUB_LOG']).write_text('EVIL')\n    return 'evil'\n")
+        prog_env = dict(os.environ, PYTHONPATH=str(evil))
+        prog = (f"set -euo pipefail\nREPO_DIR={self.repo!s}\ncd \"$REPO_DIR\"\n"
+                f"export VPS_BACKUP_NO_PUSH=0 VPS_BACKUP_MIRROR_TOOLS_DIR={self.lib} STUB_LOG={self.log}\n"
+                f"{_mirror_block()}\n")
+        r = subprocess.run(["bash", "-c", prog], capture_output=True, text=True, timeout=30, env=prog_env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.log.read_text(), f"{self.repo}|main:main")
+
+
+class UnitEnvironment(unittest.TestCase):
+    """T-5993: the system unit has no User=, so HOME is unset unless pinned, git never
+    reads /root/.gitconfig, and the mirror leg's credential helper is invisible (the
+    first live run failed 'could not read Password')."""
+
+    def test_unit_pins_home_to_root(self):
+        unit = (SCRIPT.parent / "systemd" / "pantheon-vps-state-backup.service").read_text()
+        self.assertIn("\nEnvironment=HOME=/root\n", unit)
+
+
 if __name__ == "__main__":
     unittest.main()

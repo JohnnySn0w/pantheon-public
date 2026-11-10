@@ -25,6 +25,13 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools import lease_audit as la  # noqa: E402
+
+
+def test_scheduled_unit_explicitly_arms_live_mode():
+    unit = (Path(__file__).parent / "systemd/pantheon-lease-audit.service").read_text()
+    exec_start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+    assert "lease_audit.py --live --since=-15min" in exec_start
+    assert "--dry-run" not in exec_start
 from tools.codex_recovery import LEASE_EXPORT_DIR_MODE, LEASE_TTL_SECS, LeaseExportSink  # noqa: E402
 
 NOW = 1_800_000_000
@@ -67,19 +74,20 @@ class Fixture:
         self.records: list[dict] = []
         self._pid = 1000
 
-    def sudo(self, actor: str, user: str, command: str, ts: int, *, pid: int | None = None) -> None:
+    def sudo(self, actor: str, user: str, command: str, ts: int, *, pid: int | None = None,
+             pwd: str = "/home/x") -> None:
         self._pid += 1
-        self.records.append({"MESSAGE": msg(actor, user, command), "_PID": str(pid or self._pid),
+        self.records.append({"MESSAGE": msg(actor, user, command, pwd), "_PID": str(pid or self._pid),
                              "__REALTIME_TIMESTAMP": str(ts * 1_000_000)})
 
     def lease_events(self, *events: dict) -> None:
         self.events_path.write_text("".join(json.dumps(e) + "\n" for e in events))
 
-    def run(self, *, now: int = NOW, source=None) -> tuple[int, str]:
+    def run(self, *, now: int = NOW, source=None, **kwargs) -> tuple[int, str]:
         out = io.StringIO()
         rc = la.run(since="-15min", state_file=self.state, lease_events=self.events_path,
                     manifest=self.manifest, source=source or FakeJournal(self.records),
-                    fleet=FLEET, now=now, out=out)
+                    fleet=FLEET, now=now, out=out, **kwargs)
         return rc, out.getvalue()
 
 
@@ -542,7 +550,7 @@ class Routing(unittest.TestCase):
         rc, out = f.run()
         self.assertEqual(rc, 0)
         self.assertEqual(len(findings(out, "REPAIR_WITHOUT_LEASE")), 1)
-        self.assertEqual(json.loads(f.state.read_text())["schema_version"], 1)
+        self.assertEqual(json.loads(f.state.read_text())["schema_version"], 2)
 
 
 class JournalPort(unittest.TestCase):
@@ -601,18 +609,112 @@ class Inertness(unittest.TestCase):
         boom.assert_not_called()
         self.assertIn("would_act action=PAGE_OPERATOR", out)
 
-    def test_live_is_refused(self):
-        boom = mock.Mock(side_effect=AssertionError("live sender built"))
-        err = io.StringIO()
-        with mock.patch.object(la, "make_live_senders", boom), \
-                mock.patch.object(la, "run", boom), redirect_stderr(err):
-            self.assertEqual(la.main(["--live"]), 3)
-        self.assertIn("not enabled until T-4884 B13", err.getvalue())
+    def test_live_flag_reaches_run_without_eager_sender_construction(self):
+        run = mock.Mock(return_value=0)
+        boom = mock.Mock(side_effect=AssertionError("sender built before a due action"))
+        with mock.patch.object(la, "make_live_senders", boom), mock.patch.object(la, "run", run):
+            self.assertEqual(la.main(["--live"]), 0)
+        self.assertTrue(run.call_args.kwargs["live"])
         boom.assert_not_called()
 
-    def test_live_senders_are_stubs(self):
-        with self.assertRaises(NotImplementedError):
-            la.make_live_senders()
+
+class FakeSenders:
+    def __init__(self, results=()):
+        self.calls = []
+        self.results = list(results)
+
+    def send(self, action, payload):
+        self.calls.append((action, payload))
+        return self.results.pop(0) if self.results else True
+
+
+class LiveRouting(unittest.TestCase):
+    def test_live_sender_adapter_dispatches_to_the_real_channel_shapes(self):
+        page = mock.Mock()
+        mail = mock.Mock()
+        senders = la.LiveSenders(page, mail)
+        page_payload = la.PAGE_TAG + "\ntest"
+        mail_payload = {"recipient": "/mail/recovery"}
+        senders.send(la.Action.PAGE_OPERATOR, page_payload)
+        senders.send(la.Action.MAIL_RECOVERY, mail_payload)
+        senders.send(la.Action.MAIL_RECOVERY_SEAT, mail_payload)
+        page.send.assert_called_once_with(page_payload)
+        self.assertEqual(mail.send.call_args_list,
+                         [mock.call(mail_payload), mock.call(mail_payload)])
+
+    def test_live_routes_both_mail_targets_and_threshold_page(self):
+        f = Fixture(self)
+        f.lease_events()
+        # Three Recovery repairs make the third occurrence page; the recovery-seat
+        # repair takes the opposite mail route. Mail cooldown keeps each key to one.
+        for i in range(3):
+            f.sudo(RECOVERY, "suborch1", KILL, NOW - 30 + i, pid=800 + i)
+        f.sudo(SEAT, "claude-research", KILL, NOW - 10, pid=900)
+        senders = FakeSenders()
+        rc, out = f.run(live=True, senders=senders)
+        self.assertEqual(rc, 0)
+        actions = [a for a, _ in senders.calls]
+        self.assertEqual(actions.count(la.Action.MAIL_RECOVERY_SEAT), 1)
+        self.assertEqual(actions.count(la.Action.MAIL_RECOVERY), 1)
+        self.assertEqual(actions.count(la.Action.PAGE_OPERATOR), 1)
+        page = [p for a, p in senders.calls if a is la.Action.PAGE_OPERATOR][0]
+        self.assertTrue(page.startswith(la.PAGE_TAG + "\n"))
+        self.assertIn("count_24h: 3", page)
+        self.assertIn("summary mode=live", out)
+
+    def test_live_payload_excludes_untrusted_journal_text(self):
+        f = Fixture(self)
+        f.lease_events()
+        f.sudo(SEAT, "claude-research", KILL, NOW - 5, pwd=f"/tmp/{MARKER}")
+        senders = FakeSenders()
+        rc, _ = f.run(live=True, senders=senders)
+        self.assertEqual(rc, 0)
+        self.assertNotIn(MARKER, json.dumps(senders.calls, default=str))
+
+    def test_failed_delivery_retries_twice_then_holds_without_success_stamps(self):
+        f = Fixture(self)
+        f.lease_events()
+        f.sudo(SEAT, "claude-research", KILL, NOW - 5)
+        senders = FakeSenders([False, False, True])
+
+        rc1, out1 = f.run(live=True, senders=senders)
+        state1 = json.loads(f.state.read_text())
+        self.assertEqual(rc1, 4)
+        self.assertIn("send_failed", out1)
+        self.assertEqual(state1["reported"], {})
+        self.assertEqual(state1["mailed"], {})
+
+        rc2, out2 = f.run(now=NOW + 300, live=True, senders=senders)
+        state2 = json.loads(f.state.read_text())
+        self.assertEqual(rc2, 4)
+        self.assertIn("delivery_blocked", out2)
+        self.assertEqual(state2["reported"], {})
+        self.assertEqual(state2["mailed"], {})
+
+        rc3, out3 = f.run(now=NOW + 600, live=True, senders=senders)
+        self.assertEqual(rc3, 0)
+        self.assertIn("suppressed_delivery_blocked", out3)
+        self.assertEqual(len(senders.calls), 2)
+
+        # A bounded hold is not a permanent loss: after 24h the detector gets a
+        # fresh two-attempt window and can confirm delivery.
+        rc4, _ = f.run(now=NOW + la.DELIVERY_HOLD_S + 601, live=True, senders=senders)
+        state4 = json.loads(f.state.read_text())
+        self.assertEqual(rc4, 0)
+        self.assertEqual(len(senders.calls), 3)
+        self.assertTrue(state4["reported"])
+        self.assertTrue(state4["mailed"])
+
+    def test_factory_is_lazy_and_only_used_for_due_live_action(self):
+        f = Fixture(self)
+        f.lease_events()
+        built = mock.Mock(return_value=FakeSenders())
+        with mock.patch.object(la, "make_live_senders", built):
+            self.assertEqual(f.run(live=True)[0], 0)
+            built.assert_not_called()
+            f.sudo(SEAT, "claude-research", KILL, NOW - 5)
+            self.assertEqual(f.run(now=NOW + 1, live=True)[0], 0)
+            built.assert_called_once_with()
 
 
 if __name__ == "__main__":

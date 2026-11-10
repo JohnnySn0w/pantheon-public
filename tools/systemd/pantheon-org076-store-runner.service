@@ -24,9 +24,16 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # user journals, which needs the systemd-journal group. Recovery's user manager does not carry it and
 # user-mode systemd cannot set SupplementaryGroups, so sg is the only route (same pattern as
 # sg pantheon-mailbox). Without it the positive control reads 0 records and every enrolled seat stays
-# Unknown. Files the runner creates take systemd-journal as their group unless the dir is setgid;
-# the /var/lib/pantheon/org076 dirs are 2775, so heartbeat and samples still inherit pantheon-shared.
-ExecStart=/usr/bin/sg systemd-journal -c "/usr/bin/python3 %h/.local/state/pantheon/org076/pantheon-config/tools/org076_store_runner.py --run --heartbeat-path /var/lib/pantheon/org076/heartbeat/org076-episode-store.json"
+# Unknown. With the nested sg below, the runner's primary group is pantheon-mailbox (the innermost
+# sg), so files it creates take that group unless the dir is setgid; the /var/lib/pantheon/org076
+# dirs are 2775, so heartbeat and samples still inherit pantheon-shared.
+# sg pantheon-mailbox (T-5998): the runner's real page port (route_failure_alert("recovery")) deposits its
+# page in orchestrator's mailbox, and the hub is group pantheon-mailbox (mode 2770). A --user unit has only the
+# account's primary group, so without this second (nested) sg the orchestrator leg fails and every page falls
+# through to the operator's Telegram. BOTH groups are needed: systemd-journal for the freshness reads above,
+# pantheon-mailbox for the page. Same reasoning as pantheon-health-export.service /
+# pantheon-acp-bridge-backlog@.service (T-1015). The unit must be reinstalled + daemon-reloaded.
+ExecStart=/usr/bin/sg systemd-journal -c "/usr/bin/sg pantheon-mailbox -c \"/usr/bin/python3 %h/.local/state/pantheon/org076/pantheon-config/tools/org076_store_runner.py --run --heartbeat-path /var/lib/pantheon/org076/heartbeat/org076-episode-store.json\""
 StandardOutput=journal
 StandardError=journal
 TimeoutStartSec=10min

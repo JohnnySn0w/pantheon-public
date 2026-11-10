@@ -123,7 +123,7 @@ _MESSAGE_LIMIT = 200
 _JSON_LIMIT = 65536
 
 REVIEW_SUMMARY_SCHEMA = "pantheon-approval-review-summary/v1"
-APPROVAL_STATUS_SCHEMA = "pantheon-approval-status/v1"
+APPROVAL_STATUS_SCHEMA = "pantheon-approval-status/v2"
 
 
 def error_name_for(exc: BaseException) -> str:
@@ -279,7 +279,10 @@ def approval_status_json(status: ApprovalStatus) -> str:
 
     The input dataclass carries no nonce and no authority-record id BY
     CONSTRUCTION (gate 21): a status read can never substitute for
-    binding, so serializing all four fields is the whole story.
+    binding, so serializing all its fields is the whole story. v2 (T-4875)
+    adds the grant's ``plan_handle`` and ``plan_owner`` so the broker can
+    bind an ApprovalGet read to the caller's own plan; a v1 payload is
+    rejected by the broker client (fail closed).
     """
 
     payload = {
@@ -288,5 +291,7 @@ def approval_status_json(status: ApprovalStatus) -> str:
         "state": status.state,
         "expires_at": status.expires_at,
         "summary": status.summary,
+        "plan_handle": status.plan_handle,
+        "plan_owner": status.plan_owner,
     }
     return _bounded(canonical_json(payload), "approval status payload")

@@ -2,7 +2,7 @@
 aliases: [ORG-007]
 adr-id: ORG-007
 title: kino ↔ claude wire protocol — stream-json long-running process per agent
-status: Ratified
+status: "Ratified 2026-05-07 by the operator (Telegram msg_903); Retired since 2026-05-21 (subject removed by the ORG-006 agent-chat sunset, the operator Telegram msg_1834/1836, T-0508)"
 date: 2026-05-07
 author: orchestrator (Orchestrator)
 hitl: Ratified
@@ -15,12 +15,14 @@ related:
   - tickets/active/T-0113.md
   - rulebook/principles.md (P1, P5)
   - rulebook/directives.md (D1, D3)
+# build_disposition stays `built` (the lint's enum has no retired value): the per-agent stream-json process was
+# built, then its subject was removed by the ORG-006 agent-chat sunset 2026-05-21 (T-0508); ADR status: Retired. T-6066.
 build_disposition: built
 ---
 
 # ORG-007 — kino ↔ claude wire protocol
 
-**Status:** Ratified 2026-05-07 by the operator (Telegram, msg_903). HO-authored 2026-05-07 under autonomy-bar D3 + D2; the operator's ratification answers fold inline below in §Ratification answers (replacing prior §Open questions). T-0113 implementation arc unblocks against this ratified ADR.
+**Status:** Ratified 2026-05-07 by the operator (Telegram, msg_903); Retired since 2026-05-21 (subject removed by the ORG-006 agent-chat sunset, the operator Telegram msg_1834/1836, T-0508; see ORG-006 §Amendment 2026-05-21). HO-authored 2026-05-07 under autonomy-bar D3 + D2; the operator's ratification answers fold inline below in §Ratification answers (replacing prior §Open questions). T-0113 implementation arc unblocks against this ratified ADR.
 
 **Authoring context:** kino Phase 2 supervised first-fire (2026-05-07) surfaced a wire-protocol gap. ORG-006 §Per-agent identity model locked `claude binary in stdio-MCP mode` as the agent backend without specifying the wire protocol layer between kino-daemon and the running claude process. POST `/api/agents/:id/send` writes `{content, session_id}` JSON to the agent's IPC socket; `claude mcp serve` speaks MCP JSON-RPC 2.0 only, silently dropping non-JSON-RPC payloads. Researcher dispatch (`knowledge/episodic/2026-05-07-kino-claude-wire-protocol/notes.md`) enumerated 7 options against ORG-006's binding constraints. This ADR ratifies the synthesis call.
 
@@ -109,7 +111,7 @@ T-0113 plan should specify whether the typing indicator's start/stop is driven b
 
 ## Related
 
-- **`adr/ORG-006-kino-pwa.md`** — kino PWA design + Phase-1-implementation addendum. ORG-007 specifies the wire-protocol layer that ORG-006 §Per-agent-identity-model left underspec'd. ORG-006 stays Ratified; ORG-007 extends.
+- **`adr/ORG-006-kino-pwa.md`** — kino PWA design + Phase-1-implementation addendum. ORG-007 specifies the wire-protocol layer that ORG-006 §Per-agent-identity-model left underspec'd. ORG-006 stays Ratified; ORG-007 extends. (2026-05-21: ORG-006's multi-agent chat half went dormant and ORG-007's subject was removed with it; see ORG-006 §Amendment 2026-05-21, T-0508.)
 - **`knowledge/episodic/2026-05-07-kino-claude-wire-protocol/notes.md`** — full 7-option enumeration, sources, empirical confirmations.
 - **`tickets/active/T-0111.md`** — Phase 2 Cycle 5 (build integration + supervised first-fire); the wire-protocol gap surfaced at first-fire (msg_889).
 - **`tickets/active/T-0113.md`** — implementation arc (unblocked + active post-ratification 2026-05-07).

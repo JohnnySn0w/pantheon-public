@@ -2,8 +2,10 @@
 
 CI-only, zero privilege, nothing live. Why it cannot reach the real host:
 
-1. It is the only backend. Nothing in the engine names another; the root
-   backend is a later tranche (T-5084). The real pantheon-config git handler
+1. It is the only backend the engine names. ``Engine.from_checkout`` builds it
+   unless a caller injects a ``backend_factory`` (T-5940 S5); the dark live
+   SEAT-scope backend lives outside engine/ (tools/germinate/seat_backend/), and
+   the root backend is a later tranche (T-5084). The real pantheon-config git handler
    (components/pantheon_config_git.py, T-5133) is not registered by any
    component and actuates only inside a ``guard_sim_root``-vetted sandbox.
 2. Host state is a JSON document under the simulated-host root. Op targets
@@ -68,6 +70,7 @@ SENTINEL_BODY = b'{"schema":"pantheon-simulated-host/v0"}\n'
 STATE_NAME = "sim-host-state.json"
 STATE_SCHEMA = "pantheon-simulated-host-state/v0"
 EVIDENCE_SCOPE = "simulated"
+SIM_PRIVILEGE_CEILING: frozenset[str] = frozenset({"none", "seat", "root"})
 
 #: Resolved roots under any of these are refused outright.
 PRODUCTION_PREFIXES: tuple[str, ...] = (
@@ -85,7 +88,11 @@ _SEAT_SCOPE_RE = re.compile(r"^seat-[a-z][a-z0-9_-]{0,31}$")
 KILL_POINTS = ("after-intent", "after-execute", "after-receipt", "after-manifest", "after-record")
 
 
-class SimRootRefused(RuntimeError):
+class BackendRefused(RuntimeError):
+    """A host backend refused a root, scope or op (T-5940: the base the engine catches)."""
+
+
+class SimRootRefused(BackendRefused):
     """The simulated-host root could point at something real; refused."""
 
 
@@ -217,6 +224,57 @@ class InstallerFileHandler:
         self._sim.events = list(state.get("events", []))
 
 
+class HostBackend(Protocol):
+    """What the engine calls on a host backend (T-5940 S5, the selection seam).
+
+    ``SimulatedHostBackend`` (below) and the dark live seat backend
+    (tools/germinate/seat_backend/backend.py) satisfy it structurally.
+    ``privilege_ceiling`` (the op privileges the backend may actuate) and
+    ``bound_account`` (the one owner it serves, or None for any) are the
+    interface the S7 actuation-time privilege check (T-5941) reads; the engine
+    does not read them yet."""
+
+    root: Path
+    op_registry: OpRegistry
+    loaded_op_registry_digest: str
+    evidence_scope: str
+    privilege_ceiling: frozenset[str]
+    bound_account: str | None
+
+    @property
+    def gates_root(self) -> Path: ...
+
+    @property
+    def postboot_marker_path(self) -> Path: ...
+
+    @property
+    def boot_id_path(self) -> Path: ...
+
+    def validate_scope(self, scope: str) -> str: ...
+
+    def run_state_root(self, scope: str) -> Path: ...
+
+    def ensure_run_state_root(self, scope: str) -> Path: ...
+
+    def handles(self, kind: str) -> bool: ...
+
+    def checkpoint(self, point: str, op_id: str) -> None: ...
+
+    def observe(self, component: str, scope: str, kinds: frozenset[str]) -> dict[str, Any]: ...
+
+    def preflight(self, op: InstallOperation) -> PreflightResult: ...
+
+    def execute(self, op: InstallOperation) -> tuple[MutationRecord, OperationEvidence]: ...
+
+    def verify_operation(self, op: InstallOperation) -> OperationEvidence: ...
+
+    def rollback_intent(self, op: InstallOperation) -> MutationRecord | None: ...
+
+    def can_rollback(self, mutation: MutationRecord) -> PreflightResult: ...
+
+    def rollback_mutation(self, mutation: MutationRecord) -> None: ...
+
+
 @dataclass
 class Faults:
     """Simulation-only fault injection. ``fail``: op ids whose execute raises
@@ -241,6 +299,9 @@ class SimulatedHostBackend:
         self.op_registry = op_registry if op_registry is not None else load_op_registry()
         self.loaded_op_registry_digest = self.op_registry.digest
         self.evidence_scope = EVIDENCE_SCOPE
+        #: T-5940: the S7 interface (HostBackend); the simulation models every privilege and owner.
+        self.privilege_ceiling = SIM_PRIVILEGE_CEILING
+        self.bound_account: str | None = None
         self.faults = Faults()
         self._handlers: dict[str, Any] = {}
         self._by_kind: dict[str, Any] = {}
@@ -388,6 +449,14 @@ class SimulatedHostBackend:
     def verify_operation(self, op: InstallOperation) -> OperationEvidence:
         return self.handler(op.kind).verify_operation(op)
 
+    def on_halted(self, run_id: str, op: InstallOperation, exc: BaseException) -> None:
+        """T-5868 Phase B: the engine calls this after an escalating halt is durable. Optional on a
+        handler: one without ``on_halted`` is a no-op. A raise propagates to the engine, which pages."""
+        hook = getattr(self.handler(op.kind), "on_halted", None)
+        if hook is not None:
+            hook(run_id, op, exc)
+            self.save()
+
     def rollback_intent(self, op: InstallOperation) -> MutationRecord | None:
         return self.handler(op.kind).rollback_intent(op)
 
@@ -397,5 +466,17 @@ class SimulatedHostBackend:
     def rollback_mutation(self, mutation: MutationRecord) -> None:
         if mutation.operation_id in self.faults.rollback_fail:
             raise OperationFailed(f"injected failure rolling back {mutation.operation_id}")
-        self.handler(mutation.kind).rollback_mutation(mutation)
+        try:
+            self.handler(mutation.kind).rollback_mutation(mutation)
+        except BaseException as exc:
+            # an undo that changed the simulated host and then raised (T-5830 R2-1) must
+            # leave that partial change durable, as a real host would. If that save also
+            # fails, the ORIGINAL exception still surfaces (review R3-2): it may be an
+            # EscalatingRollbackStop the engine must mark and page; the save error rides
+            # along as a note.
+            try:
+                self.save()
+            except Exception as save_exc:  # noqa: BLE001 -- never let it mask the undo's own failure
+                exc.add_note(f"simulated host save after the failed undo also failed: {type(save_exc).__name__}: {save_exc}")
+            raise
         self.save()

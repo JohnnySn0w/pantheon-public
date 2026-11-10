@@ -6,6 +6,7 @@ home, user manager, tmux, claude or codex.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import io
@@ -258,6 +259,21 @@ class BreakGlassNoManifestTests(ApplyVerbCase):
         self.assertTrue(summary["break_glass"])
         self.assert_host_restored(backend)
 
+    def test_break_glass_rollback_emits_nothing_on_stdout_or_stderr(self) -> None:
+        # T-6167 PR-6: recovery stays quiet; the fallback notice must not leak into it.
+        backend, rid = self.applied()
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), contextlib.redirect_stderr(err):
+            code, summary = self.bg(backend, rid)
+        self.assertEqual(code, 0, summary)
+        self.assertTrue(summary["break_glass"])
+        # break-glass already prints its own BREAK-GLASS warning on stderr (persona_installer);
+        # the invariant is that the fallback notice is not added to it.
+        self.assertEqual(out.getvalue(), "")
+        self.assertNotIn("hand-run fallback", err.getvalue())
+        self.assertNotIn(pia.FALLBACK_NOTICE, err.getvalue())
+        self.assertNotIn("driver", summary)
+
     def test_succeeds_with_a_garbage_manifest(self) -> None:
         backend, rid = self.applied()
         self.manifest_path.write_text(": : [unparseable", encoding="utf-8")
@@ -346,6 +362,98 @@ class BreakGlassNoManifestTests(ApplyVerbCase):
         self.assertEqual(rb.call_args.kwargs["receipt_dir"], self.root)
 
 
+class HandRunFallbackLabelTests(ApplyVerbCase):
+    """T-6167 PR-6: hand-run apply is a LABELLED fallback; the germinate engine is the
+    default seat-install path. Nothing is refused; the label is stderr + JSON only."""
+
+    def run_quiet(self, fn, *args, **kwargs):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), contextlib.redirect_stderr(err):
+            result = fn(*args, **kwargs)
+        return result, out.getvalue(), err.getvalue()
+
+    def execute(self, backend, **extra):
+        plan = self.plan()
+        return plan, self.run_quiet(
+            pia.execute, self.manifest_path, "recovery", plan_digest=plan.digest,
+            backend=backend, **self.kwargs(**extra),
+        )
+
+    def test_notice_text_names_the_engine_path_and_the_live_converge_exit(self) -> None:
+        self.assertIn("germinate install --seat", pia.FALLBACK_NOTICE)
+        self.assertIn("T-5930", pia.FALLBACK_NOTICE)
+        self.assertEqual(pia.FALLBACK_DRIVER, "hand-run-fallback")
+
+    def test_execute_summary_and_sidecar_carry_the_driver_and_notice_is_stderr_only(self) -> None:
+        _plan, ((code, summary), out, err) = self.execute(SimulatedHostBackend())
+        self.assertEqual(code, 0, summary)
+        self.assertEqual(summary["driver"], "hand-run-fallback")
+        stored = json.loads(Path(summary["plan_sidecar"]).read_text())
+        self.assertEqual(stored["driver"], "hand-run-fallback")
+        self.assertIn(pia.FALLBACK_NOTICE, err)
+        self.assertEqual(out, "")
+
+    def test_stage_prefix_and_staged_activate_summaries_carry_the_driver(self) -> None:
+        backend = SimulatedHostBackend()
+        plan, ((code, staged), _out, _err) = self.execute(backend, workflow="stage-prefix")
+        self.assertEqual(code, 0, staged)
+        self.assertEqual(staged["driver"], "hand-run-fallback")
+        FileReceiptStore().store_receipt(plan, _pim.ApplyReceipt.from_dict(backend.receipts[staged["receipt_id"]]))
+        (code, activated), _out, err = self.run_quiet(
+            pia.execute, self.manifest_path, "recovery", plan_digest=plan.digest,
+            workflow="staged-activate", receipt_id=staged["receipt_id"], backend=backend,
+            **self.kwargs(),
+        )
+        self.assertEqual(code, 0, activated)
+        self.assertEqual(activated["driver"], "hand-run-fallback")
+        self.assertIn(pia.FALLBACK_NOTICE, err)
+
+    def test_a_refused_run_still_carries_the_notice_and_still_refuses(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaisesRegex(pia.ApplyRefused, "does not match"):
+            pia.execute(
+                self.manifest_path, "recovery", plan_digest="0" * 64,
+                backend=SimulatedHostBackend(), **self.kwargs(),
+            )
+        self.assertIn(pia.FALLBACK_NOTICE, err.getvalue())
+
+    def test_dry_run_report_carries_the_driver_and_the_notice(self) -> None:
+        (code, report), out, err = self.run_quiet(
+            pia.dry_run, self.manifest_path, "recovery", backend=SimulatedHostBackend(), **self.kwargs()
+        )
+        self.assertEqual(code, 0, report["problems"])
+        self.assertEqual(report["driver"], "hand-run-fallback")
+        self.assertIn(pia.FALLBACK_NOTICE, err)
+        self.assertEqual(out, "")
+
+    def test_rollback_and_break_glass_stay_quiet(self) -> None:
+        backend = SimulatedHostBackend()
+        plan, ((code, summary), _out, _err) = self.execute(backend)
+        FileReceiptStore().store_receipt(
+            plan, _pim.ApplyReceipt.from_dict(backend.receipts[summary["receipt_id"]])
+        )
+        (code, rolled), out, err = self.run_quiet(
+            pia.rollback_receipt, self.manifest_path, "recovery", summary["receipt_id"],
+            backend=backend, **self.kwargs(),
+        )
+        self.assertEqual(code, 0, rolled)
+        self.assertEqual((out, err), ("", ""))
+        self.assertNotIn("driver", rolled)
+
+    def test_an_old_sidecar_without_the_driver_key_still_loads(self) -> None:
+        backend = SimulatedHostBackend()
+        plan, ((code, summary), _out, _err) = self.execute(backend)
+        FileReceiptStore().store_receipt(
+            plan, _pim.ApplyReceipt.from_dict(backend.receipts[summary["receipt_id"]])
+        )
+        path = Path(summary["plan_sidecar"])
+        data = json.loads(path.read_text())
+        del data["driver"]
+        path.write_text(json.dumps(data))
+        receipt, loaded = pia._load_receipt_and_plan(plan, summary["receipt_id"])
+        self.assertEqual(loaded.digest, plan.digest)
+
+
 class CliWiringTests(ApplyVerbCase):
     def run_main(self, *argv):
         out = io.StringIO()
@@ -399,6 +507,15 @@ READ_ONLY_COMMANDS = (
     ("tmux", "display-message"),
     ("git", "-C"),
 )
+
+
+def _is_read_only(argv) -> bool:
+    """The closed read-only set. T-5612: plus the seat pane probe, `tmux -S <socket> has-session`
+    (read-only, never starts a server), matched on its exact shape."""
+    argv = tuple(argv)
+    if len(argv) == 6 and argv[:2] == ("tmux", "-S") and argv[3:5] == ("has-session", "-t"):
+        return True
+    return any(argv[: len(prefix)] == prefix for prefix in READ_ONLY_COMMANDS)
 
 
 def _tree_digest(root: Path) -> dict[str, str]:
@@ -490,7 +607,7 @@ class DryRunIsReadOnlyTests(ApplyVerbCase):
         self.assertGreater(len(report["operations"]), 20)  # the full plan really ran
         for argv in commands:
             self.assertTrue(
-                any(argv[: len(prefix)] == prefix for prefix in READ_ONLY_COMMANDS),
+                _is_read_only(argv),
                 f"dry run issued a command outside the read-only set: {argv}",
             )
         for argv in commands:  # belt and braces: no mutating systemctl verb anywhere
@@ -553,7 +670,7 @@ class DryRunIsReadOnlyTests(ApplyVerbCase):
                 self.assertEqual(probes, [], "dry run attempted a mailbox write probe")
                 for argv in commands:
                     self.assertTrue(
-                        any(argv[: len(prefix)] == prefix for prefix in READ_ONLY_COMMANDS), argv)
+                        _is_read_only(argv), argv)
                 # the approve flow is intact: the printed digest IS the plan's digest
                 plan = _pim.PersonaInstaller(pia.REPO_ROOT).plan(
                     _pim.Manifest.load(real), persona, root=self.root / "real")

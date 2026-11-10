@@ -9,6 +9,9 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
+
+from tools import ledger_shard
 
 from tools._audit import ORG001_FIELDS, append_ledger_entries, build_ledger_entry
 
@@ -70,6 +73,11 @@ class TestBuildLedgerEntry(unittest.TestCase):
 
 class TestAppendLedgerEntries(unittest.TestCase):
     def setUp(self) -> None:
+        # T-4739: mechanics fixtures (historical ts, short ids), not ORG-001's rules,
+        # which are enforced and tested in test_ledger_shard.
+        _p = mock.patch.object(ledger_shard, "ENFORCE", False)
+        _p.start()
+        self.addCleanup(_p.stop)
         self._tmp = tempfile.TemporaryDirectory()
         self.ledger_dir = Path(self._tmp.name) / "ledger"
         self.ledger_dir.mkdir(parents=True)

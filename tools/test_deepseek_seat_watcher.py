@@ -2,26 +2,33 @@
 """Tests for tools/deepseek_seat_watcher.py (T-5125, T-4924 H3b).
 
 Hermetic: every input and output lives in a tempfile directory; nothing reads
-/run, another account, or the network. The balance observer is the real
-DeepSeekBalanceObserver over a canned body; the egress checks are fakes, and
-the real EgressProbe is exercised only with its socket primitives patched.
+/run or another account. The balance observer is the real
+DeepSeekBalanceObserver. One integration test traverses a loopback-only TLS
+server under a disposable CA; no external network is touched. Egress checks
+are otherwise fakes, and the real EgressProbe uses patched socket primitives.
 """
 from __future__ import annotations
 
 import errno
+import hashlib
 import io
 import json
 import os
 import socket
+import ssl
 import stat
+import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
+
+import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -43,6 +50,153 @@ RENDERED = {
     ".hermes/SOUL.md": b"## Identity\nseat\n",
     "seat/.hermes.md": b"pinned rules\n",
 }
+
+
+def _fake_hermes_venv(root: Path) -> Path:
+    venv = root / "venv"
+    executable = venv / "bin/hermes"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\n", encoding="ascii")
+    executable.chmod(0o755)
+    (venv / "pyvenv.cfg").write_text("version_info = 3.12.0\n", encoding="ascii")
+    metadata = venv / "lib/python3.12/site-packages/hermes_agent-0.dist-info"
+    metadata.mkdir(parents=True)
+    source = root / "hermes-source"
+    (source / "hermes_cli").mkdir(parents=True)
+    (source / "hermes_cli/_startup_fast.py").write_text("# fixture\n", encoding="ascii")
+    (source / "pyproject.toml").write_text("[project]\nname='fixture'\n", encoding="ascii")
+    (metadata / "direct_url.json").write_text(json.dumps({
+        "url": source.as_uri(), "dir_info": {"editable": True},
+    }), encoding="ascii")
+    return executable
+
+
+def _watcher_manifest(root: Path, *, base_url: str = "https://deepseek-proxy.invalid:8448/v1") -> tuple[Path, Path, Path, Path]:
+    repo = root / "source"
+    source = repo / "pinned-rules/fixture-seat.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("# Fixture\n\n## Identity\nFixture seat.\n\n## Rules\nStay inert.\n", encoding="utf-8")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    home = root / "home/deepseek-fallback"
+    executable = _fake_hermes_venv(root)
+    manifest = {
+        "manifest_version": 2,
+        "instance": {"id": "fixture"},
+        "roles": {
+            "system-orchestrator-2": {
+                "persona": "fixture-seat", "account": "deepseek-fallback", "harness": "hermes",
+            },
+        },
+        "persona_installer": {
+            "schema": "pantheon-persona-install/v1",
+            "security": {"credential_mode": "references-only", "prohibit_auth_copy": True},
+            "harness_standing_instructions": {
+                "schema": "pantheon-harness-standing-instructions/v1",
+                "personas": {"fixture-seat": {"hermes": [{
+                    "source": "pinned-rules/fixture-seat.md",
+                    "source_sha256": digest,
+                    "source_commit": "a" * 40,
+                    "target": "seat/.hermes.md",
+                }, {
+                    "source": "pinned-rules/fixture-seat.md",
+                    "source_sha256": digest,
+                    "source_commit": "a" * 40,
+                    "target": ".hermes/SOUL.md",
+                    "extract": {"heading": "## Identity"},
+                }] }},
+            },
+        },
+        "harness_runtime": {
+            "schema": "pantheon-harness-runtime/v1",
+            "harnesses": {"hermes": {"default_profile": "deepseek-direct", "profiles": {
+                "deepseek-direct": {
+                    "executable": str(executable), "mode": "interactive", "meter": "api",
+                    "quota_source": "provider-api",
+                },
+            }}},
+            "roles": {"system-orchestrator-2": {
+                "fallbacks": [],
+                "hermes": {
+                    "profile": "deepseek-direct", "model": "deepseek-v4-pro",
+                    "native": {
+                        "provider": "deepseek", "base_url": base_url,
+                        "terminal_backend": "local", "busy_input_mode": "queue",
+                        "approvals": {"mode": "off"},
+                        "balance": {
+                            "currency": "USD", "low_water": "10", "hard_floor": "1",
+                            "burn_alarm_24h": "5",
+                        },
+                    },
+                },
+            }},
+        },
+    }
+    path = repo / "instance.yaml"
+    path.write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
+    defaults = Path(__file__).resolve().parents[1] / "harness/hermes/config.defaults.yaml"
+    return path, repo, home, defaults
+
+
+class _OneShotTlsBalanceServer:
+    def __init__(self, root: Path, payload: dict):
+        tls = root / "tls"
+        tls.mkdir(parents=True)
+        ca_key, self.ca = tls / "ca.key", tls / "ca.pem"
+        key, csr, cert, ext = tls / "leaf.key", tls / "leaf.csr", tls / "leaf.pem", tls / "leaf.ext"
+        ext.write_text(
+            "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\n"
+            "extendedKeyUsage=serverAuth\nsubjectAltName=DNS:deepseek-proxy.invalid\n",
+            encoding="ascii",
+        )
+        subprocess.run([
+            "/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            "-subj", "/CN=watcher-test-ca", "-addext", "basicConstraints=critical,CA:TRUE,pathlen:0",
+            "-addext", "keyUsage=critical,keyCertSign,cRLSign", "-keyout", ca_key, "-out", self.ca,
+        ], check=True, capture_output=True)
+        subprocess.run([
+            "/usr/bin/openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes",
+            "-subj", "/CN=deepseek-proxy.invalid", "-keyout", key, "-out", csr,
+        ], check=True, capture_output=True)
+        subprocess.run([
+            "/usr/bin/openssl", "x509", "-req", "-days", "1", "-sha256", "-in", csr,
+            "-CA", self.ca, "-CAkey", ca_key, "-CAcreateserial", "-extfile", ext, "-out", cert,
+        ], check=True, capture_output=True)
+        self.listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen(1)
+        self.port = self.listener.getsockname()[1]
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        self.request = b""
+        body_bytes = json.dumps(payload).encode("utf-8")
+
+        def serve():
+            raw, _ = self.listener.accept()
+            try:
+                with context.wrap_socket(raw, server_side=True) as tls:
+                    while b"\r\n\r\n" not in self.request:
+                        chunk = tls.recv(4096)
+                        if not chunk:
+                            break
+                        self.request += chunk
+                    tls.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        + f"X-Provider-Text: {INJECT}\r\nContent-Length: {len(body_bytes)}\r\nConnection: close\r\n\r\n".encode("ascii")
+                        + body_bytes
+                    )
+            finally:
+                self.listener.close()
+
+        self.thread = threading.Thread(target=serve, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def join(self):
+        self.thread.join(3)
+        if self.thread.is_alive():
+            self.listener.close()
+            self.thread.join(1)
 
 
 def body(total="50.00", currency="USD", available=True, **extra) -> dict:
@@ -82,6 +236,8 @@ class Base(unittest.TestCase):
         self.out_dir = self.tmp / "health"
         self.state = self.tmp / "state" / "watcher-state.json"
         self.home = self.tmp / "home"
+        self.install_root = self.tmp / "hermes-install"
+        self.install_root.mkdir()
         for rel, data in RENDERED.items():
             p = self.home / rel
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -91,7 +247,7 @@ class Base(unittest.TestCase):
         self._td.cleanup()
 
     def cycle(self, *, now=NOW, obs="default", renderer="default", checks=None,
-              burn_alarm_minor_units=None, thresholds="default") -> dict:
+              burn_alarm_minor_units=None, thresholds="default", hermes_executable="default") -> dict:
         kw = {}
         if thresholds != "default":
             kw["thresholds"] = thresholds
@@ -100,6 +256,9 @@ class Base(unittest.TestCase):
                      observer=observer(body()) if obs == "default" else obs,
                      renderer=(lambda: dict(RENDERED)) if renderer == "default" else renderer,
                      seat_home=self.home,
+                     hermes_executable=(self.tmp / "bin/hermes"
+                                        if hermes_executable == "default" else hermes_executable),
+                     install_root_resolver=lambda _executable: self.install_root,
                      egress_checks=good_checks() if checks is None else checks,
                      burn_alarm_minor_units=burn_alarm_minor_units, out=out, **kw)
         self.assertEqual(rc, 0, out.getvalue())
@@ -322,6 +481,35 @@ class ConfigDriftTests(Base):
     def test_extra_entry_in_harness_home_is_not_seat_drift(self):
         (self.home / ".hermes/sessions").mkdir()
         self.assertEqual(self.cycle()["config_drift"], "none")
+
+    def test_forbidden_dotenv_control_is_config_drift_with_value_free_evidence(self):
+        env = self.home / ".hermes" / ".op.env"
+        env.write_text("HERMES_MANAGED_DIR=/secret/path\n", encoding="utf-8")
+        r = self.cycle()
+        self.assertEqual((r["config_render"], r["config_drift"]), ("ok", "drifted"))
+        self.assertIn("CONFIG_DRIFT", r["incidents"])
+        self.assertIn("harness-op-env:<forbidden-control>", self.log)
+        self.assertNotIn("/secret/path", self.log)
+
+    def test_symlinked_dotenv_is_typed_config_drift(self):
+        target = self.tmp / "credential-target"
+        target.write_text("DEEPSEEK_API_KEY=fixture\n", encoding="utf-8")
+        (self.home / ".hermes" / ".env").symlink_to(target)
+        r = self.cycle()
+        self.assertEqual(r["config_drift"], "drifted")
+        self.assertIn("harness-env:<symlink>", self.log)
+        self.assertNotIn(str(target), self.log)
+
+    def test_all_three_dotenv_path_classes_are_reported_clean(self):
+        self.cycle()
+        for path_class in ("harness-env", "harness-op-env", "install-root-env"):
+            self.assertIn(f"{path_class}:clean", self.log)
+
+    def test_missing_executable_audit_input_fails_closed(self):
+        r = self.cycle(hermes_executable=None)
+        self.assertEqual(r["config_drift"], "drifted")
+        self.assertIn("CONFIG_DRIFT", r["incidents"])
+        self.assertIn("install-root-env:<install-root-unresolved>", self.log)
 
     def test_no_renderer(self):
         r = self.cycle(renderer=None)
@@ -791,8 +979,30 @@ class CliTests(Base):
         self.assertIn("mode=dry-run", out.getvalue())
         r = json.loads((self.out_dir / dsw.HEALTH_NAME).read_text())
         self.assertEqual(r["actions"], [])
-        self.assertEqual(r["balance_band"], "unknown")   # no observer wired in this MR
-        self.assertEqual(r["config_render"], "unknown")  # no renderer wired in this MR
+        # The production defaults deliberately have no usable H4 binding in
+        # this hermetic fixture, so component construction fails closed.
+        self.assertEqual(r["balance_band"], "unknown")
+        self.assertEqual(r["config_render"], "unknown")
+
+    def test_cli_consumes_the_same_typed_egress_gate_as_launch(self):
+        policy = self.tmp / "policy.json"
+        ca = self.tmp / "ca.pem"
+        manifest = self.tmp / "gate.json"
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out), \
+                mock.patch.object(dsw, "configured_egress", return_value="enforced") as gate, \
+                mock.patch.object(dsw, "default_seat_home", return_value=self.home):
+            rc = dsw.main([
+                "--out-dir", str(self.out_dir),
+                "--state-file", str(self.state),
+                "--egress-policy", str(policy),
+                "--egress-ca", str(ca),
+                "--egress-manifest", str(manifest),
+            ])
+        self.assertEqual(rc, 0)
+        gate.assert_called_once_with(policy, ca, manifest)
+        record = json.loads((self.out_dir / dsw.HEALTH_NAME).read_text())
+        self.assertEqual(record["egress_policy"], "enforced")
 
     def test_negative_burn_alarm_refused(self):
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as cm:
@@ -843,6 +1053,139 @@ class CliTests(Base):
         self.assertEqual(dsw.DEFAULT_OUT_DIR, Path("/run/deepseek-fallback-health"))
         self.assertEqual(dsw.HEALTH_NAME, "watcher.json")
         self.assertEqual(dsw.SEAT_ACCOUNT, "deepseek-fallback")
+
+
+class LiveCliWiringTests(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.root = Path(self._td.name)
+        self.manifest, self.repo, self.home, self.defaults = _watcher_manifest(self.root)
+        self.out_dir = self.root / "health"
+        self.state = self.root / "state/watcher.json"
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _args(self, ca: Path) -> list[str]:
+        return [
+            "--manifest", str(self.manifest),
+            "--repo-root", str(self.repo),
+            "--defaults", str(self.defaults),
+            "--seat-home", str(self.home),
+            "--egress-ca", str(ca),
+            "--out-dir", str(self.out_dir),
+            "--state-file", str(self.state),
+        ]
+
+    def test_manifest_builds_real_observer_and_renderer_and_drift_reaches_record(self):
+        server = _OneShotTlsBalanceServer(self.root, {
+            **body("50.00"), INJECT: INJECT,
+        })
+        observer_value, renderer, executable = dsw.build_runtime_components(
+            self.manifest,
+            repo_root=self.repo,
+            defaults_path=self.defaults,
+            seat_home=self.home,
+            ca_path=server.ca,
+        )
+        self.assertIsInstance(observer_value, DeepSeekBalanceObserver)
+        rendered = renderer()
+        self.assertEqual(set(rendered), set(dsw.EXPECTED_RENDER))
+        self.assertIn(b"deepseek-proxy.invalid:8448", rendered[".hermes/config.yaml"])
+        for rel, data in rendered.items():
+            target = self.home / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        (self.home / ".hermes/config.yaml").write_bytes(b"drifted\n")
+        self.assertEqual(executable.name, "hermes")
+
+        server.start()
+        real_connect = socket.create_connection
+
+        def local_proxy(address, timeout=None, *args, **kwargs):
+            if address == ("deepseek-proxy.invalid", 8448):
+                address = ("127.0.0.1", server.port)
+            return real_connect(address, timeout, *args, **kwargs)
+
+        stdout = io.StringIO()
+        with mock.patch.object(dsw, "configured_egress", return_value="enforced"), \
+                mock.patch.object(socket, "create_connection", side_effect=local_proxy), \
+                mock.patch("sys.stdout", stdout):
+            rc = dsw.main(self._args(server.ca))
+        server.join()
+        self.assertEqual(rc, 0, stdout.getvalue())
+        record = json.loads((self.out_dir / dsw.HEALTH_NAME).read_text())
+        self.assertEqual(record["balance_band"], "ok")
+        self.assertEqual(record["balance_minor_units"], 5000)
+        self.assertEqual((record["config_render"], record["config_drift"]), ("ok", "drifted"))
+        self.assertIn(b"Authorization: Bearer proxy-held-dummy", server.request)
+        self.assertNotIn("ignore previous", stdout.getvalue())
+        self.assertNotIn("ignore previous", json.dumps(record))
+
+    def test_egress_gate_runs_before_manifest_or_balance_and_fails_closed(self):
+        missing_ca = self.root / "missing-ca.pem"
+        for verdict in ("open", "unknown"):
+            with self.subTest(verdict=verdict), \
+                    mock.patch.object(dsw, "configured_egress", return_value=verdict), \
+                    mock.patch.object(dsw, "build_runtime_components") as build:
+                rc = dsw.main(self._args(missing_ca))
+                self.assertEqual(rc, 0)
+                build.assert_not_called()
+                record = json.loads((self.out_dir / dsw.HEALTH_NAME).read_text())
+                self.assertEqual(record["egress_policy"], verdict)
+                self.assertEqual(record["balance_band"], "unknown")
+                self.assertEqual(record["config_render"], "unknown")
+                self.assertEqual(record["config_drift"], "unknown")
+
+    def test_missing_manifest_is_value_free_unknown_not_a_crash(self):
+        output = io.StringIO()
+        with mock.patch.object(dsw, "configured_egress", return_value="enforced"), \
+                mock.patch("sys.stdout", output):
+            rc = dsw.main([
+                *self._args(self.root / "ca.pem"),
+                "--manifest", str(self.root / INJECT),
+            ])
+        self.assertEqual(rc, 0)
+        record = json.loads((self.out_dir / dsw.HEALTH_NAME).read_text())
+        self.assertEqual(record["balance_band"], "unknown")
+        self.assertEqual(record["config_render"], "unknown")
+        self.assertNotIn("ignore previous", output.getvalue())
+
+    def test_account_mismatch_is_refused_before_writes(self):
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as cm:
+            dsw.main(["--account", "someone-else", "--out-dir", str(self.out_dir)])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertFalse(self.out_dir.exists())
+
+
+class ManifestAndSystemdParityTests(unittest.TestCase):
+    def test_h4_manifest_has_reviewed_absolute_thresholds_and_proxy(self):
+        repo = Path(__file__).resolve().parents[1]
+        manifest = yaml.safe_load((repo / "instance.yaml").read_text(encoding="utf-8"))
+        hermes = manifest["harness_runtime"]["harnesses"]["hermes"]
+        self.assertEqual(hermes["default_profile"], "deepseek-direct")
+        role = manifest["harness_runtime"]["roles"]["system-orchestrator-2"]
+        native = role["hermes"]["native"]
+        self.assertEqual(native["base_url"], "https://deepseek-proxy.invalid:8448/v1")
+        self.assertEqual(native["balance"], {
+            "currency": "USD", "low_water": "10", "hard_floor": "1",
+            "burn_alarm_24h": "5",
+        })
+
+    def test_account_keyed_service_timer_are_inert_and_cadence_matches_code(self):
+        repo = Path(__file__).resolve().parents[1]
+        service = (repo / "harness/hermes/systemd/pantheon-deepseek-seat-watcher@.service").read_text()
+        timer = (repo / "harness/hermes/systemd/pantheon-deepseek-seat-watcher@.timer").read_text()
+        self.assertIn("User=%i", service)
+        self.assertIn("--account %i", service)
+        self.assertIn("--dry-run", service)
+        self.assertNotIn("--live ", service)
+        self.assertNotIn("--live-page", service)
+        self.assertIn("OnUnitInactiveSec=5min", timer)
+        self.assertIn("RandomizedDelaySec=30s", timer)
+        self.assertIn("Unit=pantheon-deepseek-seat-watcher@%i.service", timer)
+        self.assertEqual(dsw.POLL_INTERVAL_S, 5 * 60)
+
 
 
 if __name__ == "__main__":

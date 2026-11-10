@@ -50,6 +50,8 @@ Two practical gaps surfaced during T-0160 (SOP standard-bucket re-routing) and T
 - **Subsequent amendments by HO** get ledger-entry surfaces. If the operator wants per-edit review, he requests it via D3-style escalation; otherwise HO operates within the ratified policy's shape. Cap on amendment scope: cosmetic / wording / minor calibration is HO-direct; substantive change of authority surface (e.g., expanding what HO auto-approves) is full surface-and-ratify.
 - **Re-evaluation triggers** mirror directives — every policy carries a "Re-evaluate when" line. Substrate changes (new model family, harness shape change, multi-account topology) are typical triggers.
 
+> Amended by: D3 as amended 2026-06-11 (the operator msgs 3733/3735) and corrected 2026-09-01 (TG 1887), `rulebook/directives.md` D3: the escalation bar now sits at goal level, and every new or amended ADR needs human review before adoption; the surface-time ratification and "D3-style escalation" above are read through that bar.
+
 ### Why a tier (not just notes/)
 
 The point is **calibrated authoring authority + structural traceability**. `notes/` is a generic catch-all; readers can't tell which entries are load-bearing for HO behavior vs which are session-state, design history, watchlist tracking. The policies tier names the load-bearing-for-HO-behavior entries explicitly + applies the appropriate authoring discipline.

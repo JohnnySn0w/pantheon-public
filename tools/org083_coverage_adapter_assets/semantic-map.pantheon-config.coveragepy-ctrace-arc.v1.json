@@ -1,0 +1,73 @@
+{
+  "schema": "org083.adapter-semantic-map.v1",
+  "adapter_id": "pantheon-config.coveragepy-ctrace-arc.v1",
+  "note": "Static semantic-source map, immutable per adapter id. Keys are exactly tools/repository_evidence.COMPARABILITY_CHECKED_FIELDS. Its sha256 is pinned in tools/org083_coverage_adapter.py; any edit without a new adapter id is refusal R17a. `facts` are the machine-readable declarations that observed values are contradiction-checked against (R17c).",
+  "fields": {
+    "collector.adapter_id": {
+      "statement": "pantheon-config.coveragepy-ctrace-arc.v1",
+      "source": "proposal section 1"
+    },
+    "collector.tool_name": {
+      "statement": "coverage.py",
+      "source": "proposal section 1"
+    },
+    "collector.tool_version": {
+      "statement": "7.17.0, binary wheels only (cp311 and cp312 manylinux x86_64), sha256 per interpreter from the hash lock; the pure-Python wheel is forbidden",
+      "source": "proposal section 1, PyPI"
+    },
+    "collector.command_fingerprint": {
+      "statement": "sha256 of canonical JSON over the placeholderized argv template of section 6, the env allowlist values, the exact sorted union of unset variable names plus the redirect-rule name, the PATH-resolved python3 identity and -n; no junit node-id set",
+      "source": "proposal sections 6, 7"
+    },
+    "collector.config_digest": {
+      "statement": "sha256 over canonical {coverage_config_bytes_sha256, pins}; static inputs only, no resolved map and no tool output",
+      "source": "proposal sections 4, 5, 7"
+    },
+    "collector.runner_fingerprint": {
+      "statement": "runner identity: python implementation and exact version, platform and glibc, runner label, cpu count, effective core and CTracer availability, sha256 of the sorted lower-cased pip freeze",
+      "source": "proposal section 7"
+    },
+    "scope.include_selectors": {
+      "statement": "[\"tools\"], absolute measured paths (relative_files = False)",
+      "source": "proposal section 4"
+    },
+    "scope.exclusion_ids": {
+      "statement": "[\"excl-test-code\",\"excl-test-data\",\"excl-tool-undiscoverable\"]",
+      "source": "proposal section 4"
+    },
+    "scope.generated_source_ids": {
+      "statement": "[\"generated-none\"]",
+      "source": "proposal section 4, T-3738"
+    },
+    "scope.scope_fingerprint": {
+      "statement": "sha256 over canonical {include_selectors, omit_patterns, exclusion_record_ids, exclusion_regexes, discovery_rule, in_scope_paths, unreported_scope_paths}; no blob shas, no contents, no pragma inventory",
+      "source": "proposal section 7"
+    },
+    "dimension": {
+      "statement": "line or branch",
+      "source": "proposal section 3"
+    },
+    "unit": {
+      "statement": "statement (line) or branch_destination (branch)",
+      "source": "proposal section 3"
+    },
+    "denominator": {
+      "statement": "line: totals.num_statements; branch: totals.num_branches (coverage json format 3)",
+      "source": "proposal section 3, branch.html"
+    },
+    "branch_semantics": {
+      "statement": "coverage.py arc destinations under the ctrace core: static-analysis possible transitions vs measured (source, destination) pairs; coverage default branch exclusions only",
+      "source": "branch.html, excluding.html, config [run] core",
+      "facts": {"core": "ctrace", "arcs": true}
+    },
+    "function_semantics": {
+      "statement": "deferred: no function-hit numerator/denominator; per-function regions retained only",
+      "source": "proposal section 9"
+    },
+    "test_selection": {
+      "statement": "selection rule: argv tools/, no -k/-m/--deselect/--ignore, no -p no:<plugin> beyond cacheprovider, env allowlist of section 7; the executed node-id set is an observation, not part of this declaration",
+      "source": "proposal sections 6, 7a, check_suite_outcome_floor.count",
+      "facts": {"narrowing_flags": false}
+    }
+  }
+}

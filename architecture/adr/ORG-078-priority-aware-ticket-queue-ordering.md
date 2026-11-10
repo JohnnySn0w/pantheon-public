@@ -1,7 +1,7 @@
 ---
 aliases: [ORG-078]
 title: Priority-aware ticket queue ordering — arc-label-group priority-list, transparent list re-sort
-status: Ratified 2026-08-22 by the operator via T-3019 (TG 8217). Design DIRECTED by the operator 2026-08-21 (TG 8108/8110/8111/8113).
+status: Ratified 2026-08-22 by the operator via T-3019 (TG 8217). Amendment 1 directed by the operator 2026-10-28 via T-5715 (TG 12437/12447).
 date: 2026-08-21
 author: Orchestrator (Orchestrator)
 relates: ORG-003, ORG-013, ORG-015, ORG-019, ORG-041, ORG-065, T-3018
@@ -23,11 +23,11 @@ The ticket queue (`ticket.py list` + per-persona pull loops via `inbox_consumer.
 
 Four elements, composed. Each is small; the value is the composition + operator-single-source editability.
 
-### 1. Priority is at the ARC-LABEL group level, not per-ticket
+### 1. Label tier is authoritative; a ticket may be ordered within its tier
 
-Priority is declared **once per arc-label** in a rulebook file, not per-ticket. A ticket inherits priority via its already-existing arc-labels (e.g. `t-2953-arc`, `org-073`, `harness-controller`). No new per-ticket labels or frontmatter fields.
+Priority tier is declared **once per arc-label** in a rulebook file. A ticket inherits its tier via its already-existing arc-labels (e.g. `t-2953-arc`, `org-073`, `harness-controller`). An optional per-ticket rank may order one ticket ahead of peers in that same effective tier; it never changes or crosses the label/dependency-derived tier. When absent, FIFO behavior is unchanged.
 
-**Why:** per-ticket `priority-N` labels are too cluttery; the elegant shape is priority-list keyed on goal/ADR labels that groups of tickets already share. A group-level declaration matches how tickets are naturally organized, avoids label-spam on every ticket, and makes operator-edits atomic (change one file, all tickets re-sort).
+**Why:** per-ticket `priority-N` labels are too cluttery; the priority-list remains keyed on goal/ADR labels that groups of tickets already share. The narrow per-ticket exception handles deliberate sequencing inside one tier without relabelling the ticket, inventing a dependency, or weakening the tier ceiling.
 
 **Ceiling-priority over-promotion is ACCEPTED:** the "highest-match-wins" rule (§3) can elevate a ticket whose priority-labeled arc is only an incidental touch, not the primary reason for the ticket. Example: `[echo-phase-4, harness-controller]` becomes P1 even if harness is only affected, not the reason for the ticket. This over-promotion is accepted because (a) under-promotion is the failure this ADR exists to close, and pushing an incidentally-labeled ticket up the queue costs at most one persona-turn of "this isn't actually mine" and a re-triage; (b) a "primary-priority-label" convention adds per-ticket authoring burden that violates the cluttery-is-bad direction; (c) label hygiene (arc-label-should-match-arc-reality) remains an ORG-013 / ORG-065 concern, not this ADR's. Post-ratify observation (§Cadence-observation) reports over-promotion rate; if it materially degrades persona-turn efficiency, a follow-up ADR adds a "primary-priority-label" convention.
 
@@ -64,8 +64,9 @@ Labels match exact-string case-sensitive against ticket frontmatter `labels: [..
 2. For each ticket, extract its `labels: [...]` set.
 3. **Ceiling priority-rank** — for each label, look up its rank in the priority-list; the ticket's rank is the **minimum** rank across its labels (lowest number = highest priority). See §1 for the over-promotion trade-off.
 4. Tickets with NO priority-list-matching label default to rank `∞` (tail).
-5. **Sort keys, in order** (all ASC): `(priority_rank, effective_queue_ts, ticket_id)`.
+5. **Sort keys, in order** (all ASC): `(priority_rank, tier_rank, effective_queue_ts, ticket_id)`.
    - **`priority_rank`** ASC — lower rank sorts first (rank 1 = highest priority).
+   - **`tier_rank`** ASC — optional per-ticket ordering inside the effective priority tier. Lower integers sort first; absence sorts after explicit ranks and falls through to FIFO. This key cannot lift a ticket across tiers because `priority_rank` remains first.
    - **`effective_queue_ts`** ASC — the ticket's "when did it land in current target's queue" timestamp. Sourced from a new frontmatter field `retargeted_at` (added transactionally by `ticket.py retarget` when set). If absent (never retargeted), falls back to `created`. Historic tickets with no `retargeted_at` field get `created` as effective ts; backfill by the retargeted-at from the last `[orchestrator] retargeted` transition-log entry if a follow-up hygiene pass runs.
    - **`ticket_id`** ASC (lexicographic on `T-NNNN`) — deterministic final tie-breaker for tickets with same rank + same ts.
 
@@ -150,7 +151,7 @@ Labels whose meaning drifts (e.g. `concordance` starts covering post-PoC work th
 ## Build sequence
 
 1. **Author** `rulebook/priority-list.md` with the initial stack (done in this ADR's ratify tranche; see companion file). Sentinel-delimited YAML region.
-2. **Extend `tools/ticket.py`** — `list` function: read priority-list at invocation with snapshot semantics; compute ceiling priority-rank; apply dependency-inheritance from ORG-065 graph (bounded transitive closure); sort by `(priority_rank, effective_queue_ts, ticket_id)`; expose `--sort priority|created|retargeted` (default `priority`); implement failure-mode telemetry (stderr + `priority_list_health.jsonl`).
+2. **Extend `tools/ticket.py`** — `list` function: read priority-list at invocation with snapshot semantics; compute ceiling priority-rank; apply dependency-inheritance from ORG-065 graph (bounded transitive closure); sort by `(priority_rank, tier_rank, effective_queue_ts, ticket_id)`; expose `--sort priority|created|retargeted` (default `priority`); implement failure-mode telemetry (stderr + `priority_list_health.jsonl`). Amendment 1 adds the audited `tier-rank` mutation surface for the optional per-ticket key.
 3. **Add `tools/priority_list_parse.py`** helper: parse the sentinel-delimited YAML region; return `dict[str, int]` label→rank. Reused by ticket.py + validate command + fleet-monitor.
 4. **Add `retargeted_at` frontmatter field** — `ticket.py retarget` writes/updates this transactionally; historic tickets get `created` as fallback until a hygiene backfill runs. `ticket.py priority-list validate` (or a one-time audit command) reports tickets that HAVE `[<agent>] retargeted` entries in their transition-log but lack the `retargeted_at` frontmatter field — surfaces the pre-existing-drift so we know how much distortion the `created`-fallback introduces to historic-ticket ordering.
 5. **Add `ticket.py list --explain-priority T-NNNN`** — reports own_rank + inherited_rank + which downstream ticket elevated it, if any.

@@ -565,8 +565,10 @@ class DarkUnits(unittest.TestCase):
         positive control reads 0 records and every enrolled seat is Unknown forever."""
         m = re.search(r"(?m)^ExecStart=(.+)$", self.svc)
         cmd = m.group(1)
-        self.assertTrue(cmd.startswith('/usr/bin/sg systemd-journal -c "/usr/bin/python3 '), cmd)
-        self.assertTrue(cmd.endswith('"'), cmd)
+        # T-5998: nested, so the page port can also reach orchestrator's mailbox hub (group pantheon-mailbox)
+        self.assertTrue(cmd.startswith('/usr/bin/sg systemd-journal -c "/usr/bin/sg pantheon-mailbox -c '
+                                       '\\"/usr/bin/python3 '), cmd)
+        self.assertTrue(cmd.endswith('\\""'), cmd)
         self.assertEqual(len(re.findall(r"(?m)^ExecStart=", self.svc)), 1)
 
     def test_timer_names_the_service(self):

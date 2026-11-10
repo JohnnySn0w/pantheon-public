@@ -959,6 +959,72 @@ def _render_wip_drift_section(findings: list) -> str:
     return "\n".join(lines)
 
 
+# T-5591 / ORG-106 note 4: indefinite seat-state records older than
+# INDEFINITE_FLAG_AGE (7d), read from the health export (grooming runs as
+# claude-fallback, which owns /run/pantheon-health; no new privilege).
+# 3 exporter cycles, same bound as pantheon_metrics_gen.HEALTH_RECORD_MAX_AGE_SEC (T-5655).
+SEAT_HEALTH_RECORD_MAX_AGE_SEC = 180
+SEAT_STATE_UNAVAILABLE_LINE = (
+    "Seat-state export unavailable (health_export not readable/fresh); "
+    "forgotten-pause check skipped."
+)
+_SEAT_REASON_SCRUB_RE = re.compile(r"[\s*_`\[\]<>|#\\]+")
+_SEAT_REASON_MAX = 80
+
+
+def _collect_stale_seat_states(health_dir: Path | None = None,
+                               now: float | None = None) -> tuple[list[dict], bool]:
+    """Return (stale indefinite seat records, export_unavailable). FAIL OPEN.
+
+    Per record: unreadable, malformed, schema-invalid or stale-export (exported_at older
+    than SEAT_HEALTH_RECORD_MAX_AGE_SEC, or in the future) records are skipped. The bool is
+    True only when no record at all was usable (dir missing/unreadable, or every record
+    skipped), never on a healthy export that simply has no stale seats.
+    """
+    import time
+    try:
+        from tools import health_export
+        d = Path(health_dir) if health_dir is not None else health_export.DEFAULT_OUT_DIR
+        t = time.time() if now is None else now
+        usable = 0
+        found: list[dict] = []
+        for path in sorted(d.glob("*.json")):
+            if path.name.startswith("_"):
+                continue
+            try:
+                rec = health_export.sanitize(json.loads(path.read_text()))
+            except Exception:  # noqa: BLE001 - unreadable/malformed: skip this record
+                continue
+            if rec is None:
+                continue
+            age = t - rec["exported_at"]
+            if age < 0 or age > SEAT_HEALTH_RECORD_MAX_AGE_SEC:
+                continue
+            usable += 1
+            if rec.get("seat_indefinite_stale") is True:
+                found.append(rec)
+        return found, usable == 0
+    except Exception:  # noqa: BLE001 - missing dir etc.: the check is skipped
+        return [], True
+
+
+def _render_stale_seat_state_section(findings: list, unavailable: bool = False) -> str:
+    """T-5591 digest section. Nothing to say -> ''. Plain text, single-line bullets."""
+    if unavailable:
+        return SEAT_STATE_UNAVAILABLE_LINE
+    if not findings:
+        return ""
+    lines = [f"🛏️ Forgotten seat pauses ({len(findings)} indefinite > 7d, ORG-106):"]
+    for f in findings:
+        reason = _SEAT_REASON_SCRUB_RE.sub(" ", str(f.get("seat_reason") or "")).strip()
+        reason = reason[:_SEAT_REASON_MAX].strip() or "no reason recorded"
+        days = int((f.get("seat_set_age_s") or 0) // 86400)
+        lines.append(
+            f"  - {f.get('persona')}: {f.get('seat_state')}, owner "
+            f"{f.get('seat_owner') or 'unknown'}, {days}d: {reason}")
+    return "\n".join(lines)
+
+
 def find_last_non_grooming_entry(body: str) -> tuple[datetime | None, str | None]:
     """Walk the body's transition log bottom-up; return `(ts, actor)` of the
     most recent entry whose actor is NOT `grooming`. Returns `(None, None)`
@@ -3060,6 +3126,8 @@ def build_digest(
     appetite_overrun_findings: list | None = None,
     dropped_this_week: list | None = None,
     wip_drift_findings: list | None = None,
+    seat_state_findings: list | None = None,
+    seat_state_unavailable: bool = False,
 ) -> str:
     """Render the digest as plain text (no Markdown).
 
@@ -3092,9 +3160,12 @@ def build_digest(
         appetite_overrun_findings or [])
     dropped_this_week_section = _render_dropped_this_week_section(dropped_this_week or [])
     wip_drift_section = _render_wip_drift_section(wip_drift_findings or [])
+    seat_state_section = _render_stale_seat_state_section(
+        seat_state_findings or [], seat_state_unavailable)
     _appetite_sections = "".join(
         "\n" + s + "\n" for s in (
-            wip_drift_section, appetite_overrun_section, appetite_completeness_section, dropped_this_week_section
+            wip_drift_section, appetite_overrun_section, appetite_completeness_section, dropped_this_week_section,
+            seat_state_section,
         ) if s
     )
 
@@ -3773,6 +3844,8 @@ def main(argv: list[str] | None = None) -> int:
     # This keeps the always-on informational sections (ratified-unbuilt,
     # integrity / gate-clusters, appetite completeness/overrun, dep-graph,
     # reopened, stale drafts) on the record without pinging the operator.
+    # T-5591: forgotten indefinite seat pauses (fail open; read-only).
+    _seat_found, _seat_unavail = _collect_stale_seat_states()
     digest = build_digest(
         now_human, all_stale, counts,
         hermes_line=hermes_line,
@@ -3789,6 +3862,8 @@ def main(argv: list[str] | None = None) -> int:
         appetite_overrun_findings=appetite_overrun_findings,
         dropped_this_week=dropped_this_week,
         wip_drift_findings=_wip_drift_result,
+        seat_state_findings=_seat_found,
+        seat_state_unavailable=_seat_unavail,
     )
     if failures > 0:
         digest = digest + f"\nWARNING: ticket_grooming auto-commit reported {failures} failure(s); see stderr.\n"

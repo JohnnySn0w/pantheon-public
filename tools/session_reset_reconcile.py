@@ -49,7 +49,7 @@ from tools._git_utils import _git, _hermes_scan_file, _hermes_scan_message, pull
 from tools import agent_role_map
 from tools._audit import append_ledger_entries
 from tools._audit import build_ledger_entry as _audit_build_entry
-from tools.ledger_shard import current_write_target
+from tools.ledger_shard import check_new_entry, current_write_target
 from tools.seat_exec import seat_argv
 from tools.session_reset_log import (
     CLASSES,
@@ -485,6 +485,16 @@ def main(argv: list[str] | None = None) -> int:
     refusal = _enforce_default_safe(args)
     if refusal is not None:
         return refusal
+
+    # T-4739 (orchestrator requirement 2): validate the ledger identity BEFORE any side effect
+    # (repo pull, journal-sweep append_event, watermark). The real entries are built
+    # later from the source events; a probe built the same way pins identity, ts and
+    # id shape, none of which depend on those events.
+    try:
+        check_new_entry(build_ledger_entry({"class": "preflight", "ts_iso": ""}))
+    except ValueError as exc:
+        _log(f"ledger entry would be refused by ORG-001; nothing done: {exc}")
+        return 1
 
     _log(f"start (commit_prod={args.commit_prod} dry_run={args.dry_run} no_commit={args.no_commit})")
 

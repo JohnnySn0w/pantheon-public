@@ -27,6 +27,8 @@ import os
 import re
 import stat
 import tempfile
+import urllib.parse
+import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
@@ -63,6 +65,8 @@ NO_BUNDLED_SKILLS_MARKER_BYTES = b""
 #: The seat's provider key file; Hermes skips its own chmod under .managed.
 ENV_FILENAME = ".env"
 ENV_FILE_MODE = 0o600
+OP_ENV_FILENAME = ".op.env"
+MAX_ENV_FILE_BYTES = 64 * 1024
 BINDINGS_RELDIR = PurePath(".local", "state", "pantheon", "hermes-render")
 BINDINGS_FILENAME = "bindings.json"
 # Hermes's managed scope (H0, ``hermes_cli/managed_scope.py`` ``get_managed_dir()``):
@@ -122,12 +126,18 @@ FORBIDDEN_ENV_FILE_KEYS: frozenset[str] = frozenset(
 #: The finding ``check_env_file_controls`` returns when it cannot decode a file
 #: the way Hermes would (fail closed: an unreadable file is never "clean").
 ENV_FILE_UNDECODABLE = "<undecodable>"
-# H2/H3 MUST (MED-1, T-5005 r1): the drift check runs check_env_file_controls
-# over every dotenv Hermes loads, $HERMES_HOME/.env, $HERMES_HOME/.op.env and
-# the install-root .env, and alerts on any hit; OR those files are made
-# root-owned so the seat cannot write them (H5a decides which). Until one of
-# the two lands, the overlay AND the seat config.yaml locks can be bypassed
-# from the seat's own .env.
+ENV_FILE_UNREADABLE = "<unreadable>"
+ENV_FILE_SYMLINK = "<symlink>"
+ENV_FILE_NOT_REGULAR = "<not-regular>"
+ENV_FILE_OVERSIZE = "<oversize>"
+INSTALL_ROOT_UNRESOLVED = "<install-root-unresolved>"
+DOTENV_PATH_CLASSES = ("harness-env", "harness-op-env", "install-root-env")
+# H2/H3 MUST (MED-1, T-5005 r1): pre-launch validation and the drift watcher
+# both run check_env_file_controls over every dotenv Hermes loads:
+# $HERMES_HOME/.env, $HERMES_HOME/.op.env and the install-root .env. Any hit
+# fails launch closed and is exposed as config drift. H5a still decides which
+# files become root-owned as the better steady state; it does not replace this
+# check.
 #: The stderr text Hermes prints when it skips a malformed overlay ("managed
 #: scope: failed to parse <path> ... IGNORING this managed file. Admin policy
 #: from this file is NOT being applied."). The H3 drift watcher keys on it; no
@@ -153,6 +163,7 @@ _GENERATED_HEADER = (
 )
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _AUTO_PROVIDER = "auto"
+DEEPSEEK_PROXY_BASE_URL = "https://deepseek-proxy.invalid:8448/v1"
 
 
 class HermesRenderError(RuntimeError):
@@ -273,12 +284,59 @@ def _decode_env_like_hermes(raw: bytes) -> str | None:
     return text.replace("\x00", "")
 
 
+def _read_bounded_regular(path: Path, cap: int) -> tuple[bytes | None, str]:
+    """Read one regular file without following its final symlink.
+
+    The status is ``ok``, ``absent``, ``symlink``, ``not-regular``,
+    ``oversize`` or ``unreadable``. Reads are capped even when a hostile file's
+    reported size is stale or zero.
+    """
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None, "absent"
+    except OSError as exc:
+        return None, "symlink" if exc.errno == errno.ELOOP else "unreadable"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, "not-regular"
+        if st.st_size > cap:
+            return None, "oversize"
+        chunks: list[bytes] = []
+        remaining = cap + 1
+        while remaining:
+            try:
+                chunk = os.read(fd, remaining)
+            except InterruptedError:
+                continue
+            except OSError:
+                return None, "unreadable"
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        return (None, "oversize") if len(raw) > cap else (raw, "ok")
+    finally:
+        os.close(fd)
+
+
+_ENV_READ_FAILURE = {
+    "symlink": ENV_FILE_SYMLINK,
+    "not-regular": ENV_FILE_NOT_REGULAR,
+    "oversize": ENV_FILE_OVERSIZE,
+    "unreadable": ENV_FILE_UNREADABLE,
+}
+
+
 def check_env_file_controls(path: Path) -> list[str]:
     """The ``FORBIDDEN_ENV_FILE_KEYS`` a dotenv file sets, sorted; ``[]`` if none
     (or if the file does not exist, since then Hermes loads nothing from it).
     ``[ENV_FILE_UNDECODABLE]`` if it cannot be decoded as Hermes would.
 
-    Pure, read-only: the H3 drift watcher's hook. Nothing calls it in H1.
+    Pure and read-only. The pre-launch gate and H3 drift watcher both call it.
     Fail-closed matching, where a false positive is acceptable and a miss is not:
 
     * each non-comment line, after an optional ``export`` and whitespace, has a
@@ -290,10 +348,11 @@ def check_env_file_controls(path: Path) -> list[str]:
 
     A key counts whatever its value (an empty value is still a seat-written control).
     """
-    try:
-        raw = path.read_bytes()
-    except FileNotFoundError:
+    raw, status = _read_bounded_regular(path, MAX_ENV_FILE_BYTES)
+    if status == "absent":
         return []
+    if status != "ok" or raw is None:
+        return [_ENV_READ_FAILURE[status]]
     text = _decode_env_like_hermes(raw)
     if text is None:
         return [ENV_FILE_UNDECODABLE]
@@ -313,6 +372,104 @@ def check_env_file_controls(path: Path) -> list[str]:
             if pattern.search(head):
                 found.add(key)
     return sorted(found)
+
+
+def hermes_install_root(executable: Path) -> Path:
+    """Resolve the pinned editable install's source root from its venv metadata.
+
+    v0.22.0's ``hermes`` console script imports ``hermes_cli.main``. That module
+    defines its project root as the parent of the installed ``hermes_cli``
+    package and loads ``PROJECT_ROOT/.env``. The H0 install used ``uv sync
+    --frozen``, which records that editable source root in
+    ``hermes_agent-*.dist-info/direct_url.json``. Follow that recorded package
+    placement instead of guessing an executable parent.
+    """
+    try:
+        exe = executable.resolve(strict=True)
+    except OSError as exc:
+        raise HermesRenderError("install-root-unresolved", type(exc).__name__) from None
+    if exe.name != "hermes" or exe.parent.name != "bin":
+        raise HermesRenderError("install-root-unresolved", "executable-layout")
+    venv = exe.parent.parent
+    cfg_raw, cfg_status = _read_bounded_regular(venv / "pyvenv.cfg", 16 * 1024)
+    if cfg_status != "ok" or cfg_raw is None:
+        raise HermesRenderError("install-root-unresolved", f"pyvenv-{cfg_status}")
+    try:
+        cfg = cfg_raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HermesRenderError("install-root-unresolved", "pyvenv-undecodable") from None
+    version = re.search(r"^version_info\s*=\s*(\d+)\.(\d+)(?:\.\d+)?\s*$", cfg, re.MULTILINE)
+    if version is None:
+        raise HermesRenderError("install-root-unresolved", "pyvenv-version")
+    site = venv / "lib" / f"python{version.group(1)}.{version.group(2)}" / "site-packages"
+    metadata: list[Path] = []
+    try:
+        with os.scandir(site) as entries:
+            for index, entry in enumerate(entries):
+                if index >= 512:
+                    raise HermesRenderError("install-root-unresolved", "site-packages-oversize")
+                if (entry.name.startswith("hermes_agent-") and entry.name.endswith(".dist-info")
+                        and entry.is_dir(follow_symlinks=False)):
+                    metadata.append(Path(entry.path) / "direct_url.json")
+    except OSError as exc:
+        raise HermesRenderError("install-root-unresolved", type(exc).__name__) from None
+    if len(metadata) != 1:
+        raise HermesRenderError("install-root-unresolved", "package-metadata")
+    direct_raw, direct_status = _read_bounded_regular(metadata[0], 4096)
+    if direct_status != "ok" or direct_raw is None:
+        raise HermesRenderError("install-root-unresolved", f"direct-url-{direct_status}")
+    try:
+        direct = json.loads(direct_raw.decode("utf-8"))
+        parsed = urllib.parse.urlparse(direct["url"])
+        editable = direct["dir_info"]["editable"] is True
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        raise HermesRenderError("install-root-unresolved", "direct-url-invalid") from None
+    if not editable or parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+        raise HermesRenderError("install-root-unresolved", "direct-url-layout")
+    root = Path(urllib.request.url2pathname(urllib.parse.unquote(parsed.path)))
+    if not root.is_absolute():
+        raise HermesRenderError("install-root-unresolved", "direct-url-relative")
+    for marker in (root / "hermes_cli" / "_startup_fast.py", root / "pyproject.toml"):
+        try:
+            mode = marker.lstat().st_mode
+        except OSError as exc:
+            raise HermesRenderError("install-root-unresolved", type(exc).__name__) from None
+        if not stat.S_ISREG(mode):
+            raise HermesRenderError("install-root-unresolved", "package-layout")
+    return root
+
+
+def dotenv_control_findings(
+    account_home: Path,
+    executable: Path,
+    *,
+    install_root_resolver: Callable[[Path], Path] = hermes_install_root,
+) -> dict[str, tuple[str, ...]]:
+    """Typed, value-free findings for exactly the three dotenv paths v0.22.0 loads."""
+    paths: list[tuple[str, Path]] = [
+        ("harness-env", account_home / HERMES_HOME_DIRNAME / ENV_FILENAME),
+        ("harness-op-env", account_home / HERMES_HOME_DIRNAME / OP_ENV_FILENAME),
+    ]
+    try:
+        install_root = install_root_resolver(executable)
+    except (HermesRenderError, OSError, ValueError):
+        paths.append(("install-root-env", Path(".")))
+        unresolved = True
+    else:
+        paths.append(("install-root-env", install_root / ENV_FILENAME))
+        unresolved = False
+    result: dict[str, tuple[str, ...]] = {}
+    for path_class, path in paths:
+        if path_class == "install-root-env" and unresolved:
+            result[path_class] = (INSTALL_ROOT_UNRESOLVED,)
+            continue
+        raw = check_env_file_controls(path)
+        normalized = tuple(
+            finding if finding.startswith("<") else "<forbidden-control>"
+            for finding in raw
+        )
+        result[path_class] = tuple(sorted(set(normalized)))
+    return result
 
 
 def load_defaults(path: Path) -> dict[str, Any]:
@@ -698,6 +855,7 @@ def prepare_hermes_launch(
     writer: Callable[[Path, bytes], None] = atomic_write,
     repo_probe: Callable[[Path], bool] | None = None,
     fchmod: Callable[[int, int], None] = os.fchmod,
+    install_root_resolver: Callable[[Path], Path] | None = None,
 ) -> HermesPrepareResult:
     """Plan §2.2 step 2: verify, render, write atomically, mark, stamp.
 
@@ -705,9 +863,26 @@ def prepare_hermes_launch(
     because a test host's temp root can itself sit inside a stray repo.
     """
     target = target or HermesRenderTarget()
+    if (
+        inputs.account_home.name == "deepseek-fallback"
+        and launch.native.get("base_url") != DEEPSEEK_PROXY_BASE_URL
+    ):
+        raise HermesRenderError("egress-proxy-required", DEEPSEEK_PROXY_BASE_URL)
     seat = target.seat_dir(inputs.account_home)
     if (repo_probe or _inside_repo)(seat):
         raise HermesRenderError("seat-inside-repo", str(seat))
+    env_findings = dotenv_control_findings(
+        inputs.account_home,
+        launch.executable,
+        install_root_resolver=install_root_resolver or hermes_install_root,
+    )
+    refused = [
+        f"{path_class}:{','.join(findings)}"
+        for path_class, findings in env_findings.items()
+        if findings
+    ]
+    if refused:
+        raise HermesRenderError("env-file-control", ";".join(refused))
     defaults, defaults_sha256 = read_defaults(inputs.defaults_path)  # one read: parse and hash the same bytes
     files = render_seat_files(inputs, launch, target=target, defaults=defaults)
     errors: list[str] = []

@@ -48,9 +48,11 @@ from tools.harness_adapter import (
 from tools.harness_adapter.codex import (
     _prune_stale_project_entries,
     ensure_model_migration_prompts_hidden,
+    ensure_lifecycle_hooks,
     ensure_project_trusted,
     ensure_update_check_disabled,
     ensure_worker_guard_hook,
+    prepare_codex_launch,
     worker_guard_command,
     worker_guard_hook_status,
     gc_stale_project_trust_entries,
@@ -368,6 +370,14 @@ class TestClaudeTranslations(unittest.TestCase):
         self.assertEqual(command.argv.count("--permission-mode"), 1)
         self.assertEqual(command.argv[-2:], ("--permission-mode", "bypassPermissions"))
 
+    def test_interactive_launch_disables_file_mentions(self) -> None:
+        # T-5843: an injected '@/path' must never load a file pre-model on a seat.
+        command = self.adapter.build_interactive_launch(
+            TmuxTarget(session="recovery", window="harness", pane="0"),
+            cwd=Path("/tmp/launch"),
+        )
+        self.assertEqual(command.env.get("CLAUDE_CODE_DISABLE_FILE_MENTIONS"), "1")
+
     def test_claude_post_start_weekly_limit_is_subscription_cap_not_runtime_started(self) -> None:
         adapter = ClaudeHarnessAdapter(
             "orchestrator",
@@ -581,6 +591,51 @@ class TestClaudeTranslations(unittest.TestCase):
         self.assertNotIn("old turn", payload)
         self.assertNotIn("ready changed", payload)
         self.assertNotIn(str(transcript), payload)
+
+    def test_claude_interactive_completion_classifies_existing_monthly_spend_modal(self) -> None:
+        """T-6235: fallback-return can land directly on the blocking modal.
+
+        The first provider-completion baseline therefore already contains the
+        modal; requiring a post-baseline pane change misclassifies it as an
+        ordinary completion timeout instead of a subscription cap.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / "account"
+            (account_home / ".claude").mkdir(parents=True)
+            state_dir = root / "state" / "specialist" / "runtime-controller"
+            modal = (
+                Path(__file__).resolve().parent / "testdata" / "orchestrator_spend_limit_modal_pane.txt"
+            ).read_text(encoding="utf-8").replace("Sep 27", "Nov 8")
+            adapter = ClaudeHarnessAdapter("orchestrator", claude_home=account_home)
+            marker = "PANTHEON_PROVIDER_COMPLETION_t6235"
+            probe = adapter.prepare_interactive_provider_completion(
+                harness="claude",
+                profile="interactive-subscription",
+                persona="specialist",
+                account_home=account_home,
+                state_dir=state_dir,
+                pane_baseline=_post_start_sample(modal, 0),
+                submitted_at=datetime(2026, 11, 6, 1, 0, tzinfo=timezone.utc),
+                nonce_marker=marker,
+                nonce_sha256=hashlib.sha256(marker.encode("utf-8")).hexdigest(),
+            )
+            assert probe is not None
+            assessment = adapter.assess_interactive_provider_completion(
+                harness="claude",
+                profile="interactive-subscription",
+                probe=probe,
+                samples=(_post_start_sample(modal, 1),),
+            )
+
+        self.assertEqual(assessment.status, "subscription-cap")
+        self.assertEqual(assessment.cause, "provider-completion-subscription-cap")
+        self.assertEqual(assessment.pattern_id, "claude-monthly-spend-limit-modal")
+        self.assertEqual(assessment.cap_kind, "monthly-spend-limit")
+        self.assertEqual(
+            assessment.reset_at,
+            datetime(2026, 11, 8, 17, 0, tzinfo=timezone.utc),
+        )
 
     _HISTORY_SUBMITTED_AT = datetime(2026, 8, 14, 0, 0, 1, tzinfo=timezone.utc)
 
@@ -1249,9 +1304,36 @@ class TestParseClaudeMidSessionCapResetAt(unittest.TestCase):
         """T-4173: a past "Feb 29" in a leap year rolls to next year, which
         has no Feb 29; the docstring's never-raises contract means None
         (unparsed), not a ValueError out of the cap classifier."""
-        now = datetime(2028, 3, 1, 12, 0, 0, tzinfo=timezone.utc)
+        # T-5801: a reset only days past is now KEPT (not rolled), so the
+        # rollover is exercised from far enough past (> half a year).
+        now = datetime(2028, 12, 1, 12, 0, 0, tzinfo=timezone.utc)
         self.assertIsNone(
             _parse_claude_mid_session_cap_reset_at("Resets Feb 29, 5pm (UTC)", now=now)
+        )
+
+    # -- T-5801: a modal still shown AFTER its reset is not a year away ------
+
+    def test_dated_form_recently_passed_keeps_this_year(self) -> None:
+        # Live 2026-11-01 mason capture: re-parsed as 2027-11-01 before T-5801,
+        # so cap_modal_reaper read noop:pre-reset on a modal it exists to reap.
+        now = datetime(2026, 11, 1, 17, 35, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            _parse_claude_mid_session_cap_reset_at("Resets Nov 1, 5pm (UTC)", now=now),
+            datetime(2026, 11, 1, 17, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_dated_form_dec_to_jan_rolls_forward(self) -> None:
+        now = datetime(2026, 12, 31, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            _parse_claude_mid_session_cap_reset_at("Resets Jan 1, 5pm (UTC)", now=now),
+            datetime(2027, 1, 1, 17, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_dated_form_dec_reset_shown_in_jan_rolls_back(self) -> None:
+        now = datetime(2027, 1, 1, 1, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            _parse_claude_mid_session_cap_reset_at("Resets Dec 31, 5pm (UTC)", now=now),
+            datetime(2026, 12, 31, 17, 0, 0, tzinfo=timezone.utc),
         )
 
     def test_unparseable_text_returns_none(self) -> None:
@@ -1831,22 +1913,549 @@ class FakeCodexHooks:
         parsed = tomllib.loads((Path(codex_home) / "config.toml").read_text()) if (Path(codex_home) / "config.toml").exists() else {}
         hooks = parsed.get("hooks") or {}
         if not real:
-            for group in hooks.get("PreToolUse") or []:
-                self.scratch_definitions.append(group)
+            for event in ("PreToolUse", "SessionStart", "Stop"):
+                for group in hooks.get(event) or []:
+                    self.scratch_definitions.append(group)
         out = []
-        for g, group in enumerate(hooks.get("PreToolUse") or []):
-            for h, hook in enumerate(group.get("hooks") or []):
-                key = f"{config}:pre_tool_use:{g}:{h}"
-                current = self._hash(hook, group.get("matcher"), salt)
-                state = (hooks.get("state") or {}).get(key) or {}
-                stored = state.get("trusted_hash")
-                trust = "untrusted" if not stored else ("trusted" if stored == current else "modified")
-                out.append({"key": key, "eventName": "preToolUse", "handlerType": "command",
-                            "matcher": group.get("matcher"), "command": hook["command"],
-                            "timeoutSec": hook.get("timeout"), "sourcePath": str(config),
-                            "source": "user", "enabled": state.get("enabled", True), "isManaged": False,
-                            "currentHash": current, "trustStatus": trust})
+        event_names = {
+            "PreToolUse": ("pre_tool_use", "preToolUse"),
+            "SessionStart": ("session_start", "sessionStart"),
+            "Stop": ("stop", "stop"),
+        }
+        for event, (key_event, wire_event) in event_names.items():
+            for g, group in enumerate(hooks.get(event) or []):
+                for h, hook in enumerate(group.get("hooks") or []):
+                    key = f"{config}:{key_event}:{g}:{h}"
+                    current = self._hash(hook, group.get("matcher"), salt)
+                    state = (hooks.get("state") or {}).get(key) or {}
+                    stored = state.get("trusted_hash")
+                    trust = "untrusted" if not stored else ("trusted" if stored == current else "modified")
+                    out.append({"key": key, "eventName": wire_event, "handlerType": "command",
+                                "matcher": group.get("matcher"), "command": hook["command"],
+                                "timeoutSec": hook.get("timeout"), "sourcePath": str(config),
+                                "source": "user", "enabled": state.get("enabled", True), "isManaged": False,
+                                "currentHash": current, "trustStatus": trust})
         return out
+
+
+class LifecycleSourceResolutionTest(unittest.TestCase):
+    """T-4990: lifecycle orientation always comes from the bound persona."""
+
+    def test_real_tree_all_eight_codex_roles_resolve_persona_owned_sources(self) -> None:
+        import yaml
+
+        repo = Path(__file__).resolve().parents[1]
+        manifest = yaml.safe_load((repo / "instance.yaml").read_text(encoding="utf-8"))
+        default_harness = manifest["instance"]["harness_default"]
+        runtime_roles = manifest["harness_runtime"]["roles"]
+        bindings = {
+            role: binding
+            for role, binding in manifest["roles"].items()
+            if binding.get("harness", default_harness) == "codex"
+            or any(
+                str(item).split("/", 1)[0] == "codex"
+                for item in runtime_roles.get(role, {}).get("fallbacks", [])
+            )
+        }
+        expected = {
+            "codex": "codex.md",
+            "orchestrator": "orchestrator-codex.md",
+            "specialist": "specialist-codex.md",
+            "recovery": "recovery-codex.md",
+            "archivist": "archivist-codex.md",
+            "mason": "mason.md",
+            "artisan": "artisan.md",
+            "watchman": "watchman.md",
+        }
+        self.assertEqual({binding["persona"] for binding in bindings.values()}, set(expected))
+        self.assertEqual(len(bindings), 8)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for role, binding in bindings.items():
+                with self.subTest(role=role, persona=binding["persona"]):
+                    home = Path(tmp) / binding["account"]
+                    home.mkdir()
+                    (home / "pantheon-config").symlink_to(repo, target_is_directory=True)
+                    source = codex_adapter.lifecycle_source_path(home, binding["persona"])
+                    self.assertIsNotNone(source)
+                    self.assertTrue(source.is_file())
+                    self.assertEqual(
+                        source.resolve(),
+                        (repo / "pinned-rules" / expected[binding["persona"]]).resolve(),
+                    )
+
+        consultant_source = (repo / "pinned-rules" / "codex.md").resolve()
+        for persona in ("artisan", "mason", "watchman"):
+            self.assertNotEqual(
+                (repo / "pinned-rules" / expected[persona]).resolve(),
+                consultant_source,
+            )
+
+
+class EnsureLifecycleHooksTest(unittest.TestCase):
+    """T-4990: every Codex runtime gets trusted orientation lifecycle hooks."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name) / "seat"
+        hook_dir = self.home / "pantheon-config" / "harness" / "codex"
+        hook_dir.mkdir(parents=True)
+        (hook_dir / "run_codex_session_start_hook.py").write_text("# start\n")
+        (hook_dir / "run_codex_stop_hook.py").write_text("# stop\n")
+        rules = self.home / "pantheon-config" / "pinned-rules" / "specialist-codex.md"
+        rules.parent.mkdir(parents=True)
+        rules.write_text("# Specialist\n")
+        self.source = rules
+        self.codex_home = self.home / ".codex"
+        self.config = self.codex_home / "config.toml"
+        self.codex = FakeCodexHooks(real_home=self.codex_home)
+        pkg = Path(self._tmp.name) / "npm" / "@openai" / "codex"
+        (pkg / "bin").mkdir(parents=True)
+        (pkg / "bin" / "codex.js").write_text("// launcher\n")
+        (pkg / "package.json").write_text('{"version": "0.147.0"}\n')
+        self.codex_bin = Path(self._tmp.name) / "codex"
+        self.codex_bin.symlink_to(pkg / "bin" / "codex.js")
+        self.start = (
+            f"/usr/bin/python3 {hook_dir}/run_codex_session_start_hook.py "
+            f"--source {self.source}"
+        )
+        self.stop = f"/usr/bin/python3 {hook_dir}/run_codex_stop_hook.py"
+
+    def _ensure(self, read=None, **kwargs):
+        return ensure_lifecycle_hooks(
+            self.codex_home, self.home, source_path=self.source,
+            executable=self.codex_bin, read_hooks=read or self.codex,
+            **kwargs,
+        )
+
+    def _parsed(self):
+        return tomllib.loads(self.config.read_text())
+
+    def test_empty_config_gets_enabled_trusted_hooks_from_account_clone(self) -> None:
+        self.assertTrue(self._ensure())
+        parsed = self._parsed()
+        self.assertIs(parsed["features"]["hooks"], True)
+        [session] = parsed["hooks"]["SessionStart"]
+        [start_hook] = session["hooks"]
+        self.assertEqual(session["matcher"], "startup|resume|clear|compact")
+        self.assertEqual(
+            {k: start_hook[k] for k in ("type", "command", "statusMessage", "additionalContextLimit", "timeout")},
+            {"type": "command", "command": self.start, "statusMessage": "Loading Codex orientation",
+             "additionalContextLimit": 1200, "timeout": 5},
+        )
+        [stop_group] = parsed["hooks"]["Stop"]
+        [stop_hook] = stop_group["hooks"]
+        self.assertEqual(stop_hook, {"type": "command", "command": self.stop, "timeout": 5})
+        state = parsed["hooks"]["state"]
+        self.assertEqual(set(state), {
+            f"{self.config}:session_start:0:0", f"{self.config}:stop:0:0",
+        })
+        self.assertTrue(all(v["trusted_hash"].startswith("sha256:") for v in state.values()))
+
+    def test_current_config_is_idempotent_and_verified_marker_skips_app_server(self) -> None:
+        self.assertTrue(self._ensure())
+        before = self.config.read_bytes()
+        self.codex.calls = []
+        self.assertFalse(self._ensure())
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(self.codex.calls, [])
+
+    def test_stale_known_hooks_are_normalized_without_duplicates(self) -> None:
+        self.codex_home.mkdir()
+        self.config.write_text(
+            "[features]\nhooks = false\n\n"
+            "[[hooks.SessionStart]]\nmatcher = \"startup\"\n\n"
+            "[[hooks.SessionStart.hooks]]\ntype = \"command\"\n"
+            f"command = \"{self.start}\"\ntimeout = 60\n\n"
+            "[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\n"
+            f"command = \"{self.stop}\"\ntimeout = 60\n"
+        )
+        self.assertTrue(self._ensure())
+        parsed = self._parsed()
+        self.assertIs(parsed["features"]["hooks"], True)
+        self.assertEqual(len(parsed["hooks"]["SessionStart"]), 1)
+        self.assertEqual(len(parsed["hooks"]["Stop"]), 1)
+        self.assertEqual(parsed["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact")
+        self.assertEqual(parsed["hooks"]["SessionStart"][0]["hooks"][0]["timeout"], 5)
+        self.assertEqual(parsed["hooks"]["Stop"][0]["hooks"][0]["timeout"], 5)
+
+    def test_consultant_legacy_paths_are_accepted_and_trusted_not_rewritten(self) -> None:
+        legacy_dir = self.home / "codex-telegram"
+        legacy_dir.mkdir()
+        (legacy_dir / "run_codex_session_start_hook.py").write_text("# legacy start\n")
+        (legacy_dir / "run_codex_stop_hook.py").write_text("# legacy stop\n")
+        legacy_start = f"/usr/bin/python3 {self.home}/codex-telegram/run_codex_session_start_hook.py"
+        legacy_stop = f"/usr/bin/python3 {self.home}/codex-telegram/run_codex_stop_hook.py"
+        self.codex_home.mkdir()
+        self.config.write_text(
+            "[features]\nhooks = true\n\n"
+            "[[hooks.SessionStart]]\nmatcher = \"startup|resume|clear|compact\"\n\n"
+            "[[hooks.SessionStart.hooks]]\ntype = \"command\"\n"
+            f"command = \"{legacy_start}\"\nstatusMessage = \"Loading Codex orientation\"\n"
+            "additionalContextLimit = 1200\ntimeout = 5\n\n"
+            "[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\n"
+            f"command = \"{legacy_stop}\"\ntimeout = 5\n"
+        )
+        self.assertTrue(self._ensure(persona="codex"))
+        text = self.config.read_text()
+        self.assertIn(legacy_start, text)
+        self.assertIn(legacy_stop, text)
+        self.assertNotIn(self.start, text)
+        self.assertEqual(len(self._parsed()["hooks"]["SessionStart"]), 1)
+
+    def test_non_consultant_legacy_paths_are_migrated_to_the_account_clone(self) -> None:
+        legacy_start = f"/usr/bin/python3 {self.home}/codex-telegram/run_codex_session_start_hook.py"
+        legacy_stop = f"/usr/bin/python3 {self.home}/codex-telegram/run_codex_stop_hook.py"
+        self.codex_home.mkdir()
+        self.config.write_text(
+            "[features]\nhooks = true\n\n"
+            "[[hooks.SessionStart]]\nmatcher = \"startup|resume|clear|compact\"\n\n"
+            "[[hooks.SessionStart.hooks]]\ntype = \"command\"\n"
+            f"command = \"{legacy_start}\"\nstatusMessage = \"Loading Codex orientation\"\n"
+            "additionalContextLimit = 1200\ntimeout = 5\n\n"
+            "[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\n"
+            f"command = \"{legacy_stop}\"\ntimeout = 5\n"
+        )
+        self.assertTrue(self._ensure(persona="specialist"))
+        text = self.config.read_text()
+        self.assertIn(self.start, text)
+        self.assertIn(self.stop, text)
+        self.assertNotIn(legacy_start, text)
+        self.assertNotIn(legacy_stop, text)
+
+    def test_missing_entrypoint_skips_without_creating_config(self) -> None:
+        (self.home / "pantheon-config" / "harness" / "codex" / "run_codex_stop_hook.py").unlink()
+        self.assertFalse(self._ensure())
+        self.assertFalse(self.config.exists())
+        self.assertEqual(self.codex.calls, [])
+
+    def test_duplicate_known_session_hooks_are_refused_without_mutation(self) -> None:
+        self.codex_home.mkdir()
+        group = (
+            "[[hooks.SessionStart]]\nmatcher = \"startup|resume|clear|compact\"\n\n"
+            "[[hooks.SessionStart.hooks]]\ntype = \"command\"\n"
+            f"command = \"{self.start}\"\nstatusMessage = \"Loading Codex orientation\"\n"
+            "additionalContextLimit = 1200\ntimeout = 5\n\n"
+        )
+        original = "[features]\nhooks = true\n\n" + group + group
+        self.config.write_text(original)
+        with self.assertRaisesRegex(RuntimeError, "refusing ambiguity before mutation"):
+            self._ensure()
+        self.assertEqual(self.config.read_text(), original)
+        self.assertEqual(self.codex.calls, [])
+
+    def test_persona_selects_its_own_pinned_source(self) -> None:
+        self.assertTrue(ensure_lifecycle_hooks(
+            self.codex_home, self.home, persona="specialist", executable=self.codex_bin,
+            read_hooks=self.codex,
+        ))
+        self.assertIn(f"--source {self.source}", self.config.read_text())
+
+    def test_missing_compat_source_uses_same_persona_canonical_rules(self) -> None:
+        self.source.unlink()
+        canonical = self.home / "pantheon-config" / "pinned-rules" / "artisan.md"
+        canonical.write_text("# Artisan\n")
+        self.assertTrue(ensure_lifecycle_hooks(
+            self.codex_home, self.home, persona="artisan", executable=self.codex_bin,
+            read_hooks=self.codex,
+        ))
+        self.assertIn(f"--source {canonical}", self.config.read_text())
+
+    def test_missing_persona_source_refuses_before_config_or_trust_mutation(self) -> None:
+        self.source.unlink()
+        consultant = self.home / "pantheon-config" / "pinned-rules" / "codex.md"
+        consultant.write_text("# Consultant only\n")
+        self.assertFalse(ensure_lifecycle_hooks(
+            self.codex_home, self.home, persona="artisan", executable=self.codex_bin,
+            read_hooks=self.codex,
+        ))
+        self.assertFalse(self.config.exists())
+        self.assertEqual(self.codex.calls, [])
+
+    def test_disabled_hook_state_is_reenabled_and_reverified(self) -> None:
+        self.assertTrue(self._ensure())
+        text = self.config.read_text()
+        stop_key = f"{self.config}:stop:0:0"
+        parsed = tomllib.loads(text)
+        disabled = codex_adapter._set_hook_state_value(text, parsed, stop_key, "enabled", False)
+        self.assertIsNotNone(disabled)
+        self.config.write_text(disabled)
+        self.assertTrue(self._ensure())
+        state = self._parsed()["hooks"]["state"]
+        self.assertIs(state[stop_key]["enabled"], True)
+        hooks = self.codex(self.codex_bin, codex_home=self.codex_home, cwd=self.home)
+        stop = next(h for h in hooks if h["eventName"] == "stop")
+        self.assertEqual((stop["enabled"], stop["trustStatus"]), (True, "trusted"))
+
+    def test_failed_post_write_trust_verification_restores_original(self) -> None:
+        self.codex_home.mkdir()
+        self.config.write_text('model = "x"\n')
+
+        def scratch_only(executable, *, codex_home, cwd=None, timeout=15.0):
+            if os.path.realpath(codex_home) == os.path.realpath(self.codex_home):
+                return None
+            return self.codex(executable, codex_home=codex_home, cwd=cwd, timeout=timeout)
+
+        self.assertFalse(self._ensure(read=scratch_only))
+        self.assertEqual(self.config.read_text(), 'model = "x"\n')
+
+    def test_prepare_launch_wires_lifecycle_with_binding_persona(self) -> None:
+        binding = unittest.mock.Mock()
+        binding.account_home = self.home
+        binding.persona = "specialist"
+        binding.launch.executable = str(self.codex_bin)
+        with unittest.mock.patch.object(codex_adapter, "ensure_project_trusted"), \
+                unittest.mock.patch.object(codex_adapter, "ensure_update_check_disabled"), \
+                unittest.mock.patch.object(codex_adapter, "ensure_model_migration_prompts_hidden"), \
+                unittest.mock.patch.object(codex_adapter, "ensure_worker_guard_hook"), \
+                unittest.mock.patch.object(codex_adapter, "ensure_lifecycle_hooks") as lifecycle:
+            prepare_codex_launch(binding, cwd=self.home)
+        lifecycle.assert_called_once_with(
+            self.codex_home, self.home, executable=self.codex_bin, persona="specialist",
+        )
+
+
+class LifecycleWrongSourceRegressionTest(unittest.TestCase):
+    """T-4990 REBOUND #2: lifecycle identity cannot coexist or escape by spelling."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(__file__).resolve().parents[1]
+        pkg = Path(self._tmp.name) / "npm" / "@openai" / "codex"
+        (pkg / "bin").mkdir(parents=True)
+        (pkg / "bin" / "codex.js").write_text("// launcher\n")
+        (pkg / "package.json").write_text('{"version": "0.147.0"}\n')
+        self.codex_bin = Path(self._tmp.name) / "codex"
+        self.codex_bin.symlink_to(pkg / "bin" / "codex.js")
+
+    def _seat(self, persona: str, *, seat_name: str | None = None):
+        home = Path(self._tmp.name) / f"seat-{seat_name or persona}"
+        home.mkdir()
+        (home / "pantheon-config").symlink_to(self.repo, target_is_directory=True)
+        codex_home = home / ".codex"
+        codex_home.mkdir()
+        source = codex_adapter.lifecycle_source_path(home, persona)
+        self.assertIsNotNone(source)
+        self.assertTrue(source.is_file())
+        canonical_start, canonical_stop = codex_adapter.lifecycle_hook_commands(home, source)
+        wrong_source = home / "pantheon-config" / "pinned-rules" / "codex.md"
+        self.assertTrue(wrong_source.is_file())
+        repo_start, _legacy_start = codex_adapter._lifecycle_entrypoints(home, "SessionStart")
+        wrong_start = f"/usr/bin/python3 {repo_start} --source {wrong_source}"
+        fake = FakeCodexHooks(real_home=codex_home)
+        return home, codex_home, source, canonical_start, canonical_stop, wrong_start, fake
+
+    @staticmethod
+    def _config(starts: list[str], stop: str) -> str:
+        groups = []
+        for start in starts:
+            groups.append(
+                "[[hooks.SessionStart]]\nmatcher = \"startup|resume|clear|compact\"\n\n"
+                "[[hooks.SessionStart.hooks]]\ntype = \"command\"\n"
+                f"command = {json.dumps(start)}\n"
+                "statusMessage = \"Loading Codex orientation\"\n"
+                "additionalContextLimit = 1200\ntimeout = 5\n\n"
+            )
+        return (
+            "[features]\nhooks = true\n\n" + "".join(groups)
+            + "[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = \"command\"\n"
+            + f"command = {json.dumps(stop)}\ntimeout = 5\n"
+        )
+
+    @staticmethod
+    def _parsed_commands(config: Path, event: str) -> list[str]:
+        parsed = tomllib.loads(config.read_text())
+        return [
+            hook["command"]
+            for group in parsed["hooks"][event]
+            for hook in group["hooks"]
+        ]
+
+    def test_wrong_source_migrates_for_watchman_artisan_mason(self) -> None:
+        for persona in ("watchman", "artisan", "mason"):
+            with self.subTest(persona=persona):
+                (home, codex_home, _source, canonical_start, canonical_stop,
+                 wrong_start, fake) = self._seat(persona)
+                config = codex_home / "config.toml"
+                config.write_text(self._config([wrong_start], canonical_stop))
+
+                self.assertTrue(ensure_lifecycle_hooks(
+                    codex_home, home, executable=self.codex_bin, persona=persona,
+                    read_hooks=fake,
+                ))
+
+                parsed = tomllib.loads(config.read_text())
+                [session] = parsed["hooks"]["SessionStart"]
+                [start_hook] = session["hooks"]
+                self.assertEqual(start_hook["command"], canonical_start)
+                self.assertNotIn(wrong_start, config.read_text())
+                hooks = fake(self.codex_bin, codex_home=codex_home, cwd=home)
+                family = [h for h in hooks if h["eventName"] == "sessionStart"]
+                self.assertEqual(len(family), 1)
+                self.assertEqual(
+                    (family[0]["command"], family[0]["trustStatus"], family[0]["enabled"]),
+                    (canonical_start, "trusted", True),
+                )
+
+    def test_coexisting_canonical_and_wrong_source_refuses_before_mutation(self) -> None:
+        (home, codex_home, _source, canonical_start, canonical_stop,
+         wrong_start, fake) = self._seat("watchman")
+        config = codex_home / "config.toml"
+        original = self._config([canonical_start, wrong_start], canonical_stop)
+        config.write_text(original)
+
+        with self.assertRaisesRegex(RuntimeError, "refusing ambiguity before mutation"):
+            ensure_lifecycle_hooks(
+                codex_home, home, executable=self.codex_bin, persona="watchman",
+                read_hooks=fake,
+            )
+        self.assertEqual(config.read_text(), original)
+        self.assertEqual(fake.calls, [])
+
+    def test_malformed_or_extra_argument_family_candidate_refuses_before_mutation(self) -> None:
+        for case in ("missing-source", "malformed-source", "extra-argument", "quoted-malformed"):
+            with self.subTest(case=case):
+                (home, codex_home, source, _canonical_start, canonical_stop,
+                 _wrong_start, fake) = self._seat(
+                     "watchman", seat_name=f"watchman-{len(list(Path(self._tmp.name).glob('seat-*')))}",
+                 )
+                # The synthetic home still uses the real Watchman source/entrypoint;
+                # persona is explicit because the directory suffix is test isolation only.
+                source = codex_adapter.lifecycle_source_path(home, "watchman")
+                repo_start, _legacy = codex_adapter._lifecycle_entrypoints(home, "SessionStart")
+                commands = {
+                    "missing-source": f"/usr/bin/python3 {repo_start}",
+                    "malformed-source": f"/usr/bin/python3 {repo_start} --source \"",
+                    "extra-argument": (
+                        f"/usr/bin/python3 {repo_start} --source {source} --extra nope"
+                    ),
+                    "quoted-malformed": f'/usr/bin/python3 "{repo_start}" --source "',
+                }
+                command = commands[case]
+                config = codex_home / "config.toml"
+                original = self._config([command], canonical_stop)
+                config.write_text(original)
+
+                with self.assertRaisesRegex(RuntimeError, "refusing before mutation"):
+                    ensure_lifecycle_hooks(
+                        codex_home, home, executable=self.codex_bin, persona="watchman",
+                        read_hooks=fake,
+                    )
+                self.assertEqual(config.read_text(), original)
+                self.assertEqual(fake.calls, [])
+
+    def test_unmatched_opening_quote_family_evidence_refuses_without_mutation(self) -> None:
+        for label, quote in (("single", "'"), ("double", '"')):
+            with self.subTest(quote=label):
+                (home, codex_home, source, _canonical_start, canonical_stop,
+                 _wrong_start, fake) = self._seat(
+                     "watchman", seat_name=f"unmatched-{label}",
+                 )
+                repo_start, _legacy = codex_adapter._lifecycle_entrypoints(
+                    home, "SessionStart",
+                )
+                malformed = f"/usr/bin/python3 {quote}{repo_start} --source {source}"
+                config = codex_home / "config.toml"
+                original = self._config([malformed], canonical_stop)
+                config.write_text(original)
+
+                with self.assertRaisesRegex(RuntimeError, "refusing before mutation"):
+                    ensure_lifecycle_hooks(
+                        codex_home, home, executable=self.codex_bin, persona="watchman",
+                        read_hooks=fake,
+                    )
+                self.assertEqual(config.read_text(), original)
+                self.assertEqual(fake.calls, [])
+
+    def test_unmatched_opening_quote_coexistence_refuses_ambiguity(self) -> None:
+        for label, quote in (("single", "'"), ("double", '"')):
+            with self.subTest(quote=label):
+                (home, codex_home, source, canonical_start, canonical_stop,
+                 _wrong_start, fake) = self._seat(
+                     "watchman", seat_name=f"coexist-{label}",
+                 )
+                repo_start, _legacy = codex_adapter._lifecycle_entrypoints(
+                    home, "SessionStart",
+                )
+                malformed = f"/usr/bin/python3 {quote}{repo_start} --source {source}"
+                config = codex_home / "config.toml"
+                original = self._config([canonical_start, malformed], canonical_stop)
+                config.write_text(original)
+
+                with self.assertRaisesRegex(RuntimeError, "refusing ambiguity before mutation"):
+                    ensure_lifecycle_hooks(
+                        codex_home, home, executable=self.codex_bin, persona="watchman",
+                        read_hooks=fake,
+                    )
+                self.assertEqual(config.read_text(), original)
+                self.assertEqual(fake.calls, [])
+
+    def test_balanced_entrypoint_quotes_migrate_and_strict_boundaries_stay_unrelated(self) -> None:
+        for label, quote in (("single", "'"), ("double", '"')):
+            with self.subTest(kind="balanced", quote=label):
+                (home, codex_home, source, canonical_start, canonical_stop,
+                 _wrong_start, fake) = self._seat(
+                     "watchman", seat_name=f"balanced-{label}",
+                 )
+                repo_start, _legacy = codex_adapter._lifecycle_entrypoints(
+                    home, "SessionStart",
+                )
+                balanced = (
+                    f"/usr/bin/python3 {quote}{repo_start}{quote} --source {source}"
+                )
+                config = codex_home / "config.toml"
+                config.write_text(self._config([balanced], canonical_stop))
+
+                self.assertTrue(ensure_lifecycle_hooks(
+                    codex_home, home, executable=self.codex_bin, persona="watchman",
+                    read_hooks=fake,
+                ))
+                starts = self._parsed_commands(config, "SessionStart")
+                self.assertEqual(starts, [canonical_start])
+
+        for label, path_transform in (
+            ("prefix", lambda path: path.with_name(f"prefix-{path.name}")),
+            ("suffix", lambda path: Path(f"{path}.backup")),
+        ):
+            with self.subTest(kind="boundary", case=label):
+                (home, codex_home, source, canonical_start, canonical_stop,
+                 _wrong_start, fake) = self._seat(
+                     "watchman", seat_name=f"boundary-{label}",
+                 )
+                repo_start, _legacy = codex_adapter._lifecycle_entrypoints(
+                    home, "SessionStart",
+                )
+                unrelated = (
+                    f"/usr/bin/python3 {path_transform(repo_start)} --source {source}"
+                )
+                config = codex_home / "config.toml"
+                config.write_text(self._config([unrelated], canonical_stop))
+
+                self.assertTrue(ensure_lifecycle_hooks(
+                    codex_home, home, executable=self.codex_bin, persona="watchman",
+                    read_hooks=fake,
+                ))
+                self.assertEqual(
+                    self._parsed_commands(config, "SessionStart"),
+                    [unrelated, canonical_start],
+                )
+
+    def test_extra_argument_stop_family_candidate_refuses_before_mutation(self) -> None:
+        (home, codex_home, _source, canonical_start, canonical_stop,
+         _wrong_start, fake) = self._seat("watchman")
+        config = codex_home / "config.toml"
+        original = self._config([canonical_start], f"{canonical_stop} --extra nope")
+        config.write_text(original)
+
+        with self.assertRaisesRegex(RuntimeError, "refusing before mutation"):
+            ensure_lifecycle_hooks(
+                codex_home, home, executable=self.codex_bin, persona="watchman",
+                read_hooks=fake,
+            )
+        self.assertEqual(config.read_text(), original)
+        self.assertEqual(fake.calls, [])
 
 
 class EnsureWorkerGuardHookTest(unittest.TestCase):
@@ -1860,6 +2469,7 @@ class EnsureWorkerGuardHookTest(unittest.TestCase):
         self.home = Path(self._tmp.name) / "seat"
         (self.home / "pantheon-config" / "tools" / "hooks").mkdir(parents=True)
         (self.home / "pantheon-config" / "tools" / "hooks" / "worker-guard.py").write_text("# guard\n")
+        (self.home / "pantheon-config" / "tools" / "hooks" / "worker-guard-v2.py").write_text("# guard v2\n")
         self.codex_home = self.home / ".codex"
         self.config = self.codex_home / "config.toml"
         self.codex = FakeCodexHooks(real_home=self.codex_home)
@@ -1929,7 +2539,7 @@ class EnsureWorkerGuardHookTest(unittest.TestCase):
         self.assertEqual(group["matcher"], "Bash|apply_patch")
         self.assertTrue(self.cmd.startswith("/usr/bin/python3 -I "), self.cmd)
         # codex_hook_trust_check recognises the guard by this suffix; -I must not break it.
-        self.assertTrue(self.cmd.endswith("/pantheon-config/tools/hooks/worker-guard.py"))
+        self.assertTrue(self.cmd.endswith("/pantheon-config/tools/hooks/worker-guard-v2.py"))
 
     # --- fresh seat (T-4166, now one write) ---
 
@@ -2012,7 +2622,7 @@ class EnsureWorkerGuardHookTest(unittest.TestCase):
         self.assertEqual(self._guard_state()[f"{self.config}:pre_tool_use:0:0"], {"trusted_hash": self.new_hash})
 
     def test_seat_without_the_guard_script_is_left_untouched(self) -> None:
-        (self.home / "pantheon-config" / "tools" / "hooks" / "worker-guard.py").unlink()
+        (self.home / "pantheon-config" / "tools" / "hooks" / "worker-guard-v2.py").unlink()
         self.assertFalse(self._ensure())
         self.assertFalse(self.config.exists())
         self.assertEqual(self.codex.calls, [])
@@ -2509,6 +3119,223 @@ class EnsureWorkerGuardHookTest(unittest.TestCase):
         self.assertEqual((status["measurable"], status["ok"], status["trust_status"]), (False, False, None))
 
 
+class EnsureWorkerGuardV2Test(unittest.TestCase):
+    """T-6123: the canonical guard is worker-guard-v2.py (python3 -I, T-5695); exact v1 -I is the
+    operator ROLLBACK (kept on the launch path), and a second guard is never appended."""
+
+    KEY0 = "pre_tool_use:0:0"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name) / "seat"
+        hooks = self.home / "pantheon-config" / "tools" / "hooks"
+        hooks.mkdir(parents=True)
+        (hooks / "worker-guard.py").write_text("# guard\n")
+        (hooks / "worker-guard-v2.py").write_text("# guard v2\n")
+        self.codex_home = self.home / ".codex"
+        self.config = self.codex_home / "config.toml"
+        self.codex = FakeCodexHooks(real_home=self.codex_home)
+        self.v2 = f"/usr/bin/python3 -I {self.home}/pantheon-config/tools/hooks/worker-guard-v2.py"
+        self.v1 = f"/usr/bin/python3 -I {self.home}/pantheon-config/tools/hooks/worker-guard.py"
+        self.plain_v1 = self.v1.replace(" -I", "")
+        self.plain_v2 = self.v2.replace(" -I", "")
+        self.shell_box = f"/usr/bin/python3 -I {self.home}/pantheon-config/tools/oom/pantheon-codex-shell-box-hook.py"
+        pkg = Path(self._tmp.name) / "npm" / "@openai" / "codex"
+        (pkg / "bin").mkdir(parents=True)
+        (pkg / "bin" / "codex.js").write_text("// launcher\n")
+        (pkg / "package.json").write_text('{"version": "0.147.0"}\n')
+        self.codex_bin = Path(self._tmp.name) / "codex"
+        self.codex_bin.symlink_to(pkg / "bin" / "codex.js")
+        self.writes: list[str] = []
+        real_write = codex_adapter._write_config_preserving_mode
+
+        def spy(path, text):
+            self.writes.append(text)
+            return real_write(path, text)
+
+        patcher = unittest.mock.patch.object(codex_adapter, "_write_config_preserving_mode", spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _ensure(self, **kw):
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            out = ensure_worker_guard_hook(self.codex_home, self.home, executable=self.codex_bin,
+                                           read_hooks=self.codex, **kw)
+        self.stderr = err
+        return out
+
+    def _status(self):
+        return worker_guard_hook_status(self.codex_home, self.home, executable=Path("/usr/bin/codex"),
+                                        read_hooks=self.codex)
+
+    def _group(self, command, timeout=30, matcher="Bash|apply_patch"):
+        return (f'[[hooks.PreToolUse]]\nmatcher = "{matcher}"\n\n[[hooks.PreToolUse.hooks]]\n'
+                f'type = "command"\ncommand = "{command}"\ntimeout = {timeout}\n\n')
+
+    def _state(self, g, h, digest):
+        return f'[hooks.state."{self.config}:pre_tool_use:{g}:{h}"]\ntrusted_hash = "{digest}"\n\n'
+
+    def _h(self, command, timeout=30, matcher="Bash|apply_patch"):
+        return FakeCodexHooks.definition_hash(command, timeout, matcher)
+
+    def _write(self, text):
+        self.codex_home.mkdir(exist_ok=True)
+        self.config.write_text(text)
+        self.config.chmod(0o640)
+        return text
+
+    def _guards(self):
+        parsed = tomllib.loads(self.config.read_text())
+        return [h["command"] for g in parsed["hooks"]["PreToolUse"] for h in g["hooks"]
+                if h["command"].endswith("/pantheon-config/tools/hooks/worker-guard.py")
+                or h["command"].endswith("/pantheon-config/tools/hooks/worker-guard-v2.py")]
+
+    def _consultant(self, guard_cmd=None, trusted=True):
+        guard_cmd = guard_cmd or self.v2
+        sb = self._h(self.shell_box, 10, "Bash")
+        return self._write(
+            'model = "x"\n\n'
+            + self._group(guard_cmd) + self._group(self.shell_box, 10, "Bash")
+            + '[[hooks.SessionStart]]\n\n[[hooks.SessionStart.hooks]]\ntype = "command"\ncommand = "/bin/tg"\n\n'
+            + '[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "/bin/tg"\n\n'
+            + (self._state(0, 0, self._h(guard_cmd)) if trusted else "")
+            + self._state(1, 0, sb))
+
+    def test_canonical_command_is_v2_and_rollback_is_v1(self) -> None:
+        self.assertEqual(worker_guard_command(self.home), self.v2)
+        self.assertEqual(codex_adapter.rollback_worker_guard_command(self.home), self.v1)
+        self.assertEqual(set(codex_adapter._legacy_worker_guard_commands(self.home)),
+                         {self.plain_v1, self.plain_v2})
+
+    def test_consultant_shape_writes_and_appends_nothing(self) -> None:
+        original = self._consultant()
+        self.assertFalse(self._ensure())
+        self.assertEqual(self.config.read_text(), original)
+        self.assertEqual(self.writes, [])
+        parsed = tomllib.loads(original)
+        self.assertEqual(len(parsed["hooks"]["PreToolUse"]), 2)
+        self.assertEqual(self._guards(), [self.v2])
+
+    def test_consultant_shape_untrusted_guard_only_gains_its_hash(self) -> None:
+        self._consultant(trusted=False)
+        self.assertTrue(self._ensure())
+        self.assertEqual(self._guards(), [self.v2])
+        state = tomllib.loads(self.config.read_text())["hooks"]["state"]
+        self.assertEqual(state[f"{self.config}:{self.KEY0}"], {"trusted_hash": self._h(self.v2)})
+
+    def test_fresh_seat_gets_exactly_one_v2_guard_trusted_in_one_write(self) -> None:
+        self.assertTrue(self._ensure())
+        self.assertEqual(self._guards(), [self.v2])
+        state = tomllib.loads(self.config.read_text())["hooks"]["state"]
+        self.assertEqual(state[f"{self.config}:{self.KEY0}"], {"trusted_hash": self._h(self.v2)})
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+
+    def test_rollback_v1_trusted_is_left_alone_on_launch(self) -> None:
+        original = self._write(self._group(self.v1) + self._state(0, 0, self._h(self.v1)))
+        self.assertFalse(self._ensure())
+        self.assertEqual(self.config.read_text(), original)
+        self.assertEqual(self._guards(), [self.v1])
+
+    def test_rollback_v1_untrusted_gets_only_its_hash_and_stays_v1(self) -> None:
+        self._write(self._group(self.v1))
+        self.assertTrue(self._ensure())
+        self.assertEqual(self._guards(), [self.v1])
+        state = tomllib.loads(self.config.read_text())["hooks"]["state"]
+        self.assertEqual(state[f"{self.config}:{self.KEY0}"], {"trusted_hash": self._h(self.v1)})
+
+    def test_upgrade_rollback_rewrites_v1_to_v2_in_place_and_retrusts(self) -> None:
+        self._write(self._group(self.v1) + self._group(self.shell_box, 10, "Bash")
+                    + self._state(0, 0, self._h(self.v1)))
+        self.assertTrue(self._ensure(upgrade_rollback=True))
+        self.assertEqual(self._guards(), [self.v2])
+        parsed = tomllib.loads(self.config.read_text())
+        self.assertEqual(parsed["hooks"]["state"][f"{self.config}:{self.KEY0}"],
+                         {"trusted_hash": self._h(self.v2)})
+        self.assertEqual(len(parsed["hooks"]["PreToolUse"]), 2)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_stale_forms_are_upgraded_in_place_to_v2(self) -> None:
+        for stale, timeout in ((self.plain_v1, 10), (self.plain_v2, 30), (self.v1, 10), (self.v2, 10)):
+            with self.subTest(stale=stale, timeout=timeout):
+                self.writes.clear()
+                self._write(self._group(stale, timeout) + self._state(0, 0, self._h(stale, timeout)))
+                self.assertTrue(self._ensure())
+                self.assertEqual(self._guards(), [self.v2])
+                self.assertEqual(len(self.writes), 1)
+                parsed = tomllib.loads(self.config.read_text())
+                self.assertEqual(parsed["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 30)
+                self.assertEqual(parsed["hooks"]["state"][f"{self.config}:{self.KEY0}"],
+                                 {"trusted_hash": self._h(self.v2)})
+
+    def test_v1_alongside_v2_never_gets_a_third_guard(self) -> None:
+        original = self._write(self._group(self.v2) + self._group(self.v1)
+                               + self._state(0, 0, self._h(self.v2)) + self._state(1, 0, self._h(self.v1)))
+        self._ensure()
+        self.assertEqual(self.config.read_text(), original)
+        self.assertEqual(len(self._guards()), 2)
+
+    def test_edited_guard_command_is_refused_not_duplicated(self) -> None:
+        for edited in (self.v2 + " --x", self.v2.replace("/usr/bin/python3", "/opt/py/python3"),
+                       self.v1 + " --x"):
+            with self.subTest(edited=edited):
+                original = self._write(self._group(edited))
+                self.assertFalse(self._ensure())
+                self.assertEqual(self.config.read_text(), original)
+                self.assertIn("unrecognised worker-guard entry", self.stderr.getvalue())
+                self.assertEqual(self.writes, [])
+
+    def test_quoted_and_shell_wrapped_guard_commands_are_refused_not_duplicated(self) -> None:
+        script = f"{self.home}/pantheon-config/tools/hooks/worker-guard"
+        for edited in (f"/usr/bin/python3 '{script}-v2.py'",
+                       f'/usr/bin/python3 "{script}.py"',
+                       f"sh -c '{script}.py;true'"):
+            with self.subTest(edited=edited):
+                toml_cmd = edited.replace("\\", "\\\\").replace('"', '\\"')
+                original = self._write(self._group(toml_cmd))
+                self.assertFalse(self._ensure())
+                self.assertEqual(self.config.read_text(), original)
+                self.assertIn("unrecognised worker-guard entry", self.stderr.getvalue())
+                self.assertEqual(self.writes, [])
+                from tools.harness_adapter import codex
+                self.assertEqual(len(codex._guard_like_positions(tomllib.loads(original))), 1)
+
+    def test_guard_script_regex_boundaries(self) -> None:
+        from tools.harness_adapter import codex
+        base = "/h/pantheon-config/tools/hooks/"
+        for cmd in (base + "worker-guard-shadow.py", base + "worker-guard-v2.pyc",
+                    base + "worker-guard.py.bak"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(codex._GUARD_SCRIPT_RE.search("/usr/bin/python3 " + cmd))
+        for cmd in (base + "worker-guard.py", "'" + base + "worker-guard-v2.py'",
+                    base + "worker-guard.py;true", base + "worker-guard.py --x"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(codex._GUARD_SCRIPT_RE.search(cmd))
+
+    def test_status_v2_generation(self) -> None:
+        self._consultant()
+        status = self._status()
+        self.assertEqual((status["generation"], status["ok"], status["legacy_present"]), ("v2", True, False))
+
+    def test_status_rollback_generation_is_ok_when_trusted_and_alone(self) -> None:
+        self._write(self._group(self.v1) + self._state(0, 0, self._h(self.v1)))
+        status = self._status()
+        self.assertEqual((status["generation"], status["ok"], status["legacy_present"]),
+                         ("rollback-v1", True, False))
+        self._write(self._group(self.v1))
+        self.assertFalse(self._status()["ok"])
+
+    def test_status_v1_plus_v2_is_not_ok_and_legacy_present(self) -> None:
+        self._write(self._group(self.v2) + self._group(self.v1)
+                    + self._state(0, 0, self._h(self.v2)) + self._state(1, 0, self._h(self.v1)))
+        status = self._status()
+        self.assertEqual((status["generation"], status["ok"], status["legacy_present"]), ("v2", False, True))
+
+    def test_status_no_guard(self) -> None:
+        self.assertEqual((self._status()["generation"], self._status()["ok"]), (None, False))
+
+
 class GcStaleProjectTrustEntriesTest(unittest.TestCase):
     """Thin tests for the I/O-performing outer function + the manual CLI."""
 
@@ -2600,6 +3427,7 @@ class EnsureUpdateCheckDisabledTest(unittest.TestCase):
             config_path = codex_home / "config.toml"
             parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(parsed["check_for_update_on_startup"], False)
+            self.assertIs(parsed["features"]["apps"], False)
 
     def test_root_level_key_lands_before_existing_table_not_inside_it(self) -> None:
         # The load-bearing TOML-scoping correctness case: a bare append (like
@@ -2629,7 +3457,10 @@ class EnsureUpdateCheckDisabledTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             codex_home = Path(tmp)
             config_path = codex_home / "config.toml"
-            config_path.write_text("check_for_update_on_startup = true\n", encoding="utf-8")
+            config_path.write_text(
+                "check_for_update_on_startup = true\n\n[features]\napps = true\n",
+                encoding="utf-8",
+            )
             before = config_path.read_bytes()
             modified = ensure_update_check_disabled(codex_home)
             self.assertFalse(modified)
@@ -2663,6 +3494,46 @@ class EnsureUpdateCheckDisabledTest(unittest.TestCase):
             config_path.write_text("this is not [valid toml\n", encoding="utf-8")
             with self.assertRaises(RuntimeError):
                 ensure_update_check_disabled(codex_home)
+
+    # T-6257: codex_apps (the 0.147.0 ``apps`` feature) is not started on seats.
+    def test_apps_seed_joins_existing_features_table_without_duplicate_header(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp)
+            config_path = codex_home / "config.toml"
+            config_path.write_text(
+                "check_for_update_on_startup = false\n\n[features]\nhooks = true\n\n"
+                '[projects."/x"]\ntrust_level = "trusted"\n',
+                encoding="utf-8",
+            )
+            self.assertTrue(ensure_update_check_disabled(codex_home))
+            text = config_path.read_text(encoding="utf-8")
+            parsed = tomllib.loads(text)
+            self.assertEqual(text.count("[features]"), 1)
+            self.assertIs(parsed["features"]["hooks"], True)
+            self.assertIs(parsed["features"]["apps"], False)
+            self.assertEqual(parsed["projects"]["/x"]["trust_level"], "trusted")
+
+    def test_explicit_apps_true_is_preserved_while_update_guard_is_seeded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp)
+            config_path = codex_home / "config.toml"
+            config_path.write_text("[features]\napps = true\n", encoding="utf-8")
+            self.assertTrue(ensure_update_check_disabled(codex_home))
+            parsed = tomllib.loads(config_path.read_text(encoding="utf-8"))
+            self.assertIs(parsed["features"]["apps"], True)
+            self.assertIs(parsed["check_for_update_on_startup"], False)
+
+    def test_inline_features_table_skips_apps_seed_instead_of_breaking_toml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp)
+            config_path = codex_home / "config.toml"
+            config_path.write_text(
+                "check_for_update_on_startup = false\nfeatures = { hooks = true }\n",
+                encoding="utf-8",
+            )
+            before = config_path.read_bytes()
+            self.assertFalse(ensure_update_check_disabled(codex_home))
+            self.assertEqual(config_path.read_bytes(), before)
 
 
 # --------------------------------------------------------------------------- #

@@ -19,6 +19,8 @@ The operator's stated problem: interjecting while the HO is mid-arc "throws off 
 
 This extends the two-hemisphere precedent (ORG-042 / Archivist — a peer head with her own operator-facing channel) downward into a reporting tree: these seats are subordinate, not peers. D1 is the load-bearing principle — the chain absorbs variance so the operator's interface stays one conversation.
 
+> Read through (operator-ratified framing, not an ADR edit): the 2026-09-07 peer-orchestrator framing (the operator, TG 9294/9296/9298/9300; recorded in `pinned-rules/orchestrator.md` "Regular engineering orchestrators" and typed as role `engineering_orchestrator` in ORG-100): these seats are full orchestrators, peers with a chain position, autonomous within their own arcs at the head orchestrator's degree and not workers; "subordinate, not peers" above holds for the arc-routing chain (the operator -> Orchestrator -> seat) only.
+
 ## Decision
 
 1. **Two new daemon unix users** on the VPS, brought up per `sop/standard/pantheon-bringup.md` (with the 2026-07-20 Archivist field records). They **self-name** in their first supervised session (Archivist precedent); until then, bringup artifacts use placeholder ids `sub-a` / `sub-b`, normalized on naming.

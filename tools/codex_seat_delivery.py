@@ -90,6 +90,10 @@ HUNG_RECOVERY_ATTEMPTS = 1
 HUNG_RECOVERY_STATE_VERSION = 1
 BACKOFF_MAX_S = 60.0
 RECONNECT_PAGE_AFTER = 3
+#: T-6130: a FRESH thread has no rollout until the TUI runs its first turn, so
+#: thread/resume answers -32600 "no rollout found" meanwhile. That is a wait (bounded
+#: backoff, mail stays queued), not a hold. Past this many seconds it pages Recovery once.
+UNMATERIALIZED_PAGE_AFTER_S = 300.0
 FAILED_RETRIES = 3
 SEND_PHASE_WAIT_S = 120.0
 COMPACTION_PREFIX = "[re-delivery after compaction]"
@@ -399,6 +403,7 @@ class SeatDeliveryPath:
         self._auth_failed = False
         self._anomalies: list[dict] = []
         self._reconnect_failures = 0
+        self._unmaterialized_since: Optional[float] = None     # T-6130
         self._next_reconnect = 0.0
         self._last_hb = 0.0
         self._hb_misses = 0
@@ -627,6 +632,16 @@ class SeatDeliveryPath:
         tid = doc.get("thread_id") if isinstance(doc, dict) else None
         return tid if isinstance(tid, str) else None
 
+    def _recorded_unmaterialized(self) -> bool:
+        """T-6130: True only when the record says, explicitly, materialized: false (the
+        supervisor writes the key). A missing key, an unreadable record or true all
+        read False: the hard hold is the conservative answer."""
+        try:
+            doc = json.loads(self.b.thread_json.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return isinstance(doc, dict) and doc.get("materialized") is False
+
     def _check_identity(self, res: dict, account: Optional[dict]) -> None:
         pol = self.b.policy
         thread = res.get("thread") or {}
@@ -670,6 +685,10 @@ class SeatDeliveryPath:
             self._set_hold(HOLD_IDENTITY, f"identity check failed on {tid}: {exc}")
             return False
         except cd.RpcError as exc:
+            if exc.code == -32600 and "no rollout found" in exc.message \
+                    and self._recorded_unmaterialized():
+                client.close()
+                return self._unmaterialized_wait(f"thread/resume {tid}: {exc}")
             self._set_hold(HOLD_THREAD, f"thread/resume {tid} failed: {exc}. Not starting a "
                                         f"new thread over the seat's context; Recovery decides.")
             return False
@@ -677,6 +696,7 @@ class SeatDeliveryPath:
             client.close()
             return self._connect_failed(f"resume: {exc}")
         self._reconnect_failures = 0
+        self._unmaterialized_since = None
         self._hb_misses = 0
         self._last_hb = self.clock() - self.heartbeat_every \
             if self._hung_recovery_probe_required or self.readiness_publisher else self.clock()
@@ -688,6 +708,28 @@ class SeatDeliveryPath:
         with self._ev_lock:
             self._idle_edge = True      # a fresh connection is an idle transition
         return True
+
+    def _unmaterialized_wait(self, why: str) -> bool:
+        """T-6130: the recorded thread is fresh (never ran a turn), so it cannot resume
+        yet. Back off like a failed reconnect, never start a thread, never hold; page
+        Recovery once if it is still unmaterialized after UNMATERIALIZED_PAGE_AFTER_S."""
+        now = self.clock()
+        if self._unmaterialized_since is None:
+            self._unmaterialized_since = now
+        self._reconnect_failures += 1
+        delay = min(BACKOFF_MAX_S, 2 ** (self._reconnect_failures - 1))
+        self._next_reconnect = now + delay
+        self._audit("reconnect_failed", attempt=self._reconnect_failures, retry_in_s=delay,
+                    error=cd.preview(why, 200), unmaterialized=True)
+        waited = now - self._unmaterialized_since
+        if waited >= UNMATERIALIZED_PAGE_AFTER_S:
+            self.page("thread_unmaterialized", "codex thread never materialized",
+                      f"The recorded thread has had no rollout for {waited:.0f}s, so it cannot "
+                      f"resume and the seat's first turn has not run (boot prompt unsubmitted?). "
+                      f"{why}. Mail stays queued in {self.d['pending']}; retrying with backoff "
+                      f"up to {BACKOFF_MAX_S:.0f}s. No thread is started.")
+        self.client = None
+        return False
 
     def _connect_failed(self, why: str) -> bool:
         self._reconnect_failures += 1

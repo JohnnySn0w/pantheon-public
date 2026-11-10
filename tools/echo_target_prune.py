@@ -47,6 +47,21 @@ name). The newest unit of every name is never pruned this way, and the cost of a
 wrong guess is a rebuild, never a broken build: deletion is still whole-unit, under
 the cargo lock, in the same order. H is floored at MIN_SUPERSEDED_HOURS.
 
+SIZE CAP (T-6121, opt-in --max-gb N): unit-granular pruning cannot bound a live build's
+output (echo-target refilled ~10G/h, 2026-11-04). After the normal prune, if the target is
+still over N GB AND the .cargo-lock of EVERY profile can be acquired (all-or-nothing, the
+same flock cargo holds for a whole build, so none is running), every profile dir is emptied
+while all locks are held. This is the ONLY deletion coarser than a unit, and it is whole-
+profile, never partial: EVERY cargo lock file in a profile (.cargo-lock, held shared, and
+.cargo-build-lock / .cargo-artifact-lock, held exclusive by cargo 1.97) is kept, since
+unlinking one would let a new build lock a fresh inode while an old holder keeps the old
+one; so is anything outside the profile dirs. It also skips when any cargo/rustc process
+is running on the host (a test binary can run after cargo releases .cargo-lock), and when
+the pre-lock size walk itself fails (files churning under a build). On any skip the run
+deletes nothing, releases what it got, logs "SKIP cap" and still exits 0 (the disk
+monitor, tools/disk_usage_monitor.py, is the alert for the busy case). The noatime refusal still comes first, so the cap does not run
+there. The next build simply rebuilds from cold.
+
 Only /var/lib/pantheon/echo-target (or an explicit --target) is accepted;
 echo-evidence-targets is refused. Ambiguous linkage keeps the unit. --days is
 floored at 1.
@@ -69,6 +84,9 @@ FILE_HASH_RE = re.compile(r"-([0-9a-f]{16})(?=\.|$)")
 ABS_PATH_RE = re.compile(r"/[^\s=:\"']+")
 DIRECTIVE_RE = re.compile(r"^cargo::?(?P<key>[A-Za-z0-9_-]+)[=:]")
 IGNORED_DIRECTIVES = {"warning", "error", "rerun-if-changed", "rerun-if-env-changed"}
+# Every cargo lock file in a profile dir is kept by the cap (review of #1634): cargo
+# 1.97 holds .cargo-lock SHARED and .cargo-build-lock / .cargo-artifact-lock EXCLUSIVE.
+CARGO_LOCK_RE = re.compile(r"^\.cargo-.*lock$")
 
 
 class Refused(Exception):
@@ -91,15 +109,34 @@ def _real_dir(p):
     return os.path.isdir(p) and not os.path.islink(p)
 
 
+def _lock_only_profile(path):
+    """True for the recognizable zero-work layout left by a successful cap clear."""
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return False
+    if ".cargo-lock" not in entries:
+        return False
+    return all(CARGO_LOCK_RE.match(entry)
+               and os.path.isfile(os.path.join(path, entry))
+               and not os.path.islink(os.path.join(path, entry))
+               for entry in entries)
+
+
 def find_profiles(target):
-    """Profile dirs: target itself, children, or grandchildren holding a .fingerprint dir."""
+    """Recognizable profile dirs at target, child, or grandchild depth.
+
+    An active/non-empty profile has a real ``.fingerprint`` directory. A profile
+    successfully emptied by the size cap contains only its real Cargo lock files.
+    """
     cands = [target]
     for e in _ls(target):
         c = os.path.join(target, e)
         if _real_dir(c):
             cands.append(c)
             cands += [os.path.join(c, x) for x in _ls(c) if _real_dir(os.path.join(c, x))]
-    return [c for c in cands if os.path.isdir(os.path.join(c, ".fingerprint"))]
+    return [c for c in cands
+            if _real_dir(os.path.join(c, ".fingerprint")) or _lock_only_profile(c)]
 
 
 def check_scope(target):
@@ -111,7 +148,7 @@ def check_scope(target):
     if not os.path.isdir(real):
         raise Refused("refusing %s: not a directory" % target)
     if not find_profiles(real):
-        raise Refused("refusing %s: no cargo profile dirs (.fingerprint) found" % target)
+        raise Refused("refusing %s: no recognizable cargo profile dirs found" % target)
     return real
 
 
@@ -391,8 +428,96 @@ def prune_profile(profile, days, dry_run, lock_timeout, now=None, log=print,
     return res
 
 
+class Results(list):
+    """Per-profile result dicts, plus `.cap`: None (cap off) or a dict with
+    status in under-cap | cleared | would-clear | skipped-locked | skipped-busy |
+    skipped-measure, size/freed bytes."""
+    cap = None
+
+
+def _target_bytes(real):
+    return walk_stats(real)[1]
+
+
+def _scan_cargo(proc_root):
+    """First running cargo/rustc as 'comm (pid N)', else None. Unreadable entries are skipped."""
+    try:
+        pids = [p for p in os.listdir(proc_root) if p.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            with open(os.path.join(proc_root, pid, "comm")) as fh:
+                comm = fh.read().strip()
+        except OSError:
+            continue
+        if comm in ("cargo", "rustc") or comm.startswith("cargo-"):
+            return "%s (pid %s)" % (comm, pid)
+    return None
+
+
+def cargo_process_running():
+    """Belt-and-braces for the cap (review of #1634): a test binary can run while cargo
+    no longer holds .cargo-lock, so any live cargo/rustc on the host skips the clear."""
+    return _scan_cargo("/proc")
+
+
+def enforce_cap(real, profiles, max_gb, dry_run, lock_timeout, log, already_freed=0):
+    """Whole-profile clear when over `max_gb` and every profile lock is free. See docstring."""
+    cap_bytes = int(max_gb * (1 << 30))
+    try:
+        size = _target_bytes(real)
+    except OSError as ex:
+        # measured before any lock, i.e. while a build may churn files: unknown, not a crash
+        log("SKIP cap: size walk failed (%s); nothing deleted" % ex)
+        return {"status": "skipped-measure", "size": None, "cap": cap_bytes, "freed": 0}
+    if dry_run:
+        size = max(0, size - already_freed)
+    out = {"status": "under-cap", "size": size, "cap": cap_bytes, "freed": 0}
+    if size <= cap_bytes:
+        log("cap: %d bytes <= %d, nothing to do" % (size, cap_bytes))
+        return out
+    busy = cargo_process_running()
+    if busy:
+        log("SKIP cap: %d bytes > %d but %s is running; nothing deleted" % (size, cap_bytes, busy))
+        out["status"] = "skipped-busy"
+        return out
+    fds = []
+    try:
+        for prof in profiles:
+            fd = acquire_lock(prof, lock_timeout)
+            if fd is None:
+                log("SKIP cap: %d bytes > %d but %s .cargo-lock not acquired (build running "
+                    "or lock unopenable); nothing deleted" % (size, cap_bytes, prof))
+                out["status"] = "skipped-locked"
+                return out
+            fds.append(fd)
+        pre = "would clear" if dry_run else "clear"
+        nested = {os.path.realpath(q) for q in profiles}
+        freed = 0
+        for prof in profiles:
+            for e in _ls(prof):
+                q = os.path.join(prof, e)
+                if CARGO_LOCK_RE.match(e) or os.path.realpath(q) in nested:
+                    continue
+                try:
+                    freed += walk_stats(q)[1]
+                    log("cap: %s %s" % (pre, q))
+                    if not dry_run:
+                        safe_remove(q, prof)
+                except OSError as ex:
+                    out["errors"] = out.get("errors", 0) + 1
+                    log("ERROR cap %s: %s (continuing)" % (q, ex))
+        out["status"] = "would-clear" if dry_run else "cleared"
+        out["freed"] = freed
+        return out
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
 def prune_target(target, days=7.0, dry_run=False, lock_timeout=5.0, now=None, log=print,
-                 superseded_hours=None):
+                 superseded_hours=None, max_gb=None):
     if days < MIN_DAYS:
         raise Refused("refusing --days %s: minimum is %d" % (days, MIN_DAYS))
     if superseded_hours is not None and superseded_hours < MIN_SUPERSEDED_HOURS:
@@ -402,8 +527,15 @@ def prune_target(target, days=7.0, dry_run=False, lock_timeout=5.0, now=None, lo
     if not atime_supported(real):
         raise Refused("refusing %s: filesystem does not refresh atime (noatime?); last-use "
                       "staleness is unsafe and mtime-only would prune live dependencies" % target)
-    return [prune_profile(p, days, dry_run, lock_timeout, now, log, superseded_hours)
-            for p in find_profiles(real)]
+    if max_gb is not None and max_gb <= 0:
+        raise Refused("refusing --max-gb %s: must be positive" % max_gb)
+    profiles = find_profiles(real)
+    results = Results(prune_profile(p, days, dry_run, lock_timeout, now, log, superseded_hours)
+                      for p in profiles)
+    if max_gb is not None:
+        results.cap = enforce_cap(real, profiles, max_gb, dry_run, lock_timeout, log,
+                                  already_freed=sum(r["freed"] for r in results))
+    return results
 
 
 def main(argv=None):
@@ -415,10 +547,13 @@ def main(argv=None):
     ap.add_argument("--superseded-hours", type=float, default=None,
                     help="also prune units unused this long that a newer same-name unit "
                          "replaced (T-5249); off by default")
+    ap.add_argument("--max-gb", type=float, default=None,
+                    help="size cap (T-6121): when still over it after the normal prune and "
+                         "every profile .cargo-lock is free, empty the profile dirs; off by default")
     a = ap.parse_args(argv)
     try:
         results = prune_target(a.target, a.days, a.dry_run, a.lock_timeout,
-                               superseded_hours=a.superseded_hours)
+                               superseded_hours=a.superseded_hours, max_gb=a.max_gb)
     except Refused as e:
         print("echo_target_prune: %s" % e, file=sys.stderr)
         return 2
@@ -430,7 +565,12 @@ def main(argv=None):
             " REPAIRED=%s" % r["repaired"] if r["repaired"] else "",
             " ERRORS=%d" % r["errors"] if r["errors"] else ""))
     print("TOTAL %s %d bytes" % (verb, sum(r["freed"] for r in results)))
-    if any(r["errors"] for r in results):
+    cap = results.cap
+    if cap:
+        size = "unknown" if cap["size"] is None else "%d bytes" % cap["size"]
+        print("cap: %s (size %s, cap %d bytes, %s %d bytes)"
+              % (cap["status"], size, cap["cap"], verb, cap["freed"]))
+    if any(r["errors"] for r in results) or (cap and cap.get("errors")):
         return 3
     return 1 if any(r["repaired"] for r in results) else 0
 

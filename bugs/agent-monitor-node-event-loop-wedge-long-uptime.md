@@ -11,6 +11,7 @@ domain: "pantheon, agent-monitor, node, third-party, systemd-user"
 > disabled**; port 4820 is closed. Nothing consumed it — there is no `tailscale serve` config any more
 > (so the §Symptom URL below is also stale), and the only repo references were the watchdog's liveness
 > probe and documentation.
+> (2026-11-03, T-6033 follow-up: `dashboard:4820` had lingered in /etc/tailscale/services.conf, so tailscale-serve-restore kept re-applying svc:dashboard → 502. Line dropped and `tailscale serve clear svc:dashboard` run; restore = re-add the line and re-serve.)
 > **Do not run the Fix to "clear a wedge" — nothing is running to wedge.** Kept because it is the
 > reference if the dashboard is ever re-armed (`systemctl --user enable --now agent-monitor.service`,
 > plus the timer if the watchdog is wanted), and because T-2346 reattributed the failure history it

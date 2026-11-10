@@ -461,6 +461,53 @@ check_contains "rollback DRY-RUN block mentions control-plane scope teardown" "$
 check_contains "rollback DRY-RUN block mentions tmux kill-session guard" "$DRYRUN_BLOCK" "kill-session"
 check_contains "rollback DRY-RUN block shows the manifest pin and break-glass mode (T-4848)" "$DRYRUN_BLOCK" "--break-glass-no-manifest"
 
+# =============================================================================
+# Tier (a4): T-5956 companion pre-state snapshot. Hermetic -- a fake systemctl
+# on PATH reports a scripted ActiveState per unit; no real systemd touched.
+# The cutover records each companion's pre-state; the rollback restores only
+# those recorded active, and a missing snapshot or unrecorded unit keeps the
+# old restore-everything behaviour (unknown must not read as inactive).
+# =============================================================================
+SSBX="$(mktemp -d -t t5956_companion_snap.XXXXXX)"
+mkdir -p "$SSBX/bin"
+cat > "$SSBX/bin/systemctl" <<'EOF'
+#!/bin/bash
+# show <unit> -p ActiveState --value
+case "${3:-}" in
+  live.service) echo active ;;
+  retired.service) echo inactive ;;
+  failed.service) echo failed ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$SSBX/bin/systemctl"
+SNAP="$(companion_snapshot_path "$SSBX/home" specialist T0)"
+check "snapshot path is stamp-keyed under the account state dir" "$SNAP" "$SSBX/home/.local/state/pantheon/persona-cutover-specialist-T0.companions"
+PATH="$SSBX/bin:$PATH" companion_snapshot_write "$SNAP" live.service=s1 retired.service=s2 failed.service=s3 broken.service=s4
+check "snapshot records each companion's ActiveState (unknown when unreadable)" "$(tr '\n' ' ' < "$SNAP")" "live.service=active retired.service=inactive failed.service=failed broken.service=unknown "
+# Re-run with the same stamp after the first fire stopped the companions: the
+# first snapshot must survive (else the rollback would leave live units stopped).
+cat > "$SSBX/bin/systemctl" <<'EOF'
+#!/bin/bash
+echo inactive
+EOF
+PATH="$SSBX/bin:$PATH" companion_snapshot_write "$SNAP" live.service=s1 retired.service=s2
+check "same-stamp re-run keeps the first snapshot (live stays recorded active)" "$(head -1 "$SNAP")" "live.service=active"
+r() { if companion_should_restore "$1" "$2"; then echo restore; else echo leave; fi; }
+check "recorded active -> restore" "$(r "$SNAP" live.service)" restore
+check "recorded inactive -> leave stopped (the T-5946 revive bug)" "$(r "$SNAP" retired.service)" leave
+check "recorded failed -> leave stopped" "$(r "$SNAP" failed.service)" leave
+check "recorded unknown -> restore (unknown is not inactive)" "$(r "$SNAP" broken.service)" restore
+check "unit missing from snapshot -> restore" "$(r "$SNAP" other.service)" restore
+check "no snapshot (pre-T-5956 cutover) -> restore" "$(r "$SSBX/none.companions" retired.service)" restore
+check "prefix of another unit name does not match (live vs live2)" "$(printf 'live2.service=inactive\n' > "$SSBX/p.companions"; r "$SSBX/p.companions" live.service)" restore
+check "a longer name ending in the unit does not match (xlive vs live)" "$(printf 'xlive.service=inactive\n' > "$SSBX/q.companions"; r "$SSBX/q.companions" live.service)" restore
+rm -rf "$SSBX"
+check_contains "cutover records pre-state before stopping companions" "$(sed -n '/companion_snapshot_write/,/systemctl --user stop/p' "$CUTOVER")" "systemctl --user stop"
+check_contains "rollback execute path gates start on the snapshot" "$(sed -n '/T-5956: only companions/,/restored companion unit/p' "$ROLLBACK")" "companion_should_restore"
+check_contains "rollback verify gates on the snapshot" "$(sed -n '/every companion unit restored above must be active/,/NOT active FAIL/p' "$ROLLBACK")" "companion_should_restore"
+check_contains "rollback DRY-RUN reflects the snapshot gate" "$(sed -n '/DRY-RUN — would then run/,/Dry-run OK/p' "$ROLLBACK")" "companion_should_restore"
+
 echo "----------------------------------------"
 echo "$pass passed, $fail failed, $skipped skipped"
 [[ "$fail" -eq 0 ]]

@@ -900,11 +900,12 @@ def test_account_drift_is_refused_on_the_fake_host():
     assert "DRIFT" in h.preflight(h.admit("account.ensure", {"account": "alice"}, Hp.ACTIVATE)).detail
 
 
-def test_a_scheduled_stage_never_touches_the_fake_host():
+def test_a_scheduled_stage_is_refused_and_never_touches_the_fake_host():
     host, fake, _ = _pair()
     h = Hp.RootHelper(fake, M, Hp.SCHEDULED)
-    h.apply(h.admit("account.ensure", {"account": "alice"}, Hp.STAGE))
-    assert fake.get("staged:passwd:alice")["uid"] == 3101
+    with pytest.raises(Hp.ScheduledRootRefused):
+        h.admit("account.ensure", {"account": "alice"}, Hp.STAGE)
+    assert fake.get("staged:passwd:alice") is None
     assert all(argv[0] in READ_ONLY_BINARIES for argv in host.log)  # only observation ran
 
 
@@ -1570,6 +1571,7 @@ def test_parse_path_stat_fails_closed(stdout, rc, stderr):
         P.parse_path_stat("/srv", res(rc, stdout, stderr))
 
 
+@pytest.mark.nested_namespace
 def test_the_sandbox_root_is_ns_root_owned_so_the_walk_sees_a_trusted_root(real_sb):
     """T-5657: enter.sh chroots into a namespace-root tmpfs (and aborts otherwise), so the
     REAL row-4 stat of "/" reads root, and a real g+w ancestor is refused."""
@@ -1619,6 +1621,7 @@ def real_sb(tmp_path_factory):
     sb.close()
 
 
+@pytest.mark.nested_namespace
 def test_sandbox_real_binaries_observe_parses_like_the_sandbox_port(real_sb):
     """REAL getent/stat/sha256sum/getfacl/visudo in the T-2918 sandbox. ``enabled:`` is
     excluded: systemctl is faked there (fake-port tier; the real check is U4's)."""

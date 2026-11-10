@@ -21,6 +21,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import yaml
@@ -477,9 +478,15 @@ class VerifyTests(MailboxOnboardTestCase):
                 )
             }
         )
-        identity = mo.FakeHostIdentity(memberships={("acct-alice", "pantheon-mailbox"): (True, "ok")})
+        hub = self.mailbox_hub / "alice"  # T-6009: the maildir_acl row needs a scripted real-shape ACL to be green
+        acl = _acl_text().replace(f"{LIVE_HUB}/artisan", str(hub))
+        runner.scripted[("getfacl", "-p", str(hub), str(hub / "new"), str(hub / "tmp"))] = mo.CommandResult(0, acl, "")
+        identity = mo.FakeHostIdentity(
+            memberships={("acct-alice", "pantheon-mailbox"): (True, "ok")}, members={"pantheon-mailbox": MEMBERS}
+        )
         checks = mo.verify(ctx, bindings, runner, identity)
-        self.assertTrue(all(c.ok for c in checks))
+        self.assertTrue(all(c.ok for c in checks), [c for c in checks if not c.ok])
+        self.assertIn("maildir_acl", [c.name for c in checks])
 
     def test_red_case_missing_hub_dir_and_disabled_timer(self) -> None:
         # alice allowlisted -- disabled-when-should-be-enabled is the red
@@ -574,6 +581,57 @@ class VerifyAllowlistTests(MailboxOnboardTestCase):
         checks = mo.verify(ctx, bindings, runner, identity)
         by_name = {c.name: c for c in checks}
         self.assertFalse(by_name["wake_timer.not_enabled"].ok)
+
+
+# ---------------------------------------------------------------------------
+# T-6092: a missing observation binary is a failed check row, never an escape.
+# ---------------------------------------------------------------------------
+
+
+class _MissingBinaryRunner(mo.FakeCommandRunner):
+    """FakeCommandRunner whose host lacks one binary: run() raises like SubprocessCommandRunner does."""
+
+    def __init__(self, missing: str) -> None:
+        super().__init__()
+        self.missing = missing
+
+    def run(self, argv):
+        if argv[0] == self.missing:
+            self.calls.append(tuple(argv))
+            raise FileNotFoundError(2, "No such file or directory", argv[0])
+        return super().run(argv)
+
+
+class VerifyMissingBinaryTests(MailboxOnboardTestCase):
+    def _verify(self, missing: str, **ctx_kwargs):
+        ctx = self._load_ctx(personas=(("alice", "acct-alice"),), **ctx_kwargs)
+        self._make_hub_dir("alice")
+        bindings = mo._all_persona_bindings(ctx.manifest)
+        identity = mo.FakeHostIdentity(
+            memberships={("acct-alice", "pantheon-mailbox"): (True, "ok")}, members={"pantheon-mailbox": MEMBERS}
+        )
+        return {c.name: c for c in mo.verify(ctx, bindings, _MissingBinaryRunner(missing), identity)}
+
+    def test_acl_check_missing_getfacl_fails_naming_binary(self) -> None:
+        by_name = self._verify("getfacl", wake_timer_personas=("alice",))
+        self.assertFalse(by_name["maildir_acl"].ok)
+        self.assertIn("getfacl", by_name["maildir_acl"].detail)
+
+    def test_wake_timer_missing_systemctl_fails_closed_allowlisted(self) -> None:
+        by_name = self._verify("systemctl", wake_timer_personas=("alice",))
+        self.assertFalse(by_name["wake_timer.enabled"].ok)
+        self.assertIn("systemctl", by_name["wake_timer.enabled"].detail)
+
+    def test_wake_timer_missing_systemctl_fails_closed_not_allowlisted(self) -> None:
+        by_name = self._verify("systemctl", wake_timer_personas=())
+        self.assertFalse(by_name["wake_timer.not_enabled"].ok)
+        self.assertIn("systemctl", by_name["wake_timer.not_enabled"].detail)
+
+    def test_wake_timer_missing_systemctl_fails_closed_secondary(self) -> None:
+        by_name = self._verify("systemctl", wake_timer_personas=(), wake_timer_secondary_personas=("alice",))
+        self.assertFalse(by_name["wake_timer.secondary"].ok)
+        self.assertIn("systemctl", by_name["wake_timer.secondary"].detail)
+        self.assertNotIn("allowed secondary waker", by_name["wake_timer.secondary"].detail)
 
 
 # ---------------------------------------------------------------------------
@@ -910,7 +968,13 @@ class SecondaryWakeTimerTests(MailboxOnboardTestCase):
                 )
             }
         )
-        identity = mo.FakeHostIdentity(memberships={(f"acct-{persona}", "pantheon-mailbox"): (True, "ok")})
+        hub = self.mailbox_hub / persona  # T-6009: a scripted real-shape ACL keeps the maildir_acl row green
+        runner.scripted[("getfacl", "-p", str(hub), str(hub / "new"), str(hub / "tmp"))] = mo.CommandResult(
+            0, _acl_text().replace(f"{LIVE_HUB}/artisan", str(hub)), ""
+        )
+        identity = mo.FakeHostIdentity(
+            memberships={(f"acct-{persona}", "pantheon-mailbox"): (True, "ok")}, members={"pantheon-mailbox": MEMBERS}
+        )
         checks = mo.verify(ctx, bindings, runner, identity)
         return {c.name: c for c in checks}
 
@@ -1009,6 +1073,190 @@ class SecondaryWakeTimerTests(MailboxOnboardTestCase):
             frozenset({"artisan", "specialist", "recovery", "mason", "watchman"}),
         )
         self.assertFalse(ctx.wake_timer_personas & ctx.wake_timer_secondary_personas)
+
+
+# ---------------------------------------------------------------------------
+# T-6009: maildir ACL (parse_getfacl / acl_gaps / the verify_persona maildir_acl row).
+# FIXTURE is real `getfacl -p` output captured from the live hub (artisan, orchestrator, mason).
+# ---------------------------------------------------------------------------
+
+ACL_FIXTURE = REPO_ROOT / "tools" / "germinate" / "components" / "tests" / "fixtures" / "mailbox_getfacl_real.txt"
+LIVE_HUB = "/home/post-office/mailbox"
+MEMBERS = ("claude", "claude-research", "claude-fallback", "the-ancestor", "codex", "exocortex", "suborch1", "suborch2", "post-office", "codex-fallback")
+ARTISAN = (f"{LIVE_HUB}/artisan", f"{LIVE_HUB}/artisan/new", f"{LIVE_HUB}/artisan/tmp")
+
+
+def _acl_text() -> str:
+    return ACL_FIXTURE.read_text(encoding="utf-8")
+
+
+def _edit_block(text: str, path: str, fn) -> str:
+    """Apply fn(lines) -> lines to the one `# file: <path>` block of getfacl text."""
+
+    blocks = text.strip("\n").split("\n\n")
+    out = [("\n".join(fn(b.split("\n"))) if b.startswith(f"# file: {path}\n") else b) for b in blocks]
+    return "\n\n".join(out) + "\n"
+
+
+class ParseGetfaclTests(unittest.TestCase):
+    def test_parses_the_real_capture(self) -> None:
+        parsed = mo.parse_getfacl(_acl_text())
+        self.assertEqual(len(parsed), 9)
+        artisan = parsed[ARTISAN[0]]
+        self.assertEqual(artisan["owner"], "post-office")
+        self.assertEqual(artisan["access"]["suborch2"], "rwx")
+        self.assertEqual(artisan["default"]["suborch2"], "rwx")
+        self.assertEqual((artisan["mask"], artisan["default_mask"]), ("rwx", "rwx"))
+        self.assertEqual((artisan["owner_access"], artisan["owner_default"]), ("rwx", "rwx"))
+
+    def test_effective_comments_are_ignored(self) -> None:
+        parsed = mo.parse_getfacl("# file: /x\n# owner: o\nuser::rwx\nuser:a:rwx\t\t#effective:r--\nmask::r--\n")
+        self.assertEqual(parsed["/x"]["access"], {"a": "rwx"})
+        self.assertEqual(parsed["/x"]["mask"], "r--")
+
+    def test_empty_and_garbage_parse_to_nothing(self) -> None:
+        self.assertEqual(mo.parse_getfacl(""), {})
+        self.assertEqual(mo.parse_getfacl("getfacl: nope: No such file\nrubbish\n"), {})
+
+
+class AclGapsTests(unittest.TestCase):
+    def gaps(self, text: str, members=MEMBERS) -> tuple[str, ...]:
+        return mo.acl_gaps(mo.parse_getfacl(text), ARTISAN, members, "post-office")
+
+    def test_real_capture_has_no_gaps(self) -> None:
+        self.assertEqual(self.gaps(_acl_text()), ())
+
+    def test_missing_access_entry_names_account_path_and_kind(self) -> None:
+        text = _edit_block(_acl_text(), ARTISAN[1], lambda ls: [x for x in ls if x != "user:suborch2:rwx"])
+        [gap] = self.gaps(text)
+        self.assertIn("suborch2", gap)
+        self.assertIn(ARTISAN[1], gap)
+        self.assertIn("access", gap)
+
+    def test_missing_default_entry_names_account_path_and_kind(self) -> None:
+        text = _edit_block(_acl_text(), ARTISAN[2], lambda ls: [x for x in ls if x != "default:user:suborch2:rwx"])
+        [gap] = self.gaps(text)
+        self.assertTrue("suborch2" in gap and ARTISAN[2] in gap and "default" in gap, gap)
+
+    def test_short_entry_is_a_gap(self) -> None:
+        text = _edit_block(_acl_text(), ARTISAN[0], lambda ls: ["user:suborch2:r-x" if x == "user:suborch2:rwx" else x for x in ls])
+        [gap] = self.gaps(text)
+        self.assertIn("r-x", gap)
+
+    def test_mask_restriction_gaps_every_named_user_but_not_the_owner(self) -> None:
+        text = _edit_block(_acl_text(), ARTISAN[1], lambda ls: ["mask::r-x" if x == "mask::rwx" else x for x in ls])
+        gaps = self.gaps(text)
+        self.assertEqual(len(gaps), len(MEMBERS) - 1)  # post-office is satisfied by user::
+        self.assertTrue(all("masked by mask::r-x" in g and ARTISAN[1] in g and "access" in g for g in gaps), gaps)
+        self.assertFalse(any(g.startswith("post-office ") for g in gaps))
+
+    def test_default_mask_restriction_is_a_default_gap(self) -> None:
+        text = _edit_block(_acl_text(), ARTISAN[2], lambda ls: ["default:mask::r-x" if x == "default:mask::rwx" else x for x in ls])
+        gaps = self.gaps(text)
+        self.assertTrue(gaps and all("masked by default:mask::r-x" in g and "default" in g for g in gaps), gaps)
+
+    def test_a_path_absent_from_the_output_is_no_acl_observed(self) -> None:
+        blocks = _acl_text().strip("\n").split("\n\n")
+        text = "\n\n".join(b for b in blocks if not b.startswith(f"# file: {ARTISAN[2]}\n")) + "\n"
+        self.assertEqual(self.gaps(text), (f"{ARTISAN[2]}: no ACL observed",))
+
+    def test_empty_output_fails_closed_for_every_path(self) -> None:
+        self.assertEqual(self.gaps(""), tuple(f"{p}: no ACL observed" for p in ARTISAN))
+
+    def test_owner_needs_a_user_entry_only_when_it_owns_the_path(self) -> None:
+        text = _edit_block(_acl_text(), ARTISAN[0], lambda ls: [x for x in ls if x != "user::rwx"])
+        [gap] = self.gaps(text)
+        self.assertTrue("post-office" in gap and ARTISAN[0] in gap, gap)
+        self.assertEqual(self.gaps(_acl_text(), members=("post-office",)), ())
+        self.assertTrue(self.gaps(_acl_text(), members=("stranger",)))  # a member with no entry at all
+
+    def test_no_members_fails_closed(self) -> None:
+        [gap] = self.gaps(_acl_text(), members=())
+        self.assertIn("no mailbox group members", gap)
+
+
+class VerifyPersonaAclTests(MailboxOnboardTestCase):
+    def _run(self, text: str, members=MEMBERS, make_dir: bool = True):
+        ctx = self._load_ctx(personas=(("alice", "acct-alice"),), wake_timer_personas=("alice",), hub_owner="post-office")
+        if make_dir:
+            self._make_hub_dir("alice")
+        hub = self.mailbox_hub / "alice"
+        argv = ("getfacl", "-p", str(hub), str(hub / "new"), str(hub / "tmp"))
+        runner = mo.FakeCommandRunner(scripted={argv: mo.CommandResult(0, text.replace(f"{LIVE_HUB}/artisan", str(hub)), "")})
+        identity = mo.FakeHostIdentity(members={"pantheon-mailbox": members})
+        binding = mo._all_persona_bindings(ctx.manifest)[0]
+        return mo.verify_persona(ctx, binding, runner, identity), runner, argv
+
+    def test_row_is_after_hub_and_before_group_membership(self) -> None:
+        checks, runner, argv = self._run(_acl_text())
+        self.assertEqual([c.name for c in checks][:6], ["hub.tmp", "hub.new", "hub.cur", "maildir_acl", "group_membership", "wake_timer.enabled"])
+        [acl] = [c for c in checks if c.name == "maildir_acl"]
+        self.assertTrue(acl.ok, acl.detail)
+        self.assertIn(argv, runner.calls)
+
+    def test_gap_makes_the_row_fail_and_the_detail_lists_it(self) -> None:
+        text = _edit_block(_acl_text(), ARTISAN[0], lambda ls: [x for x in ls if x != "user:codex:rwx"])
+        [acl] = [c for c in self._run(text)[0] if c.name == "maildir_acl"]
+        self.assertFalse(acl.ok)
+        self.assertIn("codex", acl.detail)
+
+    def test_unscripted_getfacl_fails_closed(self) -> None:
+        checks, _r, _a = self._run("")
+        [acl] = [c for c in checks if c.name == "maildir_acl"]
+        self.assertFalse(acl.ok)
+        self.assertIn("no ACL observed", acl.detail)
+
+    def test_absent_maildir_emits_no_acl_row_and_runs_no_getfacl(self) -> None:
+        checks, runner, argv = self._run(_acl_text(), make_dir=False)
+        self.assertNotIn("maildir_acl", [c.name for c in checks])
+        self.assertNotIn(argv, runner.calls)
+
+    def test_host_identity_group_members(self) -> None:
+        self.assertEqual(mo.FakeHostIdentity(members={"g": ["a", "b"]}).group_members("g"), ("a", "b"))
+        self.assertEqual(mo.FakeHostIdentity().group_members("g"), ())
+        self.assertEqual(mo.RealHostIdentity().group_members("no-such-group-t6009"), ())
+        with patch("tools.mailbox_onboard.grp.getgrnam") as getgrnam, patch("tools.mailbox_onboard.pwd.getpwall") as getpwall:
+            getgrnam.return_value.gr_mem = ["x", "y"]
+            getgrnam.return_value.gr_gid = 1006
+            getpwall.return_value = ()
+            self.assertEqual(mo.RealHostIdentity().group_members("g"), ("x", "y"))
+
+    def test_host_identity_group_members_includes_primary_gid_accounts(self) -> None:
+        """recovery D15: gr_mem omits accounts whose PRIMARY gid is the group; they must be counted."""
+        with patch("tools.mailbox_onboard.grp.getgrnam") as getgrnam, patch("tools.mailbox_onboard.pwd.getpwall") as getpwall:
+            getgrnam.return_value.gr_mem = ["x"]
+            getgrnam.return_value.gr_gid = 1006
+            getpwall.return_value = (
+                SimpleNamespace(pw_name="x", pw_gid=1006),       # both: listed once
+                SimpleNamespace(pw_name="prim", pw_gid=1006),    # primary-gid only
+                SimpleNamespace(pw_name="other", pw_gid=1000),   # not in the group
+            )
+            self.assertEqual(mo.RealHostIdentity().group_members("g"), ("x", "prim"))
+
+    def test_primary_gid_only_member_without_an_acl_entry_is_a_gap(self) -> None:
+        """recovery D15: an account in the group only via its primary gid, with no ACL entry, is named."""
+        parsed = mo.parse_getfacl(
+            "# file: /hub/alice\n# owner: post-office\n# group: pantheon-mailbox\nuser::rwx\n"
+            "user:x:rwx\ngroup::---\nmask::rwx\nother::---\n"
+            "default:user::rwx\ndefault:user:x:rwx\ndefault:group::---\ndefault:mask::rwx\ndefault:other::---\n"
+        )
+        gaps = mo.acl_gaps(parsed, ("/hub/alice",), ("x", "prim"), "post-office")
+        self.assertTrue(gaps)
+        self.assertTrue(all("prim" in g for g in gaps), gaps)
+        self.assertTrue(any("access" in g for g in gaps) and any("default" in g for g in gaps), gaps)
+
+    def test_cli_verify_exits_nonzero_on_an_acl_gap(self) -> None:
+        self._write_manifest(personas=(("alice", "acct-alice"),), wake_timer_personas=("alice",), hub_owner="post-office")
+        self._make_hub_dir("alice")
+        hub = self.mailbox_hub / "alice"
+        argv = ("getfacl", "-p", str(hub), str(hub / "new"), str(hub / "tmp"))
+        runner = mo.FakeCommandRunner(scripted={("systemctl", "--user", "is-enabled", "pantheon-mailbox-wake@alice.timer"): mo.CommandResult(0, "enabled\n", "")})
+        identity = mo.FakeHostIdentity(memberships={("acct-alice", "pantheon-mailbox"): (True, "ok")}, members={"pantheon-mailbox": MEMBERS})
+        rc = mo.main(["verify", "--manifest", str(self.manifest_path), "--repo-root", str(REPO_ROOT)], runner=runner, host_identity=identity)
+        self.assertEqual(rc, 1)  # unscripted getfacl: empty output, every path a gap
+        runner.scripted[argv] = mo.CommandResult(0, _acl_text().replace(f"{LIVE_HUB}/artisan", str(hub)), "")
+        rc = mo.main(["verify", "--manifest", str(self.manifest_path), "--repo-root", str(REPO_ROOT)], runner=runner, host_identity=identity)
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

@@ -639,7 +639,18 @@ def send(recipient_inbox, payload, sender: str, *, subject: str | None = None,
 # while two seats spent a night on precisely the failure it exists to prevent.
 #
 # The maildir is the RECIPIENT's record. Nothing was ever the sender's.
-_SENT_LEDGER = Path.home() / ".local" / "state" / "pantheon" / "sent.jsonl"
+
+
+def _default_sent_ledger() -> Path:
+    """Resolve the sender ledger from the call-time state root.
+
+    Pytest redirects ``PANTHEON_STATE_DIR`` after this module may already have
+    been imported.  Capturing ``Path.home()`` in a module constant therefore
+    bypasses that isolation; the fallback is deliberately evaluated here.
+    """
+    state_dir = os.environ.get("PANTHEON_STATE_DIR", "").strip()
+    root = Path(state_dir) if state_dir else Path.home() / ".local" / "state" / "pantheon"
+    return root / "sent.jsonl"
 
 
 def _manifest_hub() -> str:
@@ -685,7 +696,7 @@ def _ledger_target(inbox: Path) -> Path | None:
             return None          # not a real hub delivery — a fixture, not a send
     except (OSError, ImportError):
         return None              # cannot tell where it went -> do not claim we sent it
-    return _SENT_LEDGER
+    return _default_sent_ledger()
 
 
 def _record_sent(inbox: Path, record: dict, name: str) -> None:
@@ -727,7 +738,7 @@ def sent_ledger_path() -> Path:
     """Where this account's sent ledger lives, honouring PANTHEON_SENT_LEDGER.
     Exposed so tooling and an operator can find it without re-deriving the path."""
     override = os.environ.get("PANTHEON_SENT_LEDGER", "").strip()
-    return Path(override) if override else _SENT_LEDGER
+    return Path(override) if override else _default_sent_ledger()
 
 
 # -------------------------------------------------------------------------- consume

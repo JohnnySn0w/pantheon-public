@@ -207,21 +207,26 @@ def classify(reports: list[pr.SeatReport]) -> Findings:
     )
 
 
-def _seat_in_maintenance(seat: str) -> bool:
-    """T-5254: True iff `seat` (a persona name — SeatReport.seat is SeatBinding.persona, the
-    same key space as notify_policy) is in an ACTIVE seat-maintenance window. Fail-open."""
+def _seat_state_mod():
+    """ORG-106 (T-5585): the seat_state module, importable from a package or a bare run."""
     try:
-        try:
-            from tools.notify_policy import in_maintenance
-        except ImportError:  # bare run with cwd=tools/
-            from notify_policy import in_maintenance  # type: ignore
-        return bool(in_maintenance(seat))
-    except Exception:  # noqa: BLE001 — a registry fault must never silence a real alert
-        return False
+        from tools import seat_state
+    except ImportError:  # bare run with cwd=tools/
+        import seat_state  # type: ignore
+    return seat_state
 
 
 def held_seats(findings: Findings, in_maintenance=None) -> tuple[str, ...]:
-    check = in_maintenance or _seat_in_maintenance  # resolved per call: patchable
+    """T-5254 / T-5585: seats whose findings are HELD (not paged) because a seat-maintenance
+    window is ACTIVE. Predicate: seat_state.maintenance_active, the shared fail-open wrapper
+    (SeatReport.seat is a persona name, the notify_policy key space). Chosen over
+    remediation_vetoed because this is an observation-side exclusion of a deliberate operator
+    hold, not an action-side veto: remediation_vetoed also covers deep-sleep and U5 pauses and
+    needs a cross-account seat-state read, which would change which seats are held. A
+    deep-sleep or halted seat is therefore NOT held here, exactly as before (unchanged
+    semantics, no new ones invented). A registry fault reads not-held, silently, as before.
+    `in_maintenance` is a test seam."""
+    check = in_maintenance or _seat_state_mod().maintenance_active  # resolved per call: patchable
     return tuple(s for s in findings.all_seats if check(s))
 
 

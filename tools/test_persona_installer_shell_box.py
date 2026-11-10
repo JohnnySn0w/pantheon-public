@@ -90,7 +90,12 @@ class PlanShapeTests(PeriodicCase):
         self.assertIn(OP_ID, {o.operation_id for o in residue})
         self.assertNotIn(OP_ID, {o.operation_id for o in broker.operations})
         # T-5470 (HO ruling 2026-10-26): routed launches have their own bound; B8 counts the rest
-        self.assertLessEqual(len([o for o in residue if o.kind not in EXECUTOR_KIND_CLASSES]), SEAT_LOCAL_RESIDUE_LIMIT)
+        # T-5961 (orchestrator ruling on B8): the fleet-usage periodic-timer ops are a separate bucket
+        from tools.host_control.planner import residue_bucket_counts
+
+        self.assertLessEqual(residue_bucket_counts(
+            (o.kind, o.target) for o in residue if o.kind not in EXECUTOR_KIND_CLASSES)[0],
+            SEAT_LOCAL_RESIDUE_LIMIT)
 
     def test_codex_only_seat_gets_no_op_and_a_not_applicable_plan_note(self) -> None:
         plan = self.plan("consultant")
@@ -122,7 +127,12 @@ class PlanShapeTests(PeriodicCase):
                 plan = installer.plan(manifest, persona, root=self.root / "real")
                 # T-5470 (HO ruling 2026-10-26): routed launches have their own bound; B8 counts the rest
                 residue = partition_installer_plan(plan)[1]
-                self.assertLessEqual(len([o for o in residue if o.kind not in EXECUTOR_KIND_CLASSES]), SEAT_LOCAL_RESIDUE_LIMIT)
+                # T-5961 (orchestrator ruling on B8): the fleet-usage periodic-timer ops are a separate bucket
+                from tools.host_control.planner import residue_bucket_counts
+
+                self.assertLessEqual(residue_bucket_counts(
+                    (o.kind, o.target) for o in residue if o.kind not in EXECUTOR_KIND_CLASSES)[0],
+                    SEAT_LOCAL_RESIDUE_LIMIT)
 
 
 # ---------------------------------------------------------------------------
@@ -506,9 +516,20 @@ class VerifySeatContainmentTests(PeriodicCase):
         self.fallback.write_text("shell-box: no user manager, running unboxed\n")
         self.assertFalse(self.by_name(self.run_checks())["fallback-log"]["ok"])
 
-    def test_codex_only_seat_reports_not_applicable_and_passes(self) -> None:
+    def test_seat_with_no_containment_op_reports_not_applicable_and_passes(self) -> None:
+        # T-5480: codex-only seats are no longer "not applicable" (they carry the codex hook op);
+        # only a plan with NEITHER op is.
+        import dataclasses
+
         plan = self.plan("consultant")
-        checks = vs.containment_checks(plan, env={}, which=lambda name: None)
+        stripped = dataclasses.replace(
+            plan,
+            operations=tuple(o for o in plan.operations
+                             if o.kind not in (_pim.SETTINGS_ENV_KIND, _pim.CODEX_HOOK_KIND)),
+            provenance={**plan.provenance,
+                        "shell_box_containment": "not-applicable: no claude runtime candidate"},
+        )
+        checks = vs.containment_checks(stripped, env={}, which=lambda name: None)
         self.assertEqual(len(checks), 1)
         self.assertEqual(checks[0]["name"], "containment-applicable")
         self.assertTrue(checks[0]["ok"])

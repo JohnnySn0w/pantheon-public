@@ -373,6 +373,21 @@ def known_repos(repo_root: Path) -> set[str]:
     return names
 
 
+def repo_pins(repo_root: Path) -> dict[str, Any]:
+    """{repo name: repos.yaml ``revision`` value} for rows that carry one (ORG-081 §7, T-5113).
+
+    Values are returned raw: the caller refuses a malformed pin rather than silently dropping it.
+    """
+    if not (repo_root / REPOS_REL).exists():
+        return {}  # no pins: every external row stays fail-closed
+    data = load_file(repo_root / REPOS_REL) or {}
+    return {
+        entry["name"]: entry["revision"]
+        for entry in data.get("repos") or []
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str) and "revision" in entry
+    }
+
+
 def _check_tickets_exist(sink: _Sink, refs: Iterable[tuple[str, str, bool]], repo_root: Path) -> None:
     tickets_dir = repo_root / TICKETS_REL
     for where, ticket, closes_gap in refs:
@@ -436,9 +451,11 @@ class ExternalResolver(Protocol):
     """ORG-081 §7: fetch an external repo's contract module at a pinned revision.
 
     Returns a local path to the module's bytes at ``revision``, or None if the
-    file does not exist there. The git-backed resolver is deferred: repos.yaml
-    carries no revision pins yet (T-5074 bubble 11), so validation without a
-    resolver refuses every pinned external row.
+    file does not exist there. repos.yaml's per-repo ``revision`` is the ratified
+    pin (T-5113); ``tools.germinate.registry.git_resolver.GitExternalResolver`` is the
+    git-backed implementation, opt-in via ``registry validate --resolve-external``.
+    Without a resolver, validation refuses every pinned external row (fail-closed).
+    A resolver may raise ``Exception`` for fetch failures; those become findings.
     """
 
     def resolve(self, repo: str, revision: str, module: str) -> Path | None: ...
@@ -528,6 +545,7 @@ def check_contracts(doc: Mapping, repo_root: Path, resolver: ExternalResolver | 
         and S.DIGEST_RE.match(r["contract"]["digest"])
     ]
     op_registry = _merged_op_registry(sink, doc, repo_root) if pinned else None
+    pins = repo_pins(repo_root) if pinned else {}
     for row in doc.get("systems") or []:
         if not isinstance(row, dict) or row.get("kind") != S.KIND_COMPONENT:
             continue
@@ -562,16 +580,32 @@ def check_contracts(doc: Mapping, repo_root: Path, resolver: ExternalResolver | 
             revision = contract.get("repo_revision")
             if not isinstance(revision, str):
                 continue  # structural error already reported
+            repo = contract["repo"]
+            pin = pins.get(repo)
             if resolver is None:
+                hint = "" if pin is not None else f"; {REPOS_REL} has no revision pin for {repo}"
                 sink.err(
                     f"{rid}.contract",
-                    f"external contract {contract.get('repo')}:{module}@{revision} cannot be resolved: no resolver "
-                    "is configured (ORG-081 §7; fail-closed)",
+                    f"external contract {repo}:{module}@{revision} cannot be resolved: no resolver "
+                    f"is configured (ORG-081 §7; fail-closed){hint}",
                 )
                 continue
-            resolved = resolver.resolve(contract["repo"], revision, module)
+            if pin is None:
+                sink.err(f"{rid}.contract", f"{repo} has no revision pin in {REPOS_REL}; an unpinned external repo is refused (ORG-081 §7)")
+                continue
+            if not (isinstance(pin, str) and S.REVISION_RE.match(pin)):
+                sink.err(f"{rid}.contract", f"{REPOS_REL} revision {pin!r} for {repo} is not a 40-hex commit sha")
+                continue
+            if revision != pin:
+                sink.err(f"{rid}.contract", f"repo_revision {revision} != {REPOS_REL} pin {pin} for {repo} (ORG-081 D-9)")
+                continue
+            try:
+                resolved = resolver.resolve(repo, revision, module)
+            except Exception as exc:  # a fetch failure is a finding; the validator never crashes on a remote
+                sink.err(f"{rid}.contract", f"external contract {repo}:{module}@{revision} cannot resolve: {exc} (ORG-081 §7)")
+                continue
             if resolved is None:
-                sink.err(f"{rid}.contract", f"{contract['repo']}@{revision} has no {module} (ORG-081 §7)")
+                sink.err(f"{rid}.contract", f"{repo}@{revision} has no {module} (ORG-081 §7)")
                 continue
             path = Path(resolved)
         _check_one_contract(sink, rid, row, path, op_registry)

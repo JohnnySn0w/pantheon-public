@@ -7,7 +7,7 @@ covering a hookless clone or a `--no-verify` push — did not execute on origin 
 NOTHING SAID SO. Not one alert. The outage produced no red runs because it produced no runs.
 
 WHY NOT A REQUIRED STATUS CHECK, which is the obvious fix and is a no-op here (T-2392):
-protect-main's bypass_actors are DeployKey and User 33181572, both bypass_mode "always", and
+protect-main's bypass_actors are DeployKey and User 12345678, both bypass_mode "always", and
 every fleet push lands directly on main with no PR — proven by pushing d65d42248 that way while
 the ruleset's pull_request rule was active. A required_status_checks rule would gate a PR from a
 non-bypass contributor, i.e. nobody, while making the ruleset READ as though the audit were

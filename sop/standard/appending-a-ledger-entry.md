@@ -29,6 +29,7 @@ You're writing a decision, arc close, catch-up or post-cap-hit-resume record int
    print(ls.append_entry(Path('ledger'), entry), entry["id"])
    PY
    ```
+   **Build and validate BEFORE acting; never hand-write a row** (T-4739, orchestrator ruling 2026-11-03). When the entry records an action you are about to take, build the dict and run `ls.validate_entry(entry)` (it returns the list of ORG-001 problems; empty means valid) BEFORE the action, then act, then `append_entry`. Once ORG-001 enforcement is on, `append_entry` refuses an invalid entry, and an entry refused after the action leaves the action unrecorded. Every row goes through `append_entry`: a row written any other way skips the check, and the pre-commit ledger lint rejects added lines that break ORG-001.
    Field names and rules follow ORG-001 (`ledger/README.md` defers to it):
    - `id` is `<ts>-<slug>`: the entry's own `ts`, then a lowercase kebab-case slug.
    - `agent` is your ORG-100 role id (`agent_role_map.resolve_role(<persona>)` gives it), or `human:operator` for an entry the operator writes. Never a persona name: persona names are kept out so the ledger can be published without a scrub.
@@ -51,6 +52,7 @@ You're writing a decision, arc close, catch-up or post-cap-hit-resume record int
 - A placeholder timestamp (`T-boot`). The `Date.now()` ban is for Workflow scripts only; in bash, use `date -u`.
 - Appending to last week's shard on a Monday (use `append_entry`, which shards by the entry's own ts).
 - Copying another seat's `executor` value, which misattributes the entry (ORG-001 executor attribution, T-2276). Two seats of one role share an `agent`; only `executor` tells them apart.
+- Hand-writing a row past `append_entry` (ad-hoc keys like `summary` or `ticket`, no `id`, `rationale` or `justifies_via`). It skips the ORG-001 check; 5 of the 6 rows a 2026-11-03 replay would reject were written this way (T-4739).
 - Writing a persona name or `orchestrator` as `agent` out of habit. Those are history-only values since 2026-10-08 (ORG-001, the operator TG 11474).
 
 ## Boundary

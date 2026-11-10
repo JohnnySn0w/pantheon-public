@@ -89,6 +89,13 @@ LATE_CONFIRM_TOTAL_S = 10.0
 #: send_keys_submit.sh's HERMES_ENTER_DELAY and inbox_consumer's hermes delay
 #: carry the same value (tests pin both).
 HERMES_SETTLE_DELAY_S = 1.2
+#: T-6130: how long the pre-Enter gate waits for the pasted text to show in the
+#: composer, and how often it looks. Only profiles carrying ``render_wait_s`` gate.
+DEFAULT_RENDER_WAIT_S = 8.0
+#: T-6132: the RENDER_WAIT_S env override is clamped to this (a non-finite or huge value
+#: would make the gate poll forever on a paste that never renders).
+MAX_RENDER_WAIT_S = 60.0
+RENDER_POLL_S = 0.5
 
 PROFILES: dict[str, dict] = {
     # Claude Code TUI: large pastes collapse to the "[Pasted text" marker, but
@@ -105,6 +112,11 @@ PROFILES: dict[str, dict] = {
         "paste_sentinel": "[Pasted text",
         "paste_sentinel_scope": "composer_box",  # T-4293 (was whole_pane)
         "repress_when_stuck": True,  # T-4141: should_repress() may fire here
+        # T-6132: the same bounded pre-Enter render gate codex carries, at the 8s
+        # default (not a measured value). Basis: T-4369's first-paste render times
+        # of 1.7-3.2s, so 8s is ~2.5x headroom. Python/CLI path only; the bash
+        # send_keys_submit.sh keeps RENDER_WAIT_S off at steady state (T-4369).
+        "render_wait_s": DEFAULT_RENDER_WAIT_S,
         "settle_delay_s": DEFAULT_SETTLE_DELAY_S,
         "submit_retries": DEFAULT_SUBMIT_RETRIES,
     },
@@ -131,6 +143,12 @@ PROFILES: dict[str, dict] = {
         # needle for short injections, sentinel for collapsed ones.
         "paste_sentinel": "[Pasted Content",
         "paste_sentinel_scope": "composer_region",
+        # T-6130: the pre-Enter render gate (see submit_verify). A fresh codex TUI
+        # renders a paste late; an Enter sent before the text shows is swallowed and
+        # the old verify then read the blank composer as "submitted" (a codex seat,
+        # 2026-11-03 22:57Z, unsubmitted for 3 minutes). Claude now carries the
+        # same gate (T-6132, 8s default); Hermes remains measurement-gated.
+        "render_wait_s": DEFAULT_RENDER_WAIT_S,
         "settle_delay_s": DEFAULT_SETTLE_DELAY_S,
         "submit_retries": DEFAULT_SUBMIT_RETRIES,
     },
@@ -141,14 +159,14 @@ PROFILES: dict[str, dict] = {
     # (hermes_cli/cli_tui_mixin.py _tui_collapse_paste), so the claude-code
     # sentinel and composer_box scope apply. H0: a send-keys text plus an
     # IMMEDIATE Enter is swallowed into the paste as a newline; text, a ~1s pause,
-    # then Enter submits, so the settle is longer (1.2s, artisan ruling 7).
-    # Known gap: while a turn runs the input line reads "☤ ❯ msg=interrupt ...",
-    # which does not START with the glyph, so a busy-pane injection reads
-    # "submitted". The wake path only injects into an idle pane
-    # (hermes_pane_idle_state), and busy_input_mode is queue.
+    # then Enter submits, so the settle is longer (1.2s, operator-side ruling 7).
+    # While a turn runs the input line reads "☤ ❯ msg=interrupt ...". The
+    # Hermes-only composer prefix below keeps queued text on that measured line
+    # visible to the pending predicate; other profiles retain glyph-at-start.
     "hermes": {
         "pending_strategy": "composer_holds_text",
         "composer_glyph": "❯",  # U+276F
+        "composer_prefixes": ("☤",),
         "needle_len": 48,
         "paste_sentinel": "[Pasted text",
         "paste_sentinel_scope": "composer_box",
@@ -183,12 +201,26 @@ def _normalize_ws(s: str) -> str:
 _COMPOSER_BORDER = re.compile(r"(─){20,}|╰")
 
 
-def _composer_region(lines: list[str], glyph: str) -> list[str] | None:
-    """The live composer: the LAST glyph-led line down to the composer's bottom
-    border (or the end of the pane if there is none). None when no line begins with
-    the glyph, i.e. no composer is visible."""
+def _starts_composer(line: str, glyph: str, prefixes: tuple[str, ...] = ()) -> bool:
+    stripped = line.lstrip()
+    if stripped.startswith(glyph):
+        return True
+    return any(
+        stripped.startswith(prefix) and stripped[len(prefix):].lstrip().startswith(glyph)
+        for prefix in prefixes
+    )
+
+
+def _composer_region(
+    lines: list[str], glyph: str, prefixes: tuple[str, ...] = (),
+) -> list[str] | None:
+    """The live composer: the LAST matching line down to its bottom border.
+
+    A match begins with ``glyph`` after whitespace, or with one explicitly
+    profile-scoped prefix followed by ``glyph``. None means no composer is visible.
+    """
     for i in range(len(lines) - 1, -1, -1):
-        if lines[i].lstrip().startswith(glyph):
+        if _starts_composer(lines[i], glyph, prefixes):
             end = next((j for j in range(i + 1, len(lines))
                         if _COMPOSER_BORDER.search(lines[j])), len(lines))
             return lines[i:end]
@@ -207,7 +239,7 @@ DUPLICATE_MIN_CHARS = 16
 def codex_duplicate_render(lines: list[str]) -> tuple[int, int, list[str]] | None:
     """T-4987: a codex composer drawn twice, the second copy BELOW the status footer.
 
-    Watchman, 2026-10-22: the wake notice sat unsubmitted while the composer was
+    A codex seat, 2026-10-22: the wake notice sat unsubmitted while the composer was
     rendered once above the footer and again below it, the copy scrolled by one row
     ('› (from inbox_consumer). ...') and cut off at the pane bottom. A sane codex
     screen always ends with its footer, so glyph lines after the LAST footer, with no
@@ -251,7 +283,7 @@ def duplicate_agrees(fragments: list[str], compact_text: str) -> bool:
 
 
 def _composer_holds_text(pane_text: str, injected_text: str, glyph: str,
-                         needle_len: int) -> bool:
+                         needle_len: int, prefixes: tuple[str, ...] = ()) -> bool:
     """codex strategy: True iff the composer still holds our injected text.
 
     codex's live input line is the LAST glyph-bearing line; after a real submit
@@ -274,13 +306,13 @@ def _composer_holds_text(pane_text: str, injected_text: str, glyph: str,
     # composer's bottom border (or the end of the pane if there is none). When the
     # composer already held unsubmitted text, an appended injection lands on wrapped
     # continuation lines that carry no glyph, sometimes split mid-word. Checking the
-    # glyph line alone false-passed that (artisan, 2026-09-28). History above stays out
+    # glyph line alone false-passed that (a claude-tier seat, 2026-09-28). History above stays out
     # (the region starts at the LAST glyph line), and so does anything below the
     # border: a tty-echoing stand-in leaves submitted text there.
     compact = "".join(_normalize_ws(injected_text).split())
     needle = "".join(_normalize_ws(injected_text)[:needle_len].split())
     # T-5380: a long single-line paste scrolls its HEAD out of the composer's visible
-    # rows (about 7-8; the cursor, hence the tail, stays in view). Recovery's T-5148 and
+    # rows (about 7-8; the cursor, hence the tail, stays in view). The head orchestrator's T-5148 and
     # T-5221 deliveries sat unsubmitted for 2h+ and 3.9h because the head needle alone
     # read "not pending" after a swallowed Enter. The TAIL needle covers that: it is
     # matched in the same composer region only, so a submitted prompt (now in history
@@ -291,13 +323,13 @@ def _composer_holds_text(pane_text: str, injected_text: str, glyph: str,
         # assert it's still pending, so treat as not-pending (don't loop forever).
         return False
     lines = pane_text.splitlines()
-    region = _composer_region(lines, glyph)
+    region = _composer_region(lines, glyph, prefixes)
     if region is None:
         return False  # no composer line visible -> not pending (submitted/cleared)
     held = "".join("".join(region).split())
     if needle in held or tail_needle in held:
         return True
-    # T-4987: the composer drawn twice, a cut-off copy below the footer (watchman
+    # T-4987: the composer drawn twice, a cut-off copy below the footer (a codex seat,
     # 2026-10-22, read "submitted" at inject time). Pending only when the two renders
     # agree: the copy is pieces of OUR text AND the composer above the footer holds a
     # needle. A copy alone, or one with other text, keeps the reading above, so text
@@ -352,7 +384,7 @@ def submit_pending(profile: dict, pane_text: str, injected_text: str) -> bool:
                 # T-4293 (claude-code; whole_pane before). Claude's placeholder
                 # "[Pasted text #N +M lines]" is text IN the prompt input: the
                 # bundle builds it into the input value and parses it back out
-                # (Q9/Uc in 2.1.284), and artisan's pane stream draws it into the
+                # (Q9/Uc in 2.1.284), and an agent pane's stream draws it into the
                 # composer with its "paste again to expand" hint. The fixtures
                 # that drew it ABOVE the "❯" line were synthetic. Whole-pane read
                 # any OLD marker left in scrollback as our paste still pending:
@@ -363,7 +395,11 @@ def submit_pending(profile: dict, pane_text: str, injected_text: str) -> bool:
                 # the old boxed frame), fall back to the whole pane: fail closed,
                 # as before.
                 lines = pane_text.splitlines()
-                region = _composer_region(lines, profile["composer_glyph"])
+                region = _composer_region(
+                    lines,
+                    profile["composer_glyph"],
+                    tuple(profile.get("composer_prefixes", ())),
+                )
                 haystack = "\n".join(lines if region is None else region)
                 if "".join(sentinel.split()) in "".join(haystack.split()):
                     return True
@@ -388,6 +424,7 @@ def submit_pending(profile: dict, pane_text: str, injected_text: str) -> bool:
         return _composer_holds_text(
             pane_text, injected_text,
             profile["composer_glyph"], profile["needle_len"],
+            tuple(profile.get("composer_prefixes", ())),
         )
     raise ValueError(f"unknown pending_strategy {strategy!r}")
 
@@ -414,13 +451,14 @@ def should_repress(profile: dict, pane_text: str, injected_text: str) -> bool:
     does submit (T-4284), which is the safe direction. pane_idle_state is
     deliberately NOT used: with text in the composer it
     reads busy under the manage footer, which is exactly the stuck state this
-    exists to clear (artisan, 2026-09-28: one Enter on the idle pane submitted the
+    exists to clear (a claude-tier seat, 2026-09-28: one Enter on the idle pane submitted the
     stuck text at once). Profiles opt in (claude-code only; codex's busy signals are
     not validated here). Fail-safe: anything unclassifiable returns False."""
     if not profile.get("repress_when_stuck"):
         return False
     if not _composer_holds_text(pane_text, injected_text,
-                                profile["composer_glyph"], profile["needle_len"]):
+                                profile["composer_glyph"], profile["needle_len"],
+                                tuple(profile.get("composer_prefixes", ()))):
         return False
     try:
         ic = _inbox_consumer()
@@ -449,20 +487,20 @@ def should_repress(profile: dict, pane_text: str, injected_text: str) -> bool:
 # from ``submit_pending`` above, which answers "did the text I ALREADY
 # injected go through?". runtime_controller.py polls this BEFORE publishing a
 # fresh or replaced runtime as ready, mirroring the proven idle-confirm
-# conjunction in recovery_boot_kick.sh (lines 48-56, 88-107): prompt-frame +
+# conjunction in the head orchestrator's boot-kick script (lines 48-56, 88-107): prompt-frame +
 # idle/composer glyph + not-a-modal, generalized to accept either harness's
 # composer glyph so one predicate covers claude and codex.
 
 # The `─` quantifiers MUST stay grouped exactly like this: `─` is 3 UTF-8
 # bytes, and in a byte locale a bare `─+`/`─{20,}` binds the quantifier to
 # the LAST byte only and silently never matches — the documented CI-red trap
-# from recovery_boot_kick.sh:48-51. Grouping is identical under UTF-8 here.
+# from the head orchestrator's boot-kick script:48-51. Grouping is identical under UTF-8 here.
 _READY_FRAME_PATTERN = re.compile(r"(╭(─)+╮|(─){20,})")
 # T-4646: Claude Code 2.1.289's startup nudge "Make auto mode your default permission
 # mode?" has NO confirm footer, and its option cursor ❯ passes the composer-glyph check.
 # Its first option line is the positive witness. On 2026-10-05 a restart kick's Enter
-# accepted it and switched specialist to auto mode. Shell copies of this marker live in the
-# DIALOG_EXCLUDE of handoff_and_restart.sh, verify_startup.sh and recovery_boot_kick.sh.
+# accepted it and switched an agent to auto mode. Shell copies of this marker live in the
+# DIALOG_EXCLUDE of handoff_and_restart.sh, verify_startup.sh and the boot-kick script.
 AUTO_MODE_NUDGE_MARKER = "Yes, set auto mode as my default permission mode"
 _READY_DIALOG_PATTERN = re.compile(r"Enter to confirm|Esc to cancel|" + re.escape(AUTO_MODE_NUDGE_MARKER))
 _READY_COMPOSER_GLYPHS = ("❯", "›")  # claude U+276F, codex U+203A
@@ -592,7 +630,7 @@ def busy_reason(pane_text: str) -> str | None:
     """Why a submit into ``pane_text`` would land in a RUNNING turn, or None (T-4459).
 
     ``not_ready_reason`` can't see this: the current TUI draws its frame and ``❯``
-    composer mid-turn too, so it passes a busy pane (T-3026 attempt 4: recovery's boot kick
+    composer mid-turn too, so it passes a busy pane (T-3026 attempt 4: the head orchestrator's boot kick
     fired into a still-running probe turn and sat unsent). The evidence is the same
     bottom region ``should_repress`` reads, with inbox_consumer's sentinels (T-0716):
     "dialog_footer", "generating" ("esc to interrupt") or "background_agents" (a
@@ -651,7 +689,37 @@ def submit_verify(profile: dict, pane: str, text: str, *,
     settle = float(profile.get("settle_delay_s", DEFAULT_SETTLE_DELAY_S))
     retries = int(profile.get("submit_retries", DEFAULT_SUBMIT_RETRIES))
 
-    if not send_text(pane, text):
+    # T-6130: pre-Enter render gate (profiles with render_wait_s only). Never
+    # confirm a submit of text that was never seen pending: a fresh TUI renders the
+    # paste late, the Enter lands before it and is swallowed, and the blank composer
+    # then reads "submitted". So: (1) if the composer ALREADY holds our text (an
+    # earlier call pasted it and failed to confirm) do not paste again, so a caller
+    # retry cannot double the text; (2) after pasting, poll until the composer shows
+    # it; (3) if it never shows, report unverified and send NO Enter.
+    render_wait = float(profile.get("render_wait_s") or 0)
+    if render_wait > 0:
+        pre = capture(pane)
+        already = bool(pre.strip()) and submit_pending(profile, pre, text)
+        if not already:
+            if not send_text(pane, text):
+                return SubmitResult(False, 0, "send-keys (text) failed")
+            waited = 0.0
+            seen_pending = False
+            while True:
+                cap = capture(pane)
+                if cap.strip() and submit_pending(profile, cap, text):
+                    seen_pending = True
+                    break
+                if waited >= render_wait:
+                    break
+                sleep(RENDER_POLL_S)
+                waited += RENDER_POLL_S
+            if not seen_pending:
+                return SubmitResult(
+                    False, 0,
+                    f"unverified: text never observed in the composer within "
+                    f"{render_wait:g}s (no Enter sent)")
+    elif not send_text(pane, text):
         return SubmitResult(False, 0, "send-keys (text) failed")
 
     last_empty = False
@@ -682,7 +750,7 @@ def submit_verify(profile: dict, pane: str, text: str, *,
             continue
         if not submit_pending(profile, seen, text):
             # T-5610: one "cleared" sample is not proof. On a heavy pane the collapsed
-            # paste can render AFTER this capture (orchestrator 2026-10-26 18:28Z: logged
+            # paste can render AFTER this capture (a claude-tier seat, 2026-10-26 18:28Z: logged
             # "woke", placeholder then sat unsubmitted). Re-sample once; a pending
             # read falls through to the pre-retry check and the retry Enter.
             sleep(CONFIRM_RESAMPLE_S)
@@ -691,10 +759,10 @@ def submit_verify(profile: dict, pane: str, text: str, *,
                 return SubmitResult(True, attempt + 1, "submit confirmed")
         # still pending — paste-mode/composer hasn't cleared; retry the Enter
     # T-5651: one late look before reporting failure. A seat finishing a turn can
-    # take longer than the retry window to accept the Enter (specialist 2026-10-27 04:46Z
-    # answered a nudge this loop had just reported unconfirmed, which paged Recovery).
+    # take longer than the retry window to accept the Enter (an agent pane, 2026-10-27 04:46Z
+    # answered a nudge this loop had just reported unconfirmed, which paged the head orchestrator).
     # Failure path only, so no added latency on success; no extra Enter is sent.
-    # T-5656: one 3s look was not enough for recovery's own very large pane (06:35Z
+    # T-5656: one 3s look was not enough for an agent's own very large pane (06:35Z
     # 10-27, the wake landed later), so the look is a bounded poll. An empty
     # sample casts no vote.
     waited = 0.0
@@ -784,6 +852,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--harness", required=True, choices=sorted(PROFILES),
                    help="harness profile to use (explicit; no sniffing)")
     p.add_argument(
+        "--print-first-paste-render-wait", action="store_true",
+        help="T-6293: print the harness's first-paste render bound in seconds (plain "
+             "decimal, for shell callers' --render-wait default) and exit. No tmux I/O.")
+    p.add_argument(
         "--pending-check", action="store_true",
         help="PREDICATE-ONLY mode: read the captured pane text from stdin and "
              "print 'pending' (text not yet submitted) or 'submitted'. Does NO "
@@ -822,10 +894,26 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def first_paste_render_wait(harness: str) -> float:
+    """T-6293: the bound a FIRST paste into a freshly started runtime waits for its render.
+
+    The harness profile is the one source: its ``render_wait_s`` when it carries the gate,
+    else DEFAULT_RENDER_WAIT_S. First-paste callers (runtime_controller's fresh-runtime
+    submits, kick_verify via handoff_and_restart and seat-relaunch, the boot-kick script,
+    claude_quota_probe) read it here instead of a literal. Steady-state bash sends stay
+    ungated (send_keys_submit.sh RENDER_WAIT_S default 0, T-4369)."""
+    return float(get_profile(harness).get("render_wait_s") or DEFAULT_RENDER_WAIT_S)
+
+
 def _profile_with_env_overrides(harness: str) -> dict:
     """Profile copy with optional env overrides for the tunables, so existing
     callers/tests can speed up or retune without code changes:
-      INJECT_ENTER_DELAY -> settle_delay_s,  SUBMIT_RETRIES -> submit_retries.
+      INJECT_ENTER_DELAY -> settle_delay_s,  SUBMIT_RETRIES -> submit_retries,
+      RENDER_WAIT_S -> render_wait_s (T-6132: the T-6130 pre-Enter render gate. codex and
+      claude-code carry it by default (8s); hermes does not and opts in here. The SAME name
+      and units as send_keys_submit.sh's RENDER_WAIT_S, but this Python path only: the bash
+      sender keeps its own default (off) and does not read the profile. Empty, unparseable
+      or <= 0 leaves the profile as is.)
     (Names mirror the legacy send_keys_submit.sh env contract.)"""
     profile = dict(get_profile(harness))
     delay = os.environ.get("INJECT_ENTER_DELAY")
@@ -840,6 +928,14 @@ def _profile_with_env_overrides(harness: str) -> dict:
             profile["submit_retries"] = int(retries)
         except ValueError:
             pass
+    render_wait = os.environ.get("RENDER_WAIT_S")
+    if render_wait:
+        try:
+            value = float(render_wait)
+        except ValueError:
+            value = 0.0
+        if value > 0:  # nan fails this test too
+            profile["render_wait_s"] = min(value, MAX_RENDER_WAIT_S)
     return profile
 
 
@@ -862,6 +958,9 @@ def _run_pending_check(harness: str, text: str, stdin) -> int:
 def main(argv: list[str] | None = None, *, stdin=None) -> int:
     args = _build_parser().parse_args(argv)
 
+    if args.print_first_paste_render_wait:
+        sys.stdout.write(f"{first_paste_render_wait(args.harness):g}\n")
+        return 0
     if args.pending_check:
         return _run_pending_check(args.harness, args.text, stdin or sys.stdin)
     if args.repress_check:

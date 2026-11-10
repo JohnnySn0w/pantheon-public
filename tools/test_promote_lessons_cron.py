@@ -4,12 +4,15 @@ Telegram — the commit/send sites are injected stubs."""
 
 from __future__ import annotations
 
+import os
 import subprocess
 import unittest
 from argparse import Namespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
+
+os.environ.setdefault("PANTHEON_DISABLE_LIVE_MAILBOX", "1")  # never the live hub (T-6370)
 
 from tools import promote_lessons as pl
 from tools import promote_lessons_cron as cron
@@ -27,7 +30,7 @@ def _args(tmp: Path, **over):
         lessons_dir=tmp / "lessons", bugs_dir=tmp / "bugs", memory_dir=tmp / "mem",
         candidates_dir=tmp / "cands", ledger=tmp / "ledger.json",
         min_confidence="high", no_commit=False, no_push=False, no_digest=True,
-        dry_run=False, telegram_env=tmp / "tg.env", chat_id="1",
+        dry_run=False,
     )
     base.update(over)
     return Namespace(**base)
@@ -81,14 +84,13 @@ class Run(unittest.TestCase):
             tmp = Path(t)
             commit = mock.Mock(return_value=(True, "committed + pushed"))
             send = mock.Mock(return_value=True)
-            (tmp / "tg.env").write_text("TELEGRAM_BOT_TOKEN=xyz\n", encoding="utf-8")
             with mock.patch.object(pl, "scan_all", return_value=[_cand()]):
                 rc = cron.run(_args(tmp, no_digest=False), do_commit=commit, do_send=send)
             self.assertEqual(rc, 0)
             commit.assert_called_once()
             send.assert_called_once()
             # the digest (3rd positional to send) names the new candidate count
-            _tok, _chat, text = send.call_args.args
+            (text,) = send.call_args.args
             self.assertIn("1 new this run", text)
 
     def test_commit_failure_returns_nonzero_but_still_digests(self):
@@ -96,13 +98,47 @@ class Run(unittest.TestCase):
             tmp = Path(t)
             commit = mock.Mock(return_value=(False, "push failed: boom"))
             send = mock.Mock(return_value=True)
-            (tmp / "tg.env").write_text("TELEGRAM_BOT_TOKEN=xyz\n", encoding="utf-8")
             with mock.patch.object(pl, "scan_all", return_value=[_cand()]):
                 rc = cron.run(_args(tmp, no_digest=False), do_commit=commit, do_send=send)
             self.assertEqual(rc, 8)
             send.assert_called_once()
-            _t, _c, text = send.call_args.args
+            (text,) = send.call_args.args
             self.assertIn("NOT committed", text)
+
+    def test_zero_candidates_still_sends_proof_of_life(self):
+        with TemporaryDirectory() as t:
+            tmp = Path(t)
+            send = mock.Mock(return_value="id")
+            with mock.patch.object(pl, "scan_all", return_value=[]):
+                rc = cron.run(_args(tmp, no_digest=False), do_commit=mock.Mock(), do_send=send)
+            self.assertEqual(rc, 0)
+            send.assert_called_once()
+            self.assertIn("0 new this run", send.call_args.args[0])
+
+    def test_owner_send_failure_is_loud_and_never_masks_a_commit_failure(self):
+        with TemporaryDirectory() as t:
+            tmp = Path(t)
+            boom = mock.Mock(side_effect=PermissionError("hub"))
+            with mock.patch.object(pl, "scan_all", return_value=[_cand()]):
+                rc = cron.run(_args(tmp, no_digest=False),
+                              do_commit=mock.Mock(return_value=(True, "ok")), do_send=boom)
+            self.assertEqual(rc, cron.EXIT_DIGEST_FAILED)
+        with TemporaryDirectory() as t:
+            tmp = Path(t)
+            with mock.patch.object(pl, "scan_all", return_value=[_cand()]):
+                rc = cron.run(_args(tmp, no_digest=False),
+                              do_commit=mock.Mock(return_value=(False, "push failed")), do_send=boom)
+            self.assertEqual(rc, 8)
+
+    def test_default_sender_is_the_owner_mailbox_not_telegram(self):
+        self.assertNotIn("424242424", Path(cron.__file__).read_text())
+        with TemporaryDirectory() as t:
+            tmp = Path(t)
+            with mock.patch.object(pl, "scan_all", return_value=[]), \
+                    mock.patch.object(cron, "send_owner_digest") as owner:
+                cron.run(_args(tmp, no_digest=False), do_commit=mock.Mock())
+            owner.assert_called_once()
+            self.assertEqual(owner.call_args.kwargs["sender"], "promote-lessons")
 
     def test_no_push_does_not_commit_or_push(self):
         with TemporaryDirectory() as t:

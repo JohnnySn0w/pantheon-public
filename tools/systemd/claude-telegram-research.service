@@ -27,11 +27,14 @@
 # which is the storm mason measured. The bound is what makes wiring safe, so it is
 # added HERE rather than assumed.
 OnFailure=pantheon-unit-failure-alert@%n.service
-StartLimitIntervalSec=600
-StartLimitBurst=20
 Description=Claude Code Telegram bot bridge (research — Specialist, @c_specialist_bot bidirectional; supervisor wrapper per T-0755)
 After=network-online.target
 Wants=network-online.target
+# T-6352: ~52 min of continuous failure (30 starts/h under the [Service] backoff) ends in
+# ONE latched failed state (OnFailure alert where wired; failed_unit_reconcile sees it
+# regardless) instead of an unbounded loop. Recover: reset-failed + start.
+StartLimitIntervalSec=3600
+StartLimitBurst=30
 
 [Service]
 Type=simple
@@ -42,6 +45,10 @@ ExecStart=/home/claude-research/.local/bin/specialist-bot-supervise.sh
 ExecStop=/usr/bin/tmux kill-session -t claude-research-bot
 Restart=always
 RestartSec=5
+# T-6352: exponential restart backoff (5,9,18,34,64,120s). NRestarts is cumulative
+# (resets only on a manual start/restart), so 120s is also the steady per-crash delay.
+RestartSteps=5
+RestartMaxDelaySec=120
 
 [Install]
 WantedBy=default.target

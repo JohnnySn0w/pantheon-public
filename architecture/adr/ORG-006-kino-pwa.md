@@ -2,7 +2,7 @@
 aliases: [ORG-006]
 adr-id: ORG-006
 title: kino PWA — Pantheon multi-agent web UI (post-bridge pivot)
-status: Ratified
+status: "Ratified 2026-05-05 by the operator (Telegram msg_662); multi-agent chat half dormant since 2026-05-21 (the operator Telegram msg_1834/1836, T-0508); ticket-UI and stats PWA live"
 date: 2026-05-05
 author: orchestrator (Orchestrator)
 hitl: Ratified

@@ -4,7 +4,8 @@
 # Files new high-confidence promotion candidates to promotion-candidates/,
 # auto-commits + pushes the SURFACE only (HERMES-guarded, scoped — never a hook;
 # the review gate is recovery via --land/--decline), and sends a proof-of-life digest
-# to the operator. Recovery-only (not templated). Mirrors ticket_grooming's posture.
+# to the owner's (recovery's) mailbox, never the operator's Telegram (T-6370). Recovery-only
+# (not templated). Mirrors ticket_grooming's posture.
 
 [Unit]
 Description=Lessons→hooks promotion pipeline — weekly fire (T-0649 inc 4)

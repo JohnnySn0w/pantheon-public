@@ -18,7 +18,7 @@ SAFETY POSTURE — the non-negotiables (plan §"Reconciler algorithm", §DECISIO
   - DIRTY / DIVERGED / FOREIGN / MISSING_REF / CREDENTIAL / HEALTH are REFUSALS on
     the shared `RefusalKind` surface — never a reset/clean/force/rewind. FOREIGN
     content (a non-managed repo, or non-repo content, at a target path) is REPORTED,
-    NEVER reaped: hard refusal, not a flag (ORG-080 :103 + the Ask ownership
+    NEVER reaped: hard refusal, not a flag (ORG-080 §1 per-op privilege + the Ask ownership
     boundary).
   - The disruptive restart is a guarded-inert brokered INTENT (ORG-052 op-family
     shape): emitted into the plan/receipt, NEVER dispatched in phase 2 (the broker
@@ -58,10 +58,18 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+
+# The supervised operator surface invokes this file both as a module and as
+# ``python3 tools/repo_reconciler.py``.  The latter puts ``tools/`` rather than
+# the repository parent on sys.path, so establish the package root before the
+# module-scope ``tools.*`` imports below.  Resolve from __file__; never trust cwd.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools.assembly_resolver import (
     ROLLBACK_STAGES,
@@ -132,6 +140,19 @@ def _unsafe_git_operand(value: str) -> bool:
     """True when a caller-controlled operand could be parsed as a git option."""
 
     return not value or value.startswith("-") or "\0" in value
+
+
+def _unsafe_entry_operands(entry: CheckoutEntry) -> bool:
+    """True when a manifest-sourced path or tracking branch could read as a git option.
+
+    Defence in depth beside the `--` call-site delimiters (T-5502): `-C <path>`
+    and `--branch <name>` take their value positionally, so `--` is not usable
+    there and the leading-`-` refusal is the only layer. Pinned shas are
+    already constrained to hex by the spec loader."""
+
+    return _unsafe_git_operand(entry.target_path) or (
+        entry.mode.tracking is not None and _unsafe_git_operand(entry.mode.tracking)
+    )
 
 
 def _filesystem_identity(path: Path) -> dict[str, int] | None:
@@ -1057,11 +1078,44 @@ class RepoReconciler:
         receipt.after_digest = after.precondition_digest
         return receipt.seal()
 
+    def _apply_operand_refusal(self, entry: CheckoutEntry) -> tuple[str | None, CompatibilityRefusal | None]:
+        """Resolve the remote and vet every operand for an apply step (T-6151).
+
+        Returns (remote_url, None) when safe, else (None, refusal) naming the entry
+        and the operand. The operand VALUE is never echoed: manifest URLs may embed
+        credentials. A resolver failure stays a plain None (no operand to name)."""
+
+        try:
+            url = self._remote_resolver(entry.logical_repo)
+        except Exception:  # noqa: BLE001 — any resolver failure is an unresolved source
+            return None, None
+        if not isinstance(url, str):
+            return None, None
+        if _unsafe_git_operand(url):
+            why = "empty" if not url else "dash-led or NUL-bearing"
+            return None, CompatibilityRefusal(
+                RefusalKind.UNRESOLVED_SOURCE,
+                entry.checkout_id,
+                f"unsafe operand url refused at apply ({why}); nothing was run",
+            )
+        for name, value in (("target_path", entry.target_path), ("tracking", entry.mode.tracking)):
+            if value is not None and _unsafe_git_operand(value):
+                why = "empty" if not value else "dash-led or NUL-bearing"
+                return None, CompatibilityRefusal(
+                    RefusalKind.LIFECYCLE_REFUSED,
+                    entry.checkout_id,
+                    f"unsafe operand {name} refused at apply ({why}); nothing was run",
+                )
+        return url, None
+
     def _do_clone(
         self, entry: CheckoutEntry, desired_sha: str | None, receipt: ApplyReceipt
     ) -> None:
-        remote_url = self._resolve(entry)
-        if remote_url is None or desired_sha is None or _unsafe_git_operand(entry.target_path):
+        remote_url, refusal = self._apply_operand_refusal(entry)
+        if refusal is not None:
+            receipt.refused.append(refusal)
+            return
+        if remote_url is None or desired_sha is None:
             return
         # `git clone [options] [--] <repository> [<directory>]` supports this
         # delimiter. Tracking clones name the authorized branch, then the HEAD
@@ -1132,8 +1186,11 @@ class RepoReconciler:
     def _do_ff_advance(
         self, entry: CheckoutEntry, desired_sha: str | None, receipt: ApplyReceipt
     ) -> None:
-        remote_url = self._resolve(entry)
-        if remote_url is None or desired_sha is None or _unsafe_git_operand(entry.target_path):
+        remote_url, refusal = self._apply_operand_refusal(entry)
+        if refusal is not None:
+            receipt.refused.append(refusal)
+            return
+        if remote_url is None or desired_sha is None:
             return
         path = entry.target_path
         # Fetch the SPECIFIC desired ref/object (never a bare `git fetch <url>`,
@@ -1543,7 +1600,6 @@ def _production_resolver(repo_root: Path, pin_path: Path) -> RemoteResolver:
 
 def main(argv: Sequence[str] | None = None) -> int:
     import argparse
-    import sys
 
     parser = argparse.ArgumentParser(description="T-2951 checkout-lifecycle reconciler (report-only)")
     sub = parser.add_subparsers(dest="command", required=True)

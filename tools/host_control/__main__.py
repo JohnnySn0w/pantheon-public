@@ -96,18 +96,29 @@ STARTUP_RECORD_TAG = "startup-record"
 REGISTRY_MAX_BYTES = 1024 * 1024
 
 #: ``connect(main_loop)``: a NEW bus connection. ``main_loop=True`` is attached
-#: to the default GLib loop (the service connection); ``False`` is blocking-only
-#: (the driver thread's outbound calls, the ApprovalGet status calls).
+#: to the default GLib loop (the service connection, and the ApprovalGet status
+#: connection since T-5644: its call_async replies are dispatched by that loop);
+#: ``False`` is blocking-only (the driver thread's outbound calls). A
+#: blocking-only connection NEVER fires a call_async handler or its timeout.
 Connect = Callable[[bool], object]
+
+
+def open_bus(constructor: Callable[..., object], main_loop: bool) -> object:
+    """The one place the main-loop attachment of a private bus connection is
+    decided, shared by production (``system_bus``) and the production-wiring
+    test (which passes a private-bus constructor)."""
+
+    import dbus.mainloop
+
+    if main_loop:
+        return constructor(private=True)
+    return constructor(private=True, mainloop=dbus.mainloop.NULL_MAIN_LOOP)
 
 
 def system_bus(main_loop: bool) -> object:
     import dbus
-    import dbus.mainloop
 
-    if main_loop:
-        return dbus.SystemBus(private=True)
-    return dbus.SystemBus(private=True, mainloop=dbus.mainloop.NULL_MAIN_LOOP)
+    return open_bus(dbus.SystemBus, main_loop)
 
 
 def _log(message: str) -> None:
@@ -137,16 +148,43 @@ class LoopReconciler:
 
 
 class _LazyConnection:
-    """One blocking connection, made on first use in the calling thread."""
+    """One connection, made on first use in the calling thread. ``main_loop``
+    picks the attachment (T-5644: the status connection needs the GLib loop
+    so async replies fire; the default stays blocking-only)."""
 
-    def __init__(self, connect: Connect) -> None:
+    def __init__(self, connect: Connect, *, main_loop: bool = False) -> None:
         self._connect = connect
+        self._main_loop = main_loop
         self._connection: object | None = None
 
     def __call__(self) -> object:
         if self._connection is None:
-            self._connection = self._connect(False)
+            self._connection = self._connect(self._main_loop)
         return self._connection
+
+    def close(self) -> None:
+        connection, self._connection = self._connection, None
+        close = getattr(connection, "close", None)
+        if close is not None:
+            close()
+
+
+def build_status_client(
+    connect: Connect,
+    ownership: object,
+) -> tuple[ApprovalConsumerClient, _LazyConnection]:
+    """T-5644: the ApprovalGet status client, built by the same code the
+    broker runs. Its connection is a SEPARATE private connection attached to
+    the GLib main loop (call_async needs the loop to deliver replies and
+    timeouts); it owns no bus name, so name ownership and the bus policy are
+    exactly those of the driver's outbound connections (same uid)."""
+
+    status_connection = _LazyConnection(connect, main_loop=True)
+    client = ApprovalConsumerClient(
+        transport=DBusConsumerTransport(status_connection, main_loop_attached=True),
+        ownership=ownership,
+    )
+    return client, status_connection
 
 
 @dataclass
@@ -334,6 +372,8 @@ def run(
     from tools.host_control.dbus_service import HostBroker1Object
     from tools.host_control.health_dbus import Health1Object, broker_health_path
 
+    service_object: HostBroker1Object | None = None
+    status_connection: _LazyConnection | None = None
     try:
         dbus.mainloop.glib.threads_init()
         dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
@@ -343,17 +383,14 @@ def run(
         except dbus.exceptions.DBusException:
             log("bus name unavailable")
             return EXIT_NAME_UNAVAILABLE
-        status_connection = _LazyConnection(connect)
+        status_client, status_connection = build_status_client(connect, stack.journal)
         service_object = HostBroker1Object(
             connection,
             registry=stack.registry,
             plan_service=stack.plan_service,
             operation_service=stack.operation_service,
             approval_source=BrokerApprovalSource(journal=stack.journal, clock=_utc_now),
-            approval_status=ApprovalConsumerClient(
-                transport=DBusConsumerTransport(status_connection),
-                ownership=stack.journal,
-            ),
+            approval_status=status_client,
             approval_uid=stack.config.approval_uid,
             execution_source=BrokerExecutionSource(journal=stack.journal, registry=stack.registry),
             driver=stack.driver,
@@ -380,7 +417,15 @@ def run(
         del _keepalive
         return 0
     finally:
-        stack.close()
+        try:
+            if service_object is not None:
+                # T-5644: late ApprovalStatus replies are dropped, never run
+                # against the journal stack.close() is about to close
+                service_object.close()
+            if status_connection is not None:
+                status_connection.close()
+        finally:
+            stack.close()
 
 
 def main(argv: Sequence[str] | None = None) -> int:

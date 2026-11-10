@@ -11,6 +11,17 @@ Every op is privilege root, ``write-ahead-inverse-durable`` (ORG-080 §2: the
 host-substrate ops take the write-ahead path), and carries only manifest ids.
 The update leg plans ``execution_scope: staged-cutover`` (D-H / A-3: a
 privileged component auto-stages; cutover is a supervised install/configure run).
+
+SEAT FRAGMENTS (T-5827, T-5091 U2; T-5829 ruling (1) Option A, orchestrator + Recovery D15).
+The manifest is the in-repo base plus the per-seat fragments that harness-manager's
+pure resolver (``harness_manager_root``) derives from this checkout's committed
+instance.yaml for every ``root_half: managed`` seat, merged add-only (a collision
+refuses), seat-scoped and order-independent. With no managed seat the manifest is
+the base, byte for byte, and no seat observation is asked for. When fragments
+exist, every op's provenance records ``base_manifest_sha256`` and one
+``fragment_sha256:<role>`` per fragment next to the merged ``manifest_sha256``
+(provenance is a flat string mapping); the handler refuses an
+unrecorded, absent or changed fragment at apply (ruling (1)(f)).
 """
 
 from __future__ import annotations
@@ -20,6 +31,7 @@ from pathlib import Path
 
 import yaml
 
+from tools.germinate.components import harness_manager_root as HR
 from tools.germinate.host_substrate import families as F
 
 HANDLER = "host-substrate"
@@ -36,11 +48,26 @@ class PlanRefused(RuntimeError):
     """The manifest or the observation is refused."""
 
 
-def _manifest():
+def _manifest(request=None):
+    """The merged manifest and the provenance additions (empty: no seat fragment)."""
+
     try:
-        return F.load_manifest(yaml.safe_load(MANIFEST.read_text(encoding="utf-8")), repo_root=REPO_ROOT)
+        base_doc = yaml.safe_load(MANIFEST.read_text(encoding="utf-8"))
+        base = F.load_manifest(base_doc, repo_root=REPO_ROOT)
     except (OSError, yaml.YAMLError, F.ManifestError) as exc:
         raise PlanRefused(f"host-substrate manifest refused: {exc}") from None
+    try:
+        seats = HR.seat_merge(base_doc, HR.load_instance(REPO_ROOT / "instance.yaml"),
+                              lambda: _observed(request or {}), plan_time=True)
+    except HR.IdentityRefused as exc:
+        raise PlanRefused(f"seat identity refused: {exc}") from None
+    if not seats.fragment_sha256:
+        return base, {}
+    try:
+        merged = F.load_manifest(seats.doc, repo_root=REPO_ROOT)
+    except F.ManifestError as exc:
+        raise PlanRefused(f"merged host-substrate manifest refused: {exc}") from None
+    return merged, {"base_manifest_sha256": base.sha256, **HR.provenance_fields(seats.fragment_sha256)}
 
 
 def _observed(request):
@@ -93,7 +120,7 @@ def retire_steps(m):
     return steps
 
 
-def _op(family, params, r, current, m, *, staged):
+def _op(family, params, r, current, m, *, staged, seat_provenance=None):
     subject = (STAGED if staged else "") + r.subject
     tag = hashlib.sha256(subject.encode("utf-8")).hexdigest()[:10]
     op = {
@@ -106,7 +133,7 @@ def _op(family, params, r, current, m, *, staged):
         "inverse": {"restore": "preimage"},
         "privilege": "root",
         "owner": "root",
-        "provenance": {"planner": "host-substrate", "manifest_sha256": m.sha256},
+        "provenance": {"planner": "host-substrate", "manifest_sha256": m.sha256, **(seat_provenance or {})},
         "crash_contract": "write-ahead-inverse-durable",
         "side_effect_free": False,
     }
@@ -120,7 +147,7 @@ def _op(family, params, r, current, m, *, staged):
 
 
 def _plan(request, steps_for, *, staged=False):
-    m = _manifest()
+    m, seat_provenance = _manifest(request)
     subjects = _observed(request)
     ops = []
     for family, params in steps_for(m):
@@ -133,7 +160,7 @@ def _plan(request, steps_for, *, staged=False):
             continue  # already converged: verify, not mutate
         if family in RETIRE_FAMILIES and current is None:
             continue  # nothing present to retire
-        ops.append(_op(family, params, r, current, m, staged=staged))
+        ops.append(_op(family, params, r, current, m, staged=staged, seat_provenance=seat_provenance))
     return ops
 
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import grp
 import hashlib
 import json
 import math
@@ -51,6 +52,7 @@ from typing import Any, Callable, Iterator, Literal, Mapping, NamedTuple, Sequen
 from tools import codex_modal
 from tools import chronicle
 from tools import handoff_first
+from tools.fleet_usage_env import fleet_usage_launch_env
 from tools._lease import Lease
 from tools.codex_telegram_actions import HEALTH_409_ERROR_PREFIX, PriorRuntime
 from tools.codex_telegram_actions import receiver_handoff_actions as _receiver_action_order
@@ -82,6 +84,8 @@ from tools.harness_adapter.types import (
     TmuxTarget,
 )
 from tools.submit_verify import get_profile as submit_verify_profile
+from tools.submit_verify import DEFAULT_RENDER_WAIT_S as SUBMIT_VERIFY_DEFAULT_RENDER_WAIT_S
+from tools.submit_verify import first_paste_render_wait as submit_verify_first_paste_render_wait
 from tools.submit_verify import ready_for_submission
 from tools.submit_verify import not_ready_reason
 from tools.submit_verify import busy_reason
@@ -124,6 +128,11 @@ _SYSTEMD_TIMER_METADATA_KEYS = frozenset({"trigger_timer_realtime_usec", "trigge
 RUNTIME_START_TIMEOUT_SECONDS = 8.0
 RUNTIME_START_POLL_SECONDS = 0.1
 RUNTIME_INPUT_READY_TIMEOUT_SECONDS = 20.0
+# A controller-owned app-server start resumes the same (potentially large)
+# rollout twice: once in the supervisor and once in the delivery writer.  Each
+# protocol request has a 30s bound, so the pane-oriented 20s startup budget is
+# structurally too short.  Keep the bare-TUI budget unchanged.
+APP_SERVER_INPUT_READY_TIMEOUT_SECONDS = 75.0
 RUNTIME_INPUT_READY_POLL_SECONDS = 0.25
 POST_START_TIMEOUT_SECONDS = 5.0
 POST_START_ASSESSMENT_CAPTURE_COUNT = 3
@@ -147,7 +156,9 @@ PROVIDER_COMPLETION_MAX_RESUBMITS = 3
 # --render-wait). Measured 2026-09-30 on recovery's candidate argv: the fresh TUI took
 # ~2.1-4s to render a 130-char paste, and the fixed 0.7s Enter went in as a literal
 # CR, which stranded the probe in the composer (T-3026 attempts 1 and 2).
-FRESH_RUNTIME_SUBMIT_RENDER_WAIT_SECONDS = 8.0
+# T-6293: the bound itself lives in the submit_verify harness profile (one source); this
+# name stays as the default for callers/tests. Per-harness: _fresh_runtime_render_wait.
+FRESH_RUNTIME_SUBMIT_RENDER_WAIT_SECONDS = SUBMIT_VERIFY_DEFAULT_RENDER_WAIT_S
 # T-5023: codex 0.147 sometimes prints this line ~5-8s after its banner, and the
 # session then runs without the named MCP servers (telegram, sticker). Nothing
 # else shows it: the MCP child processes stay alive, so a liveness check passes.
@@ -187,6 +198,8 @@ RUNTIME_SOURCE_HASH_PATHS = (
     "tools/claude_quota_probe.py",
     "tools/claude_statusline_capture.py",
     "tools/chronicle.py",
+    "tools/chronicle_export.py",
+    "tools/appserver_seats.py",
     "tools/mailbox_wake.py",
     "tools/persona_bringup.py",
     "tools/runtime_controller.py",
@@ -971,11 +984,12 @@ def _probe_managed_receiver(
     expected: Literal["present", "absent"],
     *,
     backend: Any | None,
+    wait: bool = True,
 ) -> _ManagedReceiverProbe:
     if backend is None and not receiver_handoff_required(binding):
         return _ManagedReceiverProbe(True, "not-applicable", "receiver-not-managed", {})
     try:
-        proof = _prove_receiver(binding, expected, backend=backend)
+        proof = _prove_receiver(binding, expected, backend=backend, wait=wait)
     except Exception as exc:
         text = str(exc)
         state = "ambiguous" if "duplicate" in text or "ambiguous" in text else "unknown"
@@ -988,14 +1002,15 @@ def _probe_managed_receiver(
     return _ManagedReceiverProbe(ok, state, reason, dict(proof.evidence))
 
 
-def prove_managed_receiver_present(binding: "PersonaBinding") -> bool:
-    return _probe_managed_receiver(binding, "present", backend=None).ok
+def prove_managed_receiver_present(binding: "PersonaBinding", *, wait: bool = True) -> bool:
+    return _probe_managed_receiver(binding, "present", backend=None, wait=wait).ok
 
 
 def prove_predecessor_receiver_absent(
     binding: "PersonaBinding",
     *,
     manifest_path: Path | None = None,
+    wait: bool = True,
 ) -> bool:
     if not receiver_handoff_required(binding):
         return True
@@ -1012,7 +1027,7 @@ def prove_predecessor_receiver_absent(
             for item in _manifest_bindings(manifest_path, binding.persona)
             if item.launch.harness == "claude"
         )
-        proof = _probe_managed_receiver(predecessor, "absent", backend=None)
+        proof = _probe_managed_receiver(predecessor, "absent", backend=None, wait=wait)
     except Exception:
         return False
     return proof.ok
@@ -1087,7 +1102,10 @@ def _run_tmux(
 # inside that session (tests included) silently read the LIVE manifest. Every reader
 # defaults to the instance.yaml beside its own code, which is the live clone for a live
 # run. One `--unset=NAME` word each so argv classifiers skip it like any flag.
-LAUNCH_UNSET_ENV = ("PANTHEON_INSTANCE_MANIFEST",)
+# T-5584: CLAUDE_CODE_RETRY_WATCHDOG turns a cap hit into a silent in-process wait, which
+# hides the on-screen cap modal that _mid_session_cap_hit classifies, so failover would
+# never fire. A live seat must never inherit it.
+LAUNCH_UNSET_ENV = ("PANTHEON_INSTANCE_MANIFEST", "CLAUDE_CODE_RETRY_WATCHDOG")
 
 
 def _runtime_command_argv(
@@ -1483,6 +1501,35 @@ def _stop_created_scope_best_effort(scope_unit: str) -> None:
         print(f"[runtime_controller] {exc}", file=sys.stderr)
 
 
+def _cleanup_failed_created_runtime(
+    binding: "PersonaBinding",
+    started: RuntimeStart,
+    *,
+    context: TmuxRuntimeContext | None = None,
+) -> None:
+    """Gracefully extinguish the exact wrapper before stopping its creator scope.
+
+    Modern tmux moves each pane into a ``tmux-spawn-*.scope``.  Stopping only
+    the controller's ``pantheon-runtime-tmux.scope`` can therefore leave a
+    controller-owned app-server pane (and its active thread writer) alive.
+    Reuse T-6180's pidfd-pinned graceful shutdown: SIGTERM the identity-checked
+    wrapper and require its exact extinction receipt.  Ambiguity or timeout is
+    a HOLD; there is no tmux hard-kill or creator-scope fallback.
+    """
+    if not started.created_scope:
+        return
+    if context is not None and context.tmux_socket_args():
+        raise RuntimeError(
+            "failed-start cleanup refused: T-6180 identity proof does not support "
+            "a non-default tmux socket"
+        )
+    from tools import harness as harness_cli
+    session = binding.controller.tmux.session
+    pane_pid, pane_command = harness_cli._tmux_pane_identity(session)
+    harness_cli._graceful_controller_owned_shutdown(session, pane_pid, pane_command)
+    _stop_created_scope_best_effort(started.scope_unit)
+
+
 def _wait_for_live_runtime(
     target: TmuxTarget,
     scope_unit: str,
@@ -1559,11 +1606,41 @@ def _prepare_harness_launch(binding: "PersonaBinding", adapter: "PantheonHarness
         prepare(binding, adapter, cwd=cwd)
 
 
+def _session_chronicle_group_command(
+    argv: Sequence[str], *, group: str = chronicle.NATIVE_TRANSCRIPT_GROUP
+) -> list[str]:
+    """Acquire a configured archive group for this one bounded subprocess.
+
+    A user-systemd manager can predate an /etc/group update indefinitely.  The
+    account is then a configured member while every controller child still
+    lacks the gid.  Do not restart the seat for that: use ``sg`` only when the
+    account's current group database authorizes the hop.  A genuine non-member
+    stays unwrapped so session_chronicle reports its normal fail-closed archive
+    error rather than prompting for a group password.
+    """
+    command = list(argv)
+    if os.geteuid() == 0:
+        return command
+    try:
+        group_entry = grp.getgrnam(group)
+        account = pwd.getpwuid(os.geteuid())
+        configured_gids = os.getgrouplist(account.pw_name, account.pw_gid)
+    except (KeyError, OSError):
+        return command
+    if group_entry.gr_gid in os.getgroups() or group_entry.gr_gid == os.getegid():
+        return command
+    if group_entry.gr_gid not in configured_gids:
+        return command
+    return ["/usr/bin/sg", group, "-c", shlex.join(command)]
+
+
 def _session_chronicle_runner(argv: Sequence[str], *, timeout: float) -> dict[str, Any]:
     """Run one bounded session-chronicle subprocess and parse its JSON summary.
     Reuses _run_submit_helper's own-session + killpg-on-timeout boundary."""
     try:
-        completed = _run_submit_helper(argv, timeout=timeout)
+        completed = _run_submit_helper(
+            _session_chronicle_group_command(argv), timeout=timeout
+        )
     except subprocess.TimeoutExpired:
         return {"status": "timeout", "timeout_seconds": timeout}
     lines = [line for line in (completed.stdout or "").splitlines() if line.strip()]
@@ -1699,13 +1776,19 @@ def _start_runtime(
     target = binding.controller.tmux
     spec = adapter.build_interactive_launch(target, cwd=binding.launch_cwd)
     launch_argv = tuple(spec.argv) + _statusline_launch_args(binding, adapter, state_root=state_root)
-    scoped_env = _runtime_env_with_scope_path(spec.env, account_home=binding.account_home)
+    # T-4533: claude seats load the fleet-usage mod structurally (seat-set keys win).
+    launch_env = dict(spec.env)
+    if binding.launch.harness == "claude":
+        launch_env.update(
+            fleet_usage_launch_env(binding.persona, binding.account_home)
+        )
+    scoped_env = _runtime_env_with_scope_path(launch_env, account_home=binding.account_home)
     # T-5011 PR-A (T-4924 plan §2.4): harness-specific seeding (codex config
     # trust/update/migration/worker-guard; claude bypass consent) lives behind
     # the harness integration's prepare_launch, dispatched on the binding's
     # harness as the inline branch was. An unregistered harness seeds nothing.
     _prepare_harness_launch(binding, adapter, cwd=spec.cwd)
-    command_argv = _runtime_command_argv(launch_argv, spec.env)
+    command_argv = _runtime_command_argv(launch_argv, launch_env)
     scope_unit = context.scope_unit if context is not None else TMUX_RUNTIME_SCOPE_UNIT
     server_pid = _default_tmux_server_pid(**_context_kwargs(context))
     if server_pid is None:
@@ -2062,6 +2145,12 @@ def _provider_completion_evidence(assessment: ProviderCompletionAssessment) -> M
         evidence["pane_captures_sha256"] = assessment.pane_captures_sha256 or ""
     if assessment.pane_captures_error is not None:
         evidence["pane_captures_error"] = assessment.pane_captures_error
+    cap_kind = getattr(assessment, "cap_kind", None)
+    reset_at = getattr(assessment, "reset_at", None)
+    if cap_kind is not None:
+        evidence["cap_kind"] = cap_kind
+    if reset_at is not None:
+        evidence["reset_at"] = _iso(reset_at)
     return evidence
 
 
@@ -2291,6 +2380,20 @@ def _assess_provider_completion_after_input_ready(
             capture_count=0,
             changed_capture_indices=(),
         )
+    # T-6235: classify the post-launch baseline before sending anything.  A
+    # fallback-return can already be sitting on Claude's blocking monthly
+    # spend-limit adjustment panel; submitting the nonce there would press
+    # Enter against provider UI rather than a prompt.  Only subscription-cap
+    # is terminal before submission--all ordinary completion states still
+    # require the fresh nonce round trip below.
+    pre_submit = assess(
+        harness=binding.launch.harness,
+        profile=binding.launch.profile,
+        probe=probe,
+        samples=(),
+    )
+    if pre_submit.status == "subscription-cap":
+        return pre_submit
     handle = RuntimeHandle(
         profile=binding.launch,
         tmux=binding.controller.tmux,
@@ -2300,7 +2403,7 @@ def _assess_provider_completion_after_input_ready(
     request = ExecutionRequest(prompt=probe.prompt, cwd=binding.account_home)
     submit_to_runtime(
         handle, request, context=context,
-        render_wait_seconds=FRESH_RUNTIME_SUBMIT_RENDER_WAIT_SECONDS,
+        render_wait_seconds=_fresh_runtime_render_wait(binding.launch.harness),
     )
     # T-4321: ready_for_submission can pass while the TUI is still booting, and
     # a probe pasted then is swallowed. send_keys_submit reads the empty
@@ -2390,7 +2493,7 @@ def _assess_provider_completion_after_input_ready(
                 try:
                     submit_to_runtime(
                         handle, request, context=context,
-                        render_wait_seconds=FRESH_RUNTIME_SUBMIT_RENDER_WAIT_SECONDS,
+                        render_wait_seconds=_fresh_runtime_render_wait(binding.launch.harness),
                     )
                 except RuntimeError:
                     # T-4321 r1 R1: send_keys_submit exits 2 when a busy pane
@@ -2556,7 +2659,7 @@ def _verify_runtime_input_ready(
 ) -> None:
     structural_enabled = getattr(adapter, "appserver_input_readiness_enabled", lambda: False)()
     if structural_enabled:
-        deadline = time.monotonic() + RUNTIME_INPUT_READY_TIMEOUT_SECONDS
+        deadline = time.monotonic() + APP_SERVER_INPUT_READY_TIMEOUT_SECONDS
         while True:
             if getattr(adapter, "appserver_input_ready")():
                 readiness = RuntimeInputReadiness(
@@ -2626,7 +2729,7 @@ def _verify_runtime_input_ready(
     receiver_window = _candidate_receiver_window_or_unknown(
         binding, launched_at=launched_at, now=_utc_now())
     if started.created_scope:
-        _stop_created_scope_best_effort(started.scope_unit)
+        _cleanup_failed_created_runtime(binding, started, context=context)
     evidence = {
         "event": "runtime_input_not_ready",
         "harness": binding.launch.harness,
@@ -4079,7 +4182,8 @@ def _read_only_receiver_present(binding: "PersonaBinding", *, backend: Any | Non
     if _receiver_proof_not_applicable(binding):
         return {"ok": True, "state": "not-applicable", "evidence": {"reason": "no-managed-receiver"}}
     integration = harness_integration.integration_for(binding.launch.harness)
-    proof = integration.prove_receiver_state(binding, "present", backend=backend)
+    # T-6016: single-shot; callers hold the operation lock and the peer controller produces the state.
+    proof = integration.prove_receiver_state(binding, "present", backend=backend, wait=False)
     if proof.state == "not-applicable":
         return {"ok": True, "state": "not-applicable", "evidence": dict(proof.evidence)}
     if proof.state == "absent":
@@ -4230,14 +4334,15 @@ def _rehydrate_recorded_runtime_selection(
             runtime_state=runtime_state,
             state_root=state_root,
         )
-    if not prove_managed_receiver_present(selected_binding):
+    # T-6016: single-shot; the operation lock is held and the peer controller produces the state.
+    if not prove_managed_receiver_present(selected_binding, wait=False):
         _raise_runtime_viability_block(
             "recorded-receiver-not-present",
             binding=selected_binding,
             runtime_state=runtime_state,
             state_root=state_root,
         )
-    if not prove_predecessor_receiver_absent(selected_binding):
+    if not prove_predecessor_receiver_absent(selected_binding, wait=False):
         _raise_runtime_viability_block(
             "predecessor-receiver-present",
             binding=selected_binding,
@@ -5205,6 +5310,11 @@ _SUBMIT_VERIFY_PROFILE_BY_HARNESS: Mapping[str, str] = {
     "codex": "codex",
     "hermes": "hermes",
 }
+
+
+def _fresh_runtime_render_wait(harness: str) -> float:
+    """T-6293: the first-paste render bound for a launch harness, read from its profile."""
+    return submit_verify_first_paste_render_wait(_submit_verify_harness(str(harness)))
 
 
 def _submit_verify_harness(harness: str) -> str:
@@ -8082,9 +8192,10 @@ def _prove_receiver(
     expected: Literal["present", "absent"],
     *,
     backend: Any | None,
+    wait: bool = True,
 ) -> ReceiverStateProof:
     integration = harness_integration.integration_for(getattr(binding, "launch").harness)
-    proof = integration.prove_receiver_state(binding, expected, backend=backend)
+    proof = integration.prove_receiver_state(binding, expected, backend=backend, wait=wait)
     if proof.state == "not-applicable":
         return proof
     if proof.state != expected:
@@ -8545,7 +8656,7 @@ def _prompt_successor(
         ),
         **_context_kwargs(context),
         # T-4362: the successor has only just booted (same hazard as the probe).
-        render_wait_seconds=FRESH_RUNTIME_SUBMIT_RENDER_WAIT_SECONDS,
+        render_wait_seconds=_fresh_runtime_render_wait(handle.profile.harness),
     )
     _append_controller_evidence(
         persona,
@@ -9641,6 +9752,39 @@ def clear_active_runtime(persona: str, *, state_root: Path | None = None) -> Non
         _active_runtime_path(persona, state_root=state_root).unlink()
     except FileNotFoundError:
         pass
+
+
+def clear_active_runtime_if_owned(
+    persona: str,
+    binding: "PersonaBinding",
+    handle: RuntimeHandle,
+    *,
+    state_root: Path | None = None,
+) -> bool:
+    """Clear only the cache entry written for this supervised runtime.
+
+    A recovery/consume path may install a successor after this controller has
+    observed its runtime die but before its lifecycle tail reaches cleanup.  The
+    shared operation lock closes the read/unlink race with runtime mutations; the
+    runtime ref, pid, and start timestamp keep an older supervisor from deleting
+    either a different successor or a newer incarnation of the same runtime.
+    When another mutation already owns the lock, leaving this cache alone is the
+    safe result: active-runtime.json is a cache, never liveness authority.
+    """
+    try:
+        with persona_operation_lock(persona, state_root=state_root, blocking=False):
+            cached = read_active_runtime(persona, state_root=state_root)
+            expected = {
+                "runtime": _binding_runtime_ref(binding),
+                "pid": handle.pid,
+                "started_ts": _iso(handle.started_at),
+            }
+            if any(cached.get(key) != value for key, value in expected.items()):
+                return False
+            clear_active_runtime(persona, state_root=state_root)
+            return True
+    except OperationLockBusy:
+        return False
 
 
 def read_active_runtime(persona: str, *, state_root: Path | None = None) -> dict[str, Any]:
@@ -12067,6 +12211,17 @@ def _controller_start_runtime(
     )
     _verify_started_runtime(binding, runtime_start, state_root=state_root)
     _verify_runtime_input_ready(binding, runtime_start, state_root=state_root, adapter=adapter)
+    # T-6235: input-ready proves only that the local TUI can accept keys.  A
+    # fallback-return launch can pass that transport gate while Claude is
+    # blocked behind its monthly-spend-limit adjustment modal.  Require the
+    # same provider-completion proof as the consume/bootstrap path before
+    # running hooks or committing either receiver topology.  A classified cap
+    # raises with its reset evidence; controller_main records the cooldown and
+    # immediately reselects the viable fallback in the same invocation.
+    provider_completion = _assess_provider_completion_after_input_ready(
+        binding, adapter, state_root=state_root
+    )
+    _raise_for_provider_completion_assessment(binding, runtime_start, provider_completion)
     # T-4156: a real start (fresh, or respawn over a foreign pane) gets the
     # binding's post_start duties exactly as a consume-path bootstrap does
     # (arm_pane_log, Telegram 409 re-assert, boot kick). Shared helper, same
@@ -12719,11 +12874,69 @@ def _persist_runtime_record_on_launch(
     return "persisted"
 
 
+def _record_controller_launch_viability(
+    binding: "PersonaBinding",
+    candidates: Sequence["PersonaBinding"],
+    *,
+    state_root: Path | None,
+    now: datetime,
+) -> str:
+    """T-4817: record the initial-viability receipt for a runtime controller_main just
+    launched (or attached to), so a consume tick against that live pane finds the
+    selected record _matching_recorded_runtime_selection requires. Same schema, same
+    receipt builder and same writer as ensure_viable_runtime; the one attempt is the
+    launched binding, caused "controller-launch", with no receiver receipt (the
+    controller runs no initial-bootstrap receiver boundary and none is invented).
+
+    Source provenance is read back from the runtime.json record the caller has just
+    persisted, exactly as ensure_viable_runtime does. Callers invoke this only after a
+    verified launch whose runtime.json was persisted. An existing receipt that already
+    selects this same runtime is left byte-identical (it may carry a richer consume
+    receipt); anything else (missing, exhausted, another runtime) is replaced.
+    Returns "recorded" or "unchanged"; raises on any failure (caller is best-effort)."""
+    existing = initial_viability_state(binding.persona, state_root=state_root)
+    if (
+        existing.get("schema") == "pantheon-runtime-initial-viability/v1"
+        and existing.get("status") == "selected"
+        and existing.get("selected_runtime") == _runtime_ref(binding)
+    ):
+        return "unchanged"
+    provenance = _runtime_state_source_provenance(binding, state_root=state_root)
+    manifest_order = tuple(_runtime_ref(candidate) for candidate in _unique_candidates(candidates))
+    attempt = _viability_attempt(
+        sequence=1,
+        binding=binding,
+        status="selected",
+        failure_class=None,
+        cause="controller-launch",
+        readiness=_runtime_state_readiness_evidence(binding, state_root=state_root),
+        teardown={},
+        receiver={},
+        cooldown={"opened": "false"},
+        source_provenance=provenance,
+        # no precheck_source_provenance: that field is the consume path's fresh pre-launch
+        # check; a controller launch makes no separate one, so it stays {} (T-4817)
+    )
+    receipt = _runtime_viability_receipt(
+        persona=binding.persona,
+        status="selected",
+        selected=binding,
+        manifest_order=manifest_order,
+        attempt_limit=len(manifest_order),
+        attempts=[attempt],
+        now=now,
+    )
+    _record_initial_viability(receipt, state_root=state_root)
+    return "recorded"
+
+
 #: T-5016: controller_main's block outcome -> the session-end cause it records.
 _SESSION_END_CAUSE_BY_OUTCOME = {
     "AuthenticationLossSwapOutcome": "authentication-loss-swap",
     "MidSessionCapSwapOutcome": "cap-swap",
     "FallbackReturnOutcome": "fallback-return",
+    # T-5622 (ORG-106): a deep-sleep drain end is calm, not a death.
+    "SeatSleepOutcome": "sleep",
 }
 
 
@@ -13021,7 +13234,7 @@ def controller_main(
                     _dbus_emit_health(persona, health_service)
                     if failure_class == "subscription_cap":
                         # T-4804: a START-UP cap is the same swap as a mid-session one --
-                        # Restart=always reselects the next viable runtime.
+                        # the controller reselects the next viable runtime.
                         until = failed_attempt.get("cooldown_until") or ""
                         _notify_runtime_swap(
                             persona, selected_ref, "start-cap", until,
@@ -13030,6 +13243,21 @@ def controller_main(
                             f"next viable runtime and reselects {selected_ref} after that time.",
                             state_root=state_root,
                         )
+                        # T-6235: provider completion is the last gate on a
+                        # fallback-return launch.  When that gate classifies the
+                        # monthly-spend modal, returning to systemd leaves a
+                        # short receiver-less gap after the codex poller PRE
+                        # handoff.  Re-loop in this process instead: the fresh
+                        # cooldown makes the modal runtime unselectable and the
+                        # next candidate replaces the same single tmux pane and
+                        # commits its receiver before this invocation exits.
+                        if (
+                            isinstance(exc, RuntimeOperationalFailure)
+                            and exc.cause == "provider-completion-subscription-cap"
+                        ):
+                            if max_reselect_cycles is not None and cycles >= max_reselect_cycles:
+                                return 1
+                            continue
                     return 1
 
                 write_active_runtime(persona, selected, handle, pid=handle.pid, state_root=state_root)
@@ -13059,6 +13287,21 @@ def controller_main(
                     _best_effort_controller_evidence(
                         persona, "runtime_record_not_persisted",
                         {"selected": selected_ref, "outcome": persist_outcome[:500]},
+                        state_root=state_root,
+                    )
+                # T-4817: a launch the controller verified gets the initial-viability
+                # receipt consume requires before it will touch a live pane. Best-effort,
+                # like the runtime.json record above: it may never fail or delay a launch.
+                try:
+                    if persist_outcome != "persisted":
+                        raise RuntimeError(f"runtime.json record not persisted ({persist_outcome})")
+                    _record_controller_launch_viability(
+                        selected, runtime_candidates, state_root=state_root, now=now(),
+                    )
+                except Exception as exc:  # noqa: BLE001 -- best-effort, see above
+                    _best_effort_controller_evidence(
+                        persona, "runtime_viability_not_recorded",
+                        {"selected": selected_ref, "outcome": f"{type(exc).__name__}: {exc}"[:500]},
                         state_root=state_root,
                     )
                 log_invocation(
@@ -13252,7 +13495,7 @@ def controller_main(
                     persona, selected, outcome="failed", failure_class="process_death",
                     trigger=trigger, state_root=state_root, now=now(),
                 )
-        clear_active_runtime(persona, state_root=state_root)
+        clear_active_runtime_if_owned(persona, selected, handle, state_root=state_root)
         clear_mid_session_cap_state(persona, state_root=state_root)
         _dbus_emit_health(persona, health_service)
         # T-4804: after the state cleanup, so alerting can never sit ahead of it.

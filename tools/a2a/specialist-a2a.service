@@ -1,6 +1,11 @@
 [Unit]
 Description=Pantheon specialist seat — A2A rung-1 loopback server (T-1886)
 After=network.target
+# T-6352: ~52 min of continuous failure (30 starts/h under the Service-section backoff) ends in
+# ONE latched failed state (OnFailure alert where wired; failed_unit_reconcile sees it
+# regardless) instead of an unbounded loop. Recover: reset-failed + start.
+StartLimitIntervalSec=3600
+StartLimitBurst=30
 
 [Service]
 Type=simple
@@ -13,6 +18,10 @@ Environment=SPECIALIST_A2A_PORT=41100
 ExecStart=%h/.venv-a2a/bin/python %h/pantheon-config/tools/a2a/specialist_seat_server.py
 Restart=on-failure
 RestartSec=5
+# T-6352: exponential restart backoff (5,9,18,34,64,120s). NRestarts is cumulative
+# (resets only on a manual start/restart), so 120s is also the steady per-crash delay.
+RestartSteps=5
+RestartMaxDelaySec=120
 
 # In-memory task store (rung 1, design notes §2.1) — state does not
 # survive a restart; this is expected, not a bug. sqlite durability is the
